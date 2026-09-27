@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "axiom-extension-abi"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "postcard",
  "serde",
@@ -13,7 +13,7 @@ dependencies = [
 
 [[package]]
 name = "axiom-extension-sdk"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axiom-extension-abi",
  "axiom-extension-sdk-derive",
@@ -21,7 +21,7 @@ dependencies = [
 
 [[package]]
 name = "axiom-extension-sdk-derive"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "proc-macro2",
  "quote",
