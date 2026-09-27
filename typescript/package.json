@@ -5,7 +5,7 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/AxiomCore/axiom-extension-sdk.git",
+    "url": "git+https://github.com/AxiomCore/axiom-extension-sdk.git",
     "directory": "typescript"
   },
   "type": "module",
