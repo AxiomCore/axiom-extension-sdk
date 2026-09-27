@@ -1,0 +1,40 @@
+name: Validate extension SDK packages
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  rust:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --workspace --locked
+      - run: cargo package -p axiom-extension-abi --no-verify --allow-dirty
+      - run: cargo package -p axiom-extension-sdk-derive --no-verify --allow-dirty
+      - run: cargo package -p axiom-extension-sdk --list --allow-dirty
+  typescript:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: typescript/package-lock.json
+      - run: npm ci --ignore-scripts
+        working-directory: typescript
+      - run: npm test
+        working-directory: typescript
+      - run: npm pack --dry-run --json --ignore-scripts
+        working-directory: typescript
+  python:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv build python
+      - run: python3 -B -m unittest discover -s scripts -p 'test_*.py'
+      - run: uv run --no-project python -m compileall -q python/axiom_extension_sdk

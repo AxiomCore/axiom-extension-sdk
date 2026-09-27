@@ -1,0 +1,20 @@
+[package]
+name = "axiom-extension-abi"
+version = "1.0.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Engine-neutral Axiom extension ABI v1 wire types"
+repository = "https://github.com/AxiomCore/axiom-extension-sdk"
+readme = "README.md"
+keywords = ["axiom", "extensions", "abi", "wasm"]
+
+[features]
+default = ["std"]
+std = ["serde/std", "postcard/use-std"]
+
+[dependencies]
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+serde_json = "1"

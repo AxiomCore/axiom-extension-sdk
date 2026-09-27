@@ -1,0 +1,17 @@
+[package]
+name = "axiom-extension-sdk-derive"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "First-party canonical record derive for the Axiom extension SDK"
+repository = "https://github.com/AxiomCore/axiom-extension-sdk"
+readme = "README.md"
+keywords = ["axiom", "extensions", "macros"]
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }

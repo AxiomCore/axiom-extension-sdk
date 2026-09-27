@@ -1,0 +1,3 @@
+[workspace]
+members = ["rust/abi", "rust/sdk-derive", "rust/sdk"]
+resolver = "2"

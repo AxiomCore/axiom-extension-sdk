@@ -1,0 +1,33 @@
+from typing import Any, Callable, Generic, Protocol, TypeVar
+
+T = TypeVar("T", bound=Callable[..., Any])
+ValueT = TypeVar("ValueT")
+
+class Selector(str, Generic[ValueT]): ...
+
+class Snapshot(Protocol):
+    def get(self, path: Selector[ValueT]) -> ValueT: ...
+
+class Patch(Protocol):
+    def set(self, path: Selector[ValueT], value: ValueT) -> "Patch": ...
+    def unset(self, path: Selector[Any]) -> "Patch": ...
+    def increment(self, path: Selector[int], amount: int) -> "Patch": ...
+    def build(self) -> Any: ...
+
+class Context(Protocol):
+    input: Any
+    def snapshot(self, resource: str) -> Snapshot: ...
+    def patch(self, resource: str) -> Patch: ...
+    def complete(
+        self,
+        output: Any = ...,
+        *,
+        patches: list[Any] = ...,
+        transactions: list[Any] = ...,
+        emitted_events: list[Any] = ...,
+    ) -> Any: ...
+
+class _Extension:
+    def export(self, function: T) -> T: ...
+
+extension: _Extension

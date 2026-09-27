@@ -1,0 +1,128 @@
+name: Publish one extension SDK package
+
+# Deliberately manual: no push or tag implicitly publishes a package.
+on:
+  workflow_dispatch:
+    inputs:
+      component:
+        description: Package to publish
+        required: true
+        type: choice
+        options: [rust-abi, rust-derive, rust-sdk, typescript-sdk, python-sdk]
+      version:
+        description: Exact version committed in the owning manifest
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: astral-sh/setup-uv@v6
+      - name: Verify version and build archive
+        env:
+          COMPONENT: ${{ inputs.component }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          python3 -B scripts/verify_release_input.py "$COMPONENT" "$VERSION"
+          mkdir -p release-archives
+          case "$COMPONENT" in
+            rust-abi|rust-derive|rust-sdk)
+              case "$COMPONENT" in
+                rust-abi) package=axiom-extension-abi ;;
+                rust-derive) package=axiom-extension-sdk-derive ;;
+                rust-sdk) package=axiom-extension-sdk ;;
+              esac
+              cargo test --workspace --locked
+              cargo package --locked -p "$package"
+              cp "target/package/$package-$VERSION.crate" release-archives/
+              ;;
+            typescript-sdk)
+              npm ci --ignore-scripts --prefix typescript
+              npm test --prefix typescript
+              npm pack ./typescript --pack-destination release-archives --ignore-scripts
+              ;;
+            python-sdk) uv build python --out-dir release-archives ;;
+          esac
+      - uses: actions/upload-artifact@v4
+        with:
+          name: extension-package
+          path: release-archives/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    environment: package-release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: extension-package
+          path: release-archives
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
+      - uses: astral-sh/setup-uv@v6
+      - name: Publish reviewed archive
+        env:
+          COMPONENT: ${{ inputs.component }}
+          VERSION: ${{ inputs.version }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          python3 -B scripts/verify_release_input.py "$COMPONENT" "$VERSION"
+          case "$COMPONENT" in
+            rust-abi) cargo publish --locked -p axiom-extension-abi ;;
+            rust-derive) cargo publish --locked -p axiom-extension-sdk-derive ;;
+            rust-sdk) cargo publish --locked -p axiom-extension-sdk ;;
+            typescript-sdk)
+              npm install -g npm@11.5.1
+              npm publish release-archives/*.tgz --provenance --access public --ignore-scripts
+              ;;
+            python-sdk) uv publish release-archives/* ;;
+          esac
+
+  mirror:
+    needs: [build, publish]
+    runs-on: ubuntu-24.04
+    environment: package-release
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: extension-package
+          path: release-archives
+      - name: Mirror public archive into AxiomCore Releases
+        env:
+          GH_TOKEN: ${{ secrets.AXIOMCORE_RELEASE_ASSET_TOKEN }}
+          COMPONENT: ${{ inputs.component }}
+          VERSION: ${{ inputs.version }}
+          SDK_COMMIT: ${{ github.sha }}
+        run: |
+          test -n "$GH_TOKEN"
+          tag="extension-$COMPONENT-v$VERSION"
+          if ! gh release view "$tag" --repo AxiomCore/AxiomCore >/dev/null 2>&1; then
+            gh release create "$tag" --repo AxiomCore/AxiomCore --target main \
+              --title "Extension $COMPONENT $VERSION" \
+              --notes "Package source: https://github.com/AxiomCore/axiom-extension-sdk/tree/$SDK_COMMIT"
+          fi
+          gh release upload "$tag" release-archives/* --repo AxiomCore/AxiomCore

@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "axiom-extension-sdk"
+version = "0.1.0"
+description = "Typed authoring surface for deterministic Axiom Python extensions"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+authors = [{ name = "AxiomCore" }]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Typing :: Typed",
+]
+
+[project.urls]
+Repository = "https://github.com/AxiomCore/axiom-extension-sdk"
+
+[tool.setuptools]
+packages = ["axiom_extension_sdk"]
+
+[tool.setuptools.package-data]
+axiom_extension_sdk = ["*.pyi", "py.typed"]

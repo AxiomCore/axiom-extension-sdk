@@ -1,0 +1,13 @@
+.DS_Store
+.summary_files
+**/.DS_Store
+**/.summary_files
+target/
+release-archives/
+node_modules/
+dist/
+build/
+*.egg-info/
+__pycache__/
+.venv/
+.pytest_cache/
