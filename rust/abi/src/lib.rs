@@ -463,7 +463,7 @@ mod tests {
     #[test]
     fn language_neutral_conformance_frames_preserve_the_existing_abi() {
         let fixture: ConformanceFixture = serde_json::from_str(include_str!(
-            "../../../../axiom-lib/fixtures/sdk-interface-conformance-v1.json"
+            "../fixtures/sdk-interface-conformance-v1.json"
         ))
         .unwrap();
         assert_eq!(fixture.format, "axiom-sdk-conformance/v1");

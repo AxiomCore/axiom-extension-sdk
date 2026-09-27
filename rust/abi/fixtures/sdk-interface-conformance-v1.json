@@ -1,0 +1,64 @@
+{
+  "format": "axiom-sdk-conformance/v1",
+  "abi": {
+    "name": "axiom-extension-abi",
+    "version": "1.0.0",
+    "wireEncoding": "postcard",
+    "wireMagicHex": "41584531"
+  },
+  "typeKinds": ["alias", "handle", "record", "variant"],
+  "languageMappings": {
+    "python": {
+      "record": "@dataclass(frozen=True)",
+      "variant": "typing.Union tagged by case",
+      "list": "list[T]",
+      "optional": "T | None",
+      "signed64": "int (checked i64)",
+      "unsigned64": "int (checked u64)",
+      "bytes": "bytes",
+      "handle": "AxiomHandle (opaque)",
+      "revision": "int (checked u64)",
+      "error": "AxiomResult[T] / ExtensionError",
+      "asyncCall": "collections.abc.Awaitable[T]",
+      "asyncStream": "collections.abc.AsyncIterator[T]"
+    },
+    "rust": {
+      "record": "struct",
+      "variant": "enum",
+      "list": "Vec<T>",
+      "optional": "Option<T>",
+      "signed64": "i64",
+      "unsigned64": "u64",
+      "bytes": "Vec<u8>",
+      "handle": "Handle (opaque)",
+      "revision": "u64",
+      "error": "Result<T, ExtensionError>",
+      "asyncCall": "Future<Output = Result<T, ExtensionError>>",
+      "asyncStream": "Stream<Item = Result<T, ExtensionError>>"
+    },
+    "typescript": {
+      "record": "readonly interface",
+      "variant": "discriminated union by case",
+      "list": "ReadonlyArray<T>",
+      "optional": "T | null",
+      "signed64": "bigint (checked i64)",
+      "unsigned64": "bigint (checked u64)",
+      "bytes": "Uint8Array",
+      "handle": "AxiomHandle (opaque branded type)",
+      "revision": "bigint (checked u64)",
+      "error": "AxiomResult<T> / ExtensionError",
+      "asyncCall": "Promise<T>",
+      "asyncStream": "AsyncIterable<T>"
+    }
+  },
+  "frames": [
+    { "name": "negotiate-host", "direction": "host", "hex": "41584531010000010100" },
+    { "name": "negotiate-guest", "direction": "guest", "hex": "415845310100000100" },
+    { "name": "initialize-host", "direction": "host", "hex": "4158453101000101136578616d706c652e6170706c69636174696f6e0f6578616d706c652e7068617365356b" },
+    { "name": "initialize-guest", "direction": "guest", "hex": "41584531010001" },
+    { "name": "invoke-host", "direction": "host", "hex": "4158453101000201046563686f050000ffffffffffffffffff01" },
+    { "name": "completed-guest", "direction": "guest", "hex": "41584531010003010500000000" },
+    { "name": "shutdown-host", "direction": "host", "hex": "41584531010006" },
+    { "name": "shutdown-guest", "direction": "guest", "hex": "41584531010007" }
+  ]
+}
