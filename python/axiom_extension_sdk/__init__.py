@@ -15,7 +15,7 @@ class Selector(str, Generic[ValueT]):
 
 
 class Snapshot(Protocol):
-    def get(self, path: Selector[ValueT]) -> ValueT: ...
+    def get(self, path: Selector[ValueT]) -> ValueT | None: ...
 
 
 class Patch(Protocol):

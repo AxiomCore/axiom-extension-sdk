@@ -84,6 +84,35 @@ def check_bindings(project: Path, alias: str, language: str, cli: str) -> None:
         raise RuntimeError(f"generated bindings are missing or stale: {target}; rerun setup_project.py")
 
 
+def check_installed_sdk(project: Path, language: str) -> None:
+    if language == "rust":
+        manifest = project / "Cargo.toml"
+        if not manifest.is_file():
+            raise RuntimeError("Rust extension project needs Cargo.toml")
+        packages = json.loads(run("cargo", "metadata", "--locked", "--offline", "--format-version", "1",
+                                  "--manifest-path", str(manifest), cwd=project))["packages"]
+        if not any(package["name"] == "axiom-extension-sdk" and package["version"] == SDK_VERSION
+                   for package in packages):
+            raise RuntimeError(f"Rust extension project needs installed axiom-extension-sdk=={SDK_VERSION}")
+    elif language == "typescript":
+        root = project / "node_modules/@axiomcore/extension-sdk"
+        manifest = root / "package.json"
+        if not manifest.is_file() or json.loads(manifest.read_text()).get("version") != SDK_VERSION:
+            raise RuntimeError(f"TypeScript extension project needs installed {PACKAGE}@{SDK_VERSION}")
+        if not (root / "dist/index.d.ts").is_file() or not (root / "dist/runner.js").is_file():
+            raise RuntimeError("TypeScript extension SDK is missing built declarations or runner")
+    elif language == "python":
+        site_packages = list((project / ".venv/lib").glob("*/site-packages"))
+        for site in site_packages:
+            metadata = site / f"axiom_extension_sdk-{SDK_VERSION}.dist-info/METADATA"
+            if (site / "axiom_extension_sdk/__init__.pyi").is_file() and metadata.is_file():
+                if f"Version: {SDK_VERSION}" in metadata.read_text().splitlines():
+                    return
+        raise RuntimeError(f"Python extension project needs axiom-extension-sdk=={SDK_VERSION} in .venv")
+    else:
+        raise RuntimeError(f"unsupported extension language: {language}")
+
+
 def rust(project: Path, alias: str, source: Path, sdk: Path | None, cli: str) -> None:
     manifest = project / "Cargo.toml"
     if not manifest.exists():
@@ -192,6 +221,7 @@ def main() -> None:
     boundary_digest = hashlib.sha256(json.dumps(boundary, sort_keys=True).encode()).hexdigest()
     evidence = project / ".axiom/ide" / args.alias / "acore-boundary.sha256"
     if args.check:
+        check_installed_sdk(project, language)
         check_bindings(project, args.alias, language, args.cli)
         if not evidence.is_file() or evidence.read_text().strip() != boundary_digest:
             raise RuntimeError(".acore state boundary changed; rerun setup_project.py")
