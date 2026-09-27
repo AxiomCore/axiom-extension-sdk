@@ -60,7 +60,7 @@ jobs:
                     break
                   fi
                   cat "$package_log" >&2
-                  if ! grep -Eq 'no matching package named `(axiom-extension-abi|axiom-extension-sdk-derive)` found' "$package_log" || [ "$attempt" -eq 12 ]; then
+                  if ! grep -Eq 'no matching package named `(axiom-extension-abi|axiom-extension-sdk-derive)` found|failed to select a version for the requirement `(axiom-extension-abi|axiom-extension-sdk-derive)' "$package_log" || [ "$attempt" -eq 12 ]; then
                     exit 1
                   fi
                   echo "Waiting for published Rust SDK dependencies in the crates.io index (attempt $attempt/12)"
