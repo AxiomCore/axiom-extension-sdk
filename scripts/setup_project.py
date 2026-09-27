@@ -116,7 +116,8 @@ def check_installed_sdk(project: Path, language: str) -> None:
 def rust(project: Path, alias: str, source: Path, sdk: Path | None, cli: str) -> None:
     manifest = project / "Cargo.toml"
     if not manifest.exists():
-        dependency = (f'{{ path = "{(sdk / "rust/sdk").as_posix()}", version = "={SDK_VERSION}" }}'
+        relative_sdk = os.path.relpath(sdk / "rust/sdk", project).replace(os.sep, "/") if sdk else None
+        dependency = (f'{{ path = "{relative_sdk}", version = "={SDK_VERSION}" }}'
                       if sdk else f'"={SDK_VERSION}"')
         manifest.write_text(
             f'[package]\nname = "axiom-extension-project"\nversion = "0.0.0"\nedition = "2021"\n'
@@ -177,7 +178,8 @@ def typescript(project: Path, alias: str, sdk: Path | None, cli: str) -> None:
 def python(project: Path, alias: str, sdk: Path | None, cli: str) -> None:
     manifest = project / "pyproject.toml"
     if not manifest.exists():
-        source = (f'\n[tool.uv.sources]\naxiom-extension-sdk = {{ path = "{(sdk / "python").as_posix()}" }}\n'
+        relative_sdk = os.path.relpath(sdk / "python", project).replace(os.sep, "/") if sdk else None
+        source = (f'\n[tool.uv.sources]\naxiom-extension-sdk = {{ path = "{relative_sdk}" }}\n'
                   if sdk else "")
         manifest.write_text(
             f'[project]\nname = "axiom-extension-project"\nversion = "0.0.0"\n'
