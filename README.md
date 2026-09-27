@@ -2,7 +2,9 @@
 
 Public, independently versioned authoring SDKs for Axiom extensions. This
 repository is the source of truth for the SDK packages; the Axiom CLI contains
-the compiler and binding generator, not a copy of these SDK sources.
+the compiler and binding generator. The installed-package compiler change is
+prepared in `AxiomCore/axiom-build` PR #2; the currently released CLI still
+uses its legacy SDK snapshot until that change ships.
 
 | Language | Package | Source | Registry |
 | --- | --- | --- | --- |
@@ -57,7 +59,11 @@ with a crate-root `axiom_bindings` module; TypeScript gets a generated
 `AxiomDeps.toml` or a relevant `.acore` state declaration changes.
 
 For a local `.acore` state such as `state cart { subtotal_cents: Int = 1 }`,
-the permission-scoped Rust binding contains `ui::Cart`, and `Cart` exposes a
+`AxiomDeps.toml` grants the extension access to `cart.subtotal_cents`. The CLI
+generates a crate-root `axiom_bindings` module, so authored Rust can write
+`use crate::axiom_bindings::ui::Cart;`: rust-analyzer resolves `Cart` from the
+generated Cargo example, not directly from the `.acore` file. The
+permission-scoped Rust binding exposes a
 `subtotal_cents_typed() -> Result<u64>` method alongside its generic adapter.
 TypeScript and Python selectors carry `number`/`int`, `string`/`str`, or
 `boolean`/`bool` types for supported scalar fields. A state scope supplied by
