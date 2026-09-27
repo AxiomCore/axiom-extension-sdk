@@ -1,4 +1,5 @@
 name: Publish one extension SDK package
+run-name: extension-${{ inputs.component }}-${{ inputs.version }}-${{ inputs.request_id || 'manual' }}
 
 # Deliberately manual: no push or tag implicitly publishes a package.
 on:
@@ -12,6 +13,10 @@ on:
       version:
         description: Exact version committed in the owning manifest
         required: true
+        type: string
+      request_id:
+        description: Unique release-plane handoff ID (leave blank for manual releases)
+        required: false
         type: string
 
 permissions:

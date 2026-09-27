@@ -79,12 +79,15 @@ reproducible generated snapshot.
 
 Run `bash scripts/build.sh` to test all packages and create local package
 archives. The GitHub Actions validation workflow runs the same checks. The
-manual release workflow requires a protected `package-release` GitHub
+explicitly dispatched release workflow requires a protected `package-release` GitHub
 environment, a `CARGO_REGISTRY_TOKEN` secret, an npm trusted publisher for
 `.github/workflows/release.yml`, a PyPI trusted publisher for the same workflow
 and environment, and an `AXIOMCORE_RELEASE_ASSET_TOKEN` with contents-write
 permission on `AxiomCore/AxiomCore`. Configure each registry identity before
 its first release. No push to this repository automatically publishes a package.
+The private release plane can dispatch it with a unique handoff ID after a
+reviewed train confirmation, then verify registry and AxiomCore mirror bytes.
+Manual dispatch remains available for a one-package recovery release.
 
 SDK APIs carry no ambient network, filesystem, process, clock, random, or
 native-addon authority. Runtime permissions are still enforced by Axiom's
