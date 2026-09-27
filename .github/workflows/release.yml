@@ -45,7 +45,25 @@ jobs:
                 rust-sdk) package=axiom-extension-sdk ;;
               esac
               cargo test --workspace --locked
-              cargo package --locked -p "$package"
+              if [ "$COMPONENT" = rust-sdk ]; then
+                # The ABI and derive crates may have been published only moments
+                # ago. Wait for Cargo's registry index to expose both versions.
+                package_log="$RUNNER_TEMP/axiom-cargo-package.stderr"
+                for attempt in {1..12}; do
+                  if cargo package --locked -p "$package" 2>"$package_log"; then
+                    cat "$package_log" >&2
+                    break
+                  fi
+                  cat "$package_log" >&2
+                  if ! grep -Eq 'no matching package named `(axiom-extension-abi|axiom-extension-sdk-derive)` found' "$package_log" || [ "$attempt" -eq 12 ]; then
+                    exit 1
+                  fi
+                  echo "Waiting for published Rust SDK dependencies in the crates.io index (attempt $attempt/12)"
+                  sleep 15
+                done
+              else
+                cargo package --locked -p "$package"
+              fi
               cp "target/package/$package-$VERSION.crate" release-archives/
               ;;
             typescript-sdk)
@@ -95,7 +113,9 @@ jobs:
             rust-sdk) cargo publish --locked -p axiom-extension-sdk ;;
             typescript-sdk)
               npm install -g npm@11.5.1
-              npm publish release-archives/*.tgz --provenance --access public --ignore-scripts
+              archive="$PWD/release-archives/axiomcore-extension-sdk-$VERSION.tgz"
+              test -f "$archive"
+              npm publish "$archive" --provenance --access public --ignore-scripts
               ;;
             python-sdk) uv publish release-archives/* ;;
           esac

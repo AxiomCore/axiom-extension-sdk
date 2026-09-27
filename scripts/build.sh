@@ -5,8 +5,8 @@ sdk_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cargo test --manifest-path "$sdk_root/Cargo.toml" --workspace --locked
 cargo package --manifest-path "$sdk_root/Cargo.toml" -p axiom-extension-abi --no-verify --allow-dirty
 cargo package --manifest-path "$sdk_root/Cargo.toml" -p axiom-extension-sdk-derive --no-verify --allow-dirty
-# Cargo cannot package the SDK itself until its two registry dependencies are
-# published. Listing the package still checks its intended archive contents.
+# Listing stays usable even when the next SDK version's registry dependencies
+# have not yet propagated; the protected release workflow packages it fully.
 cargo package --manifest-path "$sdk_root/Cargo.toml" -p axiom-extension-sdk --list --allow-dirty >/dev/null
 npm ci --prefix "$sdk_root/typescript" --ignore-scripts
 npm test --prefix "$sdk_root/typescript"

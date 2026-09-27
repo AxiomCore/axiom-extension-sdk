@@ -14,13 +14,13 @@ uses its legacy SDK snapshot until that change ships.
 | TypeScript | `@axiomcore/extension-sdk` | [`typescript`](typescript) | npm |
 | Python | `axiom-extension-sdk` | [`python`](python) | PyPI |
 
-The packages are **not yet published**. Until the first coordinated release,
-install from an explicit local checkout for development; do not imply that
-`0.1.0` is already available from a registry. A release first publishes the
-Rust ABI and derive crates, then the Rust SDK, and can publish the independent
-TypeScript and Python packages. A release operator must verify all package
-registries and mirror the public archives into AxiomCore Releases before
-considering the release complete.
+Packages are published independently. Check the owning registry for the exact
+version before using it; a successful publish of one package does not imply
+that the others are available. Publish the Rust ABI and derive crates before
+the Rust SDK, allowing time for crates.io index propagation. TypeScript and
+Python are independent. A release operator must verify each package in its
+registry and its public archive in AxiomCore Releases before considering that
+component complete.
 
 ## Project setup
 
