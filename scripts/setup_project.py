@@ -142,7 +142,8 @@ def rust(project: Path, alias: str, source: Path, sdk: Path | None, cli: str) ->
         f'#![allow(dead_code, non_camel_case_types, non_snake_case, non_upper_case_globals, unused_imports)]\n'
         f'pub mod axiom_bindings;\n#[path = "{relative}"]\nmod authored;\nfn main() {{}}\n'
     )
-    run("cargo", "generate-lockfile", cwd=project)
+    if not (project / "Cargo.lock").is_file():
+        run("cargo", "generate-lockfile", cwd=project)
     run("cargo", "fetch", "--locked", cwd=project)
     run("cargo", "metadata", "--locked", "--offline", "--format-version", "1", cwd=project)
 
@@ -150,8 +151,15 @@ def rust(project: Path, alias: str, source: Path, sdk: Path | None, cli: str) ->
 def typescript(project: Path, alias: str, sdk: Path | None, cli: str) -> None:
     write_if_missing(project / "package.json", '{"name":"axiom-extension-project","private":true,"type":"module"}\n')
     package = str(sdk / "typescript") if sdk else f"{PACKAGE}@{SDK_VERSION}"
-    run("npm", "install", "--save-dev", "--save-exact", "--ignore-scripts", package,
-        "typescript@7.0.2", cwd=project)
+    expected_dependency = ("file:" + os.path.relpath(sdk / "typescript", project).replace(os.sep, "/")
+                           if sdk else SDK_VERSION)
+    document = json.loads((project / "package.json").read_text())
+    locked = (project / "package-lock.json").is_file()
+    dependencies = document.get("devDependencies", {})
+    if (not locked or dependencies.get(PACKAGE) != expected_dependency
+            or dependencies.get("typescript") != "7.0.2"):
+        run("npm", "install", "--save-dev", "--save-exact", "--ignore-scripts", package,
+            "typescript@7.0.2", cwd=project)
     if sdk is not None and not (sdk / "typescript/dist/index.d.ts").is_file():
         raise RuntimeError("build the local TypeScript SDK with `npm run build` before linking it")
     run("npm", "ci", "--ignore-scripts", cwd=project)
@@ -189,7 +197,10 @@ def python(project: Path, alias: str, sdk: Path | None, cli: str) -> None:
     document = tomllib.loads(manifest.read_text())
     if not any(item.startswith("axiom-extension-sdk") for item in document.get("project", {}).get("dependencies", [])):
         raise RuntimeError("pyproject.toml exists but does not declare axiom-extension-sdk==0.1.0")
-    run("uv", "sync", "--project", str(project), cwd=project)
+    command = ["uv", "sync", "--project", str(project)]
+    if (project / "uv.lock").is_file():
+        command.append("--locked")
+    run(*command, cwd=project)
     (project / "axiom_bindings.pyi").write_text(
         run(cli, "extensions", "python-inspect", alias, "--deps", "AxiomDeps.toml",
             "--view", "stubs", cwd=project)
