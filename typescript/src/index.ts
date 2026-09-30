@@ -141,7 +141,7 @@ export function createContext(invocation: Invocation): ExtensionContext {
     patch(resource) {
       const snapshot = snapshots.get(resource);
       if (!snapshot) throw new Error(`cannot patch absent snapshot ${resource}`);
-      return new PatchBuilder(resource.replace(/^ui:/, ""), snapshot.revision);
+      return new PatchBuilder(resource, snapshot.revision);
     },
     effects(...effects) {
       return { kind: "yielded", plan: { effects } };
