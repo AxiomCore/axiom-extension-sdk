@@ -1,0 +1,4 @@
+title = "Axiom final payload credentials policy"
+
+[extend]
+useDefault = true

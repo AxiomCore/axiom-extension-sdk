@@ -78,6 +78,21 @@ jobs:
               ;;
             python-sdk) uv build python --out-dir release-archives ;;
           esac
+      - name: Inspect the final package bytes
+        run: |
+          scanner_archive="$RUNNER_TEMP/gitleaks.tar.gz"
+          curl --fail --silent --show-error --location https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz --output "$scanner_archive"
+          printf '%s  %s\n' '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb' "$scanner_archive" | sha256sum --check --status
+          tar -xzf "$scanner_archive" -C "$RUNNER_TEMP" gitleaks
+          mkdir -p release-inspections
+          for archive in release-archives/*; do
+            python3 -B scripts/check_release_artifact.py --artifact "$archive" --signatures .github/security/signatures.json --scanner "$RUNNER_TEMP/gitleaks" --receipt "release-inspections/$(basename "$archive").json"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: extension-package-inspection
+          path: release-inspections/
+          if-no-files-found: error
       - uses: actions/upload-artifact@v4
         with:
           name: extension-package
@@ -99,6 +114,10 @@ jobs:
         with:
           name: extension-package
           path: release-archives
+      - uses: actions/download-artifact@v4
+        with:
+          name: extension-package-inspection
+          path: release-inspections
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-node@v4
         with:
@@ -112,10 +131,13 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           python3 -B scripts/verify_release_input.py "$COMPONENT" "$VERSION"
+          python3 -B scripts/verify_inspected_packages.py --archives release-archives --receipts release-inspections --signatures .github/security/signatures.json
           case "$COMPONENT" in
-            rust-abi) cargo publish --locked -p axiom-extension-abi ;;
-            rust-derive) cargo publish --locked -p axiom-extension-sdk-derive ;;
-            rust-sdk) cargo publish --locked -p axiom-extension-sdk ;;
+            rust-abi|rust-derive|rust-sdk)
+              for archive in release-archives/*.crate; do
+                python3 -B scripts/publish_reviewed_crate.py --archive "$archive" --receipt "release-inspections/$(basename "$archive").json" --signatures .github/security/signatures.json --version "$VERSION"
+              done
+              ;;
             typescript-sdk)
               npm install -g npm@11.5.1
               archive="$PWD/release-archives/axiomcore-extension-sdk-$VERSION.tgz"
@@ -132,10 +154,17 @@ jobs:
     permissions:
       contents: read
     steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
           name: extension-package
           path: release-archives
+      - uses: actions/download-artifact@v4
+        with:
+          name: extension-package-inspection
+          path: release-inspections
       - name: Mirror public archive into AxiomCore Releases
         env:
           GH_TOKEN: ${{ secrets.AXIOMCORE_RELEASE_ASSET_TOKEN }}
@@ -144,6 +173,7 @@ jobs:
           SDK_COMMIT: ${{ github.sha }}
         run: |
           test -n "$GH_TOKEN"
+          python3 -B scripts/verify_inspected_packages.py --archives release-archives --receipts release-inspections --signatures .github/security/signatures.json
           tag="extension-$COMPONENT-v$VERSION"
           if ! gh release view "$tag" --repo AxiomCore/AxiomCore >/dev/null 2>&1; then
             gh release create "$tag" --repo AxiomCore/AxiomCore --target main \

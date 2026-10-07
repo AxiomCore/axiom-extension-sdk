@@ -15,6 +15,10 @@ jobs:
       - run: cargo package -p axiom-extension-abi --no-verify --allow-dirty
       - run: cargo package -p axiom-extension-sdk-derive --no-verify --allow-dirty
       - run: cargo package -p axiom-extension-sdk --list --allow-dirty
+      - run: mkdir -p release-archives && cp target/package/*.crate release-archives/
+      - uses: ./.github/actions/inspect
+        with:
+          directory: release-archives
   typescript:
     runs-on: ubuntu-24.04
     steps:
@@ -28,13 +32,18 @@ jobs:
         working-directory: typescript
       - run: npm test
         working-directory: typescript
-      - run: npm pack --dry-run --json --ignore-scripts
-        working-directory: typescript
+      - run: mkdir -p release-archives && npm pack ./typescript --pack-destination release-archives --ignore-scripts
+      - uses: ./.github/actions/inspect
+        with:
+          directory: release-archives
   python:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
-      - run: uv build python
+      - run: uv build python --out-dir release-archives
+      - uses: ./.github/actions/inspect
+        with:
+          directory: release-archives
       - run: python3 -B -m unittest discover -s scripts -p 'test_*.py'
       - run: uv run --no-project python -m compileall -q python/axiom_extension_sdk
