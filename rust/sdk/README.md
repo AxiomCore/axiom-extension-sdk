@@ -1,5 +1,15 @@
 # Axiom Rust extension SDK
 
+The working 0.1.2 candidate includes generated selected finite codecs and named
+continuations. Selected package schemas v2/v3 remain separate from ABI v1. A
+named yield carries bounded typed state and declared branch inputs; the host
+authorizes and executes those effects, validates their outcomes, and invokes a
+fresh named resume. It does not preserve guest heap state or infer extra grants.
+The complete selected example lives in
+`examples/advanced-language-dx/selected-extensions/rust` in the AxiomCore workspace.
+Use that cohort's generated bindings and exact ABI/derive dependencies. Candidate
+source capability does not imply a published version or target qualification.
+
 Use the typed prelude, reviewed macros, and permission-scoped bindings generated
 from `AxiomDeps.toml`:
 

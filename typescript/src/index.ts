@@ -74,6 +74,7 @@ export type ExtensionHandler = (context: ExtensionContext) => ExtensionResponse;
 export interface ExtensionDefinition {
   exports: Record<string, ExtensionHandler>;
   resume?: (context: {
+    requestId?: number;
     outcomes: unknown[];
     events: unknown[];
   }) => ExtensionResponse;

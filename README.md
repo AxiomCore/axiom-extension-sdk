@@ -1,5 +1,20 @@
 # Axiom extension SDKs
 
+The M2 Rust working SDK adds `ExtensionResponse::yield_group(EffectGroup)` for
+finite host-owned groups. The versioned descriptor
+`axiom-extension-effect-group/v1` has named branches, an explicit limit (1–8),
+and fail-fast/collect mode. Resume outcome indexes retain declaration order.
+Existing `Effects`/`EffectPlan` execution remains sequential. This API adds no
+grants: initial supported groups contain contract queries, with shared finite
+host-call/byte capacities and cancellation/drain ownership. A host must
+explicitly qualify group support; unsupported adapters reject before I/O.
+Guests cannot provide replay-safety evidence, worker credentials or ambient
+timers. Granted contract commands may invoke an admitted backend job producer.
+The compiled Rust group fixture is in
+`axiom-runtime/extensions/fixtures/m2-group-guest` in the AxiomCore workspace;
+SDK source support does not imply all published hosts or other language SDKs
+support the new descriptor.
+
 Public, independently versioned authoring SDKs for Axiom extensions. This
 repository is the source of truth for the SDK packages; the Axiom CLI contains
 the compiler and binding generator. The installed-package compiler change is
@@ -76,6 +91,14 @@ out of the committed source tree unless a project intentionally checks in a
 reproducible generated snapshot.
 
 ## Build and release
+
+The M1 schema engine is currently qualified through the private workspace guest
+SDK in `axiom-runtime/extensions/sdk`, using its optional `schema` feature.
+The published Rust SDK keeps its independent ABI/package closure and does not
+depend on the private compiler library. The TypeScript `schema` entry point and
+generated public failure clients use selected descriptors; hosts still validate
+returned outputs and proposals independently. Use matching workspace tooling
+for M1 helpers, and qualify the exact compiled guest against the host's limits.
 
 Run `bash scripts/build.sh` to test all packages and create local package
 archives. The GitHub Actions validation workflow runs the same checks. The

@@ -8,7 +8,6 @@ mod primitives;
 #[cfg(feature = "std")]
 pub mod test;
 mod typed;
-
 use abi::{
     CodecLimits, Effect, EffectOutcome, EventBatch, ExtensionError, Field, Frame, GuestMessage,
     HostMessage, Invocation, InvocationResult, Patch, PatchOperation, RequestId,
@@ -21,7 +20,7 @@ pub use primitives::{Cents, DurationMs, Id, Percentage, Revision, TimestampMs};
 pub use typed::{
     boxed_extension, AxiomDecode, AxiomEncode, AxiomType, EffectCall, Effects, ExtensionResponse,
     Operation, RecordDecoder, Result, ResumeContext, SdkError, Store, StoreField, StoreObject,
-    StorePatch, StoreTransaction, Stream, TypedExtension, TypedInvocation, UiField, UiPatch,
+    StorePatch, StoreTransaction, Stream, StreamBatch, TypedExtension, TypedInvocation, UiField, UiPatch,
     UiScope, UiState,
 };
 
@@ -31,7 +30,7 @@ pub mod prelude {
     pub use crate::{
         boxed_extension, export, extension, AxiomDecode, AxiomEncode, AxiomType, Cents, DurationMs,
         EffectCall, Effects, ExtensionResponse, Id, Operation, Percentage, Result, ResumeContext,
-        Revision, SdkError, Store, StoreField, StoreObject, StorePatch, StoreTransaction, Stream,
+        Revision, SdkError, Store, StoreField, StoreObject, StorePatch, StoreTransaction, Stream, StreamBatch,
         TimestampMs, TypedExtension, TypedInvocation, UiField, UiPatch, UiScope, UiState,
     };
 }
@@ -223,7 +222,7 @@ impl<E: Extension> GuestMachine<E> {
         match &response {
             GuestMessage::Yielded {
                 request_id: actual, ..
-            } if *actual == request_id => {
+            } | GuestMessage::YieldedGroup {request_id:actual,..} if *actual == request_id => {
                 self.state = MachineState::Yielded(request_id);
             }
             GuestMessage::Completed {

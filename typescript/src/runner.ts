@@ -22,7 +22,7 @@ export function runExtension(extension: ExtensionDefinition): void {
       if (!handler) throw new Error(`unknown extension export: ${request.invocation.export}`);
       response = handler(createContext(request.invocation));
     } else if (request.kind === "resume" && extension.resume) {
-      response = extension.resume({ outcomes: request.outcomes, events: request.events });
+      response = extension.resume({ requestId: request.request_id, outcomes: request.outcomes, events: request.events });
     } else {
       throw new Error(`unsupported extension bridge message: ${request.kind}`);
     }

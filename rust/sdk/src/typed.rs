@@ -396,6 +396,10 @@ impl ResumeContext {
     pub fn event_batches(&self) -> &[EventBatch] {
         &self.events
     }
+
+    /// Checked generated resume tables inspect the complete correlation set;
+    /// selecting the first matching index alone cannot detect duplicate replies.
+    pub fn outcomes(&self) -> &[EffectOutcome] { &self.outcomes }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -405,6 +409,7 @@ pub struct ExtensionResponse {
     transactions: Vec<TransactionProposal>,
     events: Vec<Event>,
     effects: Option<abi::EffectPlan>,
+    group: Option<abi::EffectGroup>,
 }
 
 impl ExtensionResponse {
@@ -415,6 +420,7 @@ impl ExtensionResponse {
             transactions: Vec::new(),
             events: Vec::new(),
             effects: None,
+            group: None,
         }
     }
 
@@ -427,9 +433,22 @@ impl ExtensionResponse {
             transactions: Vec::new(),
             events: Vec::new(),
             effects: Some(effects.build()),
+            group: None,
         }
     }
 
+    /// A finite host-owned group. Hosts without the explicit capability reject.
+    /// Branch names/indexes retain declaration order; this adds no grants.
+    pub fn yield_group(group: abi::EffectGroup) -> Self {
+        Self {
+            output: Value::Null,
+            patches: Vec::new(),
+            transactions: Vec::new(),
+            events: Vec::new(),
+            effects: None,
+            group: Some(group),
+        }
+    }
     pub fn patch(mut self, patch: impl Into<Patch>) -> Self {
         self.patches.push(patch.into());
         self
@@ -449,6 +468,9 @@ impl ExtensionResponse {
     }
 
     fn into_message(self, request_id: RequestId) -> GuestMessage {
+        if let Some(group) = self.group {
+            return GuestMessage::YieldedGroup { request_id, group };
+        }
         if let Some(plan) = self.effects {
             return GuestMessage::Yielded { request_id, plan };
         }
@@ -858,21 +880,44 @@ impl Effects {
     }
 }
 
+/// A handle-bound ordered decoder. Progress commits only after the whole batch
+/// validates, so malformed values cannot consume sequence numbers.
 pub struct Stream<T> {
     handle: Handle,
+    next_sequence: core::cell::Cell<u64>,
+    terminal: core::cell::Cell<bool>,
+    max_events: usize,
+    max_bytes: usize,
     marker: PhantomData<fn() -> T>,
+}
+
+pub struct StreamBatch<T> {
+    pub events: Vec<T>,
+    pub dropped: u32,
+    pub terminal: bool,
 }
 
 impl<T> Stream<T> {
     pub fn from_value(value: &Value) -> Result<Self> {
+        Self::bounded(value, 256, 65536)
+    }
+
+    pub fn bounded(value: &Value, max_events: usize, max_bytes: usize) -> Result<Self> {
         let Value::Handle(handle) = value else {
             return Err(type_error("stream handle", value));
         };
-        if handle.kind != HandleKind::Stream {
-            return Err(SdkError::invalid_input("handle is not a stream"));
+        if handle.kind != HandleKind::Stream || handle.id == 0 || handle.generation == 0 {
+            return Err(SdkError::invalid_input("invalid stream handle"));
+        }
+        if !(1..=256).contains(&max_events) || !(64..=65536).contains(&max_bytes) {
+            return Err(SdkError::invalid_input("invalid stream decoder bounds"));
         }
         Ok(Self {
             handle: *handle,
+            next_sequence: core::cell::Cell::new(1),
+            terminal: core::cell::Cell::new(false),
+            max_events,
+            max_bytes,
             marker: PhantomData,
         })
     }
@@ -880,21 +925,109 @@ impl<T> Stream<T> {
     pub fn handle(&self) -> Handle {
         self.handle
     }
+    pub fn next_sequence(&self) -> u64 {
+        self.next_sequence.get()
+    }
+    pub fn is_terminal(&self) -> bool {
+        self.terminal.get()
+    }
 }
 
 impl<T: AxiomDecode> Stream<T> {
+    /// Event processing requires contiguous delivery and rejects reported loss.
     pub fn decode_batch(&self, batch: &EventBatch) -> Result<Vec<T>> {
+        if batch.dropped != 0 {
+            return Err(SdkError::conflict("stream reports lost events"));
+        }
+        self.decode_state_batch(batch).map(|b| b.events)
+    }
+
+    /// Explicitly lossy replaceable-state consumers receive loss metadata.
+    /// The host's source contract must separately authorize coalescing.
+    pub fn decode_state_batch(&self, batch: &EventBatch) -> Result<StreamBatch<T>> {
         if batch.subscription != self.handle {
             return Err(SdkError::denied(
-                "event batch belongs to another stream handle",
+                "event batch belongs to another stream handle or generation",
             ));
         }
-        batch
-            .events
-            .iter()
-            .map(|event| T::decode(&event.value))
-            .collect()
+        if self.terminal.get() {
+            return Err(SdkError::conflict("stream is already terminal"));
+        }
+        if batch.events.len() > self.max_events {
+            return Err(SdkError::invalid_input("stream event bound exceeded"));
+        }
+        // Preflight before allocating decoded values or a protocol buffer.
+        let mut bytes = 32usize;
+        let mut nodes = 0usize;
+        for event in &batch.events {
+            stream_value_bound(&event.value, 0, &mut nodes, &mut bytes, self.max_bytes)?;
+            bytes = bytes.saturating_add(16);
+            if bytes > self.max_bytes {
+                return Err(SdkError::invalid_input("stream byte bound exceeded"));
+            }
+        }
+        let mut next = self.next_sequence.get();
+        let mut values = Vec::with_capacity(batch.events.len());
+        for event in &batch.events {
+            if event.sequence != next {
+                return Err(SdkError::conflict(
+                    "stream sequence gap, duplicate or reorder",
+                ));
+            }
+            next = next
+                .checked_add(1)
+                .ok_or_else(|| SdkError::invalid_input("stream sequence exhausted"))?;
+            values.push(T::decode(&event.value)?);
+        }
+        self.next_sequence.set(next);
+        self.terminal.set(batch.terminal);
+        Ok(StreamBatch {
+            events: values,
+            dropped: batch.dropped,
+            terminal: batch.terminal,
+        })
     }
+}
+fn stream_value_bound(
+    value: &Value,
+    depth: usize,
+    nodes: &mut usize,
+    bytes: &mut usize,
+    limit: usize,
+) -> Result<()> {
+    *nodes = nodes.saturating_add(1);
+    *bytes = bytes.saturating_add(16);
+    if depth > 32 || *nodes > 4096 || *bytes > limit {
+        return Err(SdkError::invalid_input(
+            "stream value exceeds depth/node/byte bounds",
+        ));
+    }
+    match value {
+        Value::String(v) => *bytes = bytes.saturating_add(v.len()),
+        Value::Bytes(v) => *bytes = bytes.saturating_add(v.len()),
+        Value::List(values) => {
+            for v in values {
+                stream_value_bound(v, depth + 1, nodes, bytes, limit)?;
+            }
+        }
+        Value::Record(fields) => {
+            for f in fields {
+                *bytes = bytes.saturating_add(f.name.len());
+                stream_value_bound(&f.value, depth + 1, nodes, bytes, limit)?;
+            }
+        }
+        Value::Variant { case, value } => {
+            *bytes = bytes.saturating_add(case.len());
+            if let Some(v) = value {
+                stream_value_bound(v, depth + 1, nodes, bytes, limit)?;
+            }
+        }
+        _ => {}
+    }
+    if *bytes > limit {
+        return Err(SdkError::invalid_input("stream byte bound exceeded"));
+    }
+    Ok(())
 }
 
 fn value_at_path<'a>(value: &'a Value, path: &str) -> Result<&'a Value> {

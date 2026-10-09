@@ -1,6 +1,6 @@
 {
   "name": "@axiomcore/extension-sdk",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Typed, deterministic authoring API for Axiom extensions",
   "license": "Apache-2.0",
   "repository": {
@@ -19,6 +19,14 @@
     "./runner": {
       "types": "./dist/runner.d.ts",
       "default": "./dist/runner.js"
+    },
+    "./schema": {
+      "types": "./dist/schema.d.ts",
+      "default": "./dist/schema.js"
+    },
+    "./selected": {
+      "types": "./dist/selected.d.ts",
+      "default": "./dist/selected.js"
     }
   },
   "files": [

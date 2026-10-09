@@ -29,5 +29,6 @@ class Context(Protocol):
 
 class _Extension:
     def export(self, function: T) -> T: ...
+    def resume(self, function: T) -> T: ...
 
 extension: _Extension

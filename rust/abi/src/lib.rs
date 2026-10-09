@@ -5,6 +5,7 @@ extern crate alloc;
 
 use alloc::{string::String, vec::Vec};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+mod value_decode;
 
 pub const ABI_NAME: &str = "axiom-extension-abi";
 pub const ABI_VERSION: AbiVersion = AbiVersion { major: 1, minor: 0 };
@@ -43,7 +44,7 @@ pub enum HandleKind {
     Secret,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub enum Value {
     Null,
     Bool(bool),
@@ -126,6 +127,15 @@ pub struct EffectPlan {
     pub effects: Vec<Effect>,
 }
 
+pub const EFFECT_GROUP_FORMAT:&str="axiom-extension-effect-group/v1";
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EffectGroupMode {FailFast,Collect}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NamedEffect {pub name:String,pub effect:Effect}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EffectGroup {pub format:String,pub limit:u16,pub mode:EffectGroupMode,pub branches:Vec<NamedEffect>}
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EffectOutcome {
     pub index: u32,
@@ -231,6 +241,7 @@ pub enum GuestMessage {
     },
     Drained,
     Shutdown,
+    YieldedGroup {request_id:RequestId,group:EffectGroup},
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -382,7 +393,7 @@ impl Lifecycle {
                 SessionState::Negotiated
             }
             (SessionState::Negotiated, GuestMessage::Initialized) => SessionState::Ready,
-            (SessionState::Running(active), GuestMessage::Yielded { request_id, .. })
+            (SessionState::Running(active), GuestMessage::Yielded { request_id, .. } | GuestMessage::YieldedGroup {request_id,..})
                 if active == *request_id =>
             {
                 SessionState::Yielded(active)

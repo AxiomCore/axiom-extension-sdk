@@ -169,6 +169,7 @@ impl TestHost {
         let mut resumptions = 0usize;
         loop {
             match message {
+                GuestMessage::YieldedGroup{..} => return self.fail("effect groups require a qualified broker harness"),
                 GuestMessage::Yielded { plan, .. } => {
                     if resumptions >= 32 {
                         return self.fail("test host continuation limit exceeded");

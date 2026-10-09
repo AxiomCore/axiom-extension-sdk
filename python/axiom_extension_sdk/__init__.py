@@ -36,6 +36,8 @@ class Context(Protocol):
 class _Extension:
     def export(self, function: T) -> T:
         return function
+    def resume(self, function: T) -> T:
+        return function
 
 
 extension = _Extension()
