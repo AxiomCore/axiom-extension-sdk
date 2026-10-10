@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "axiom-extension-sdk"
-version = "0.1.1"
+version = "0.1.2"
 description = "Typed authoring surface for deterministic Axiom Python extensions"
 readme = "README.md"
 requires-python = ">=3.12"

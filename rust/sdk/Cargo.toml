@@ -1,6 +1,6 @@
 [package]
 name = "axiom-extension-sdk"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 license = "Apache-2.0"
 description = "Rust guest SDK for Axiom extension ABI v1"
@@ -12,5 +12,5 @@ default = ["std"]
 std = ["axiom-extension-abi/std"]
 
 [dependencies]
-axiom-extension-abi = { path = "../abi", version = "1.0.2", default-features = false }
-axiom-extension-sdk-derive = { path = "../sdk-derive", version = "0.1.2" }
+axiom-extension-abi = { path = "../abi", version = "1.0.3", default-features = false }
+axiom-extension-sdk-derive = { path = "../sdk-derive", version = "0.1.3" }
