@@ -29,3 +29,15 @@ The complete source example is
 workspace. Use the exact SDK, generated selection and managed toolchain from
 that cohort. These working candidate capabilities do not establish registry
 publication or browser/mobile qualification.
+
+## Portable schema source checks
+
+The portable validation helper has a checked source binding in
+`schema-runtime.source.json`. Standalone SDK validation verifies both the
+generated helper and its source hash; workspace validation also compares the
+actual host helper when that checkout is present. CI does not need access to a
+private sibling repository.
+
+Maintainers synchronize a reviewed helper from the workspace with
+`python3 -B scripts/sync_portable_schema.py --host-source ../axiom-ui-host/web/acore-schema.js`
+at the SDK repository root. Add `--check` to reject drift without writing files.

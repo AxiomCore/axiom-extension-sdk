@@ -1,9 +1,22 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {readFileSync} from 'node:fs';
+import {existsSync,readFileSync} from 'node:fs';
+import {createHash} from 'node:crypto';
 import {codec,validate,normalize} from '../dist/schema.js';
 const schema={format:'axiom-validation-schema/v1',models:{Input:{count:{ty:{kind:'int32'},optional:false,rule:null,default:{value:4}}}},enums:{},language:{codecs:{id:{encoded:{kind:'string'},decoded:{kind:'int64'},decode:'parseCanonicalInt64',encode:'formatCanonicalInt64'}}}};
-test('shared portable helper is generated from the qualified host source',()=>{assert.equal(readFileSync(new URL('../src/schema-runtime.ts',import.meta.url),'utf8'),'// @ts-nocheck\n'+readFileSync(new URL('../../../axiom-ui-host/web/acore-schema.js',import.meta.url),'utf8'));});
+test('shared portable helper matches its pinned qualified source in standalone and workspace checkouts',()=>{
+ const binding=JSON.parse(readFileSync(new URL('../schema-runtime.source.json',import.meta.url),'utf8'));
+ assert.equal(binding.format,'axiom-portable-schema-source/v1');
+ assert.equal(binding.sourcePath,'axiom-ui-host/web/acore-schema.js');
+ const generated=readFileSync(new URL('../src/schema-runtime.ts',import.meta.url));
+ const prefix=Buffer.from('// @ts-nocheck\n');
+ assert.deepEqual(generated.subarray(0,prefix.length),prefix);
+ const source=generated.subarray(prefix.length),sha=bytes=>createHash('sha256').update(bytes).digest('hex');
+ assert.equal(sha(source),binding.sourceSha256);
+ assert.equal(sha(generated),binding.generatedSha256);
+ const host=new URL('../../../axiom-ui-host/web/acore-schema.js',import.meta.url);
+ if(existsSync(host))assert.deepEqual(source,readFileSync(host));
+});
 test('selected validators and exact portable codecs reject malformed values',()=>{assert.equal(codec(schema,'id','123'),123);assert.throws(()=>codec(schema,'id','9007199254740993'));assert.deepEqual(JSON.parse(JSON.stringify(normalize(schema,{kind:'named',value:'Input'},{}))),{count:4});assert.equal(validate(schema,{kind:'named',value:'Input'},{count:null}).issues[0].code,'invalid_type');});
 
 import {decodeFailure} from '../dist/schema.js';
