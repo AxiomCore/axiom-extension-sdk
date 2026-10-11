@@ -41,7 +41,8 @@ jobs:
           VERSION: ${{ inputs.version }}
         run: |
           python3 -B scripts/verify_release_input.py "$COMPONENT" "$VERSION"
-          mkdir -p release-archives
+          archives="$RUNNER_TEMP/axiom-extension-release/archives"
+          mkdir -p "$archives"
           case "$COMPONENT" in
             rust-abi|rust-derive|rust-sdk)
               case "$COMPONENT" in
@@ -69,14 +70,14 @@ jobs:
               else
                 cargo package --locked -p "$package"
               fi
-              cp "target/package/$package-$VERSION.crate" release-archives/
+              cp "target/package/$package-$VERSION.crate" "$archives/"
               ;;
             typescript-sdk)
               npm ci --ignore-scripts --prefix typescript
               npm test --prefix typescript
-              npm pack ./typescript --pack-destination release-archives --ignore-scripts
+              npm pack ./typescript --pack-destination "$archives" --ignore-scripts
               ;;
-            python-sdk) uv build python --out-dir release-archives ;;
+            python-sdk) uv build python --out-dir "$archives" --no-create-gitignore ;;
           esac
       - name: Inspect the final package bytes
         run: |
@@ -84,19 +85,21 @@ jobs:
           curl --fail --silent --show-error --location https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz --output "$scanner_archive"
           printf '%s  %s\n' '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb' "$scanner_archive" | sha256sum --check --status
           tar -xzf "$scanner_archive" -C "$RUNNER_TEMP" gitleaks
-          mkdir -p release-inspections
-          for archive in release-archives/*; do
-            python3 -B scripts/check_release_artifact.py --artifact "$archive" --signatures .github/security/signatures.json --scanner "$RUNNER_TEMP/gitleaks" --receipt "release-inspections/$(basename "$archive").json"
+          archives="$RUNNER_TEMP/axiom-extension-release/archives"
+          receipts="$RUNNER_TEMP/axiom-extension-release/inspections"
+          mkdir -p "$receipts"
+          for archive in "$archives"/*; do
+            python3 -B scripts/check_release_artifact.py --artifact "$archive" --signatures .github/security/signatures.json --scanner "$RUNNER_TEMP/gitleaks" --receipt "$receipts/$(basename "$archive").json"
           done
       - uses: actions/upload-artifact@v4
         with:
           name: extension-package-inspection
-          path: release-inspections/
+          path: ${{ runner.temp }}/axiom-extension-release/inspections/
           if-no-files-found: error
       - uses: actions/upload-artifact@v4
         with:
           name: extension-package
-          path: release-archives/
+          path: ${{ runner.temp }}/axiom-extension-release/archives/
           if-no-files-found: error
 
   publish:
@@ -113,11 +116,11 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: extension-package
-          path: release-archives
+          path: ${{ runner.temp }}/axiom-extension-release/archives
       - uses: actions/download-artifact@v4
         with:
           name: extension-package-inspection
-          path: release-inspections
+          path: ${{ runner.temp }}/axiom-extension-release/inspections
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-node@v4
         with:
@@ -131,20 +134,22 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           python3 -B scripts/verify_release_input.py "$COMPONENT" "$VERSION"
-          python3 -B scripts/verify_inspected_packages.py --archives release-archives --receipts release-inspections --signatures .github/security/signatures.json
+          archives="$RUNNER_TEMP/axiom-extension-release/archives"
+          receipts="$RUNNER_TEMP/axiom-extension-release/inspections"
+          python3 -B scripts/verify_inspected_packages.py --archives "$archives" --receipts "$receipts" --signatures .github/security/signatures.json
           case "$COMPONENT" in
             rust-abi|rust-derive|rust-sdk)
-              for archive in release-archives/*.crate; do
-                python3 -B scripts/publish_reviewed_crate.py --archive "$archive" --receipt "release-inspections/$(basename "$archive").json" --signatures .github/security/signatures.json --version "$VERSION"
+              for archive in "$archives"/*.crate; do
+                python3 -B scripts/publish_reviewed_crate.py --archive "$archive" --receipt "$receipts/$(basename "$archive").json" --signatures .github/security/signatures.json --version "$VERSION"
               done
               ;;
             typescript-sdk)
               npm install -g npm@11.5.1
-              archive="$PWD/release-archives/axiomcore-extension-sdk-$VERSION.tgz"
+              archive="$archives/axiomcore-extension-sdk-$VERSION.tgz"
               test -f "$archive"
               npm publish "$archive" --provenance --access public --ignore-scripts
               ;;
-            python-sdk) uv publish release-archives/* ;;
+            python-sdk) uv publish "$archives"/* ;;
           esac
 
   mirror:
@@ -160,11 +165,11 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: extension-package
-          path: release-archives
+          path: ${{ runner.temp }}/axiom-extension-release/archives
       - uses: actions/download-artifact@v4
         with:
           name: extension-package-inspection
-          path: release-inspections
+          path: ${{ runner.temp }}/axiom-extension-release/inspections
       - name: Mirror public archive into AxiomCore Releases
         env:
           GH_TOKEN: ${{ secrets.AXIOMCORE_RELEASE_ASSET_TOKEN }}
@@ -173,11 +178,13 @@ jobs:
           SDK_COMMIT: ${{ github.sha }}
         run: |
           test -n "$GH_TOKEN"
-          python3 -B scripts/verify_inspected_packages.py --archives release-archives --receipts release-inspections --signatures .github/security/signatures.json
+          archives="$RUNNER_TEMP/axiom-extension-release/archives"
+          receipts="$RUNNER_TEMP/axiom-extension-release/inspections"
+          python3 -B scripts/verify_inspected_packages.py --archives "$archives" --receipts "$receipts" --signatures .github/security/signatures.json
           tag="extension-$COMPONENT-v$VERSION"
           if ! gh release view "$tag" --repo AxiomCore/AxiomCore >/dev/null 2>&1; then
             gh release create "$tag" --repo AxiomCore/AxiomCore --target main \
               --title "Extension $COMPONENT $VERSION" \
               --notes "Package source: https://github.com/AxiomCore/axiom-extension-sdk/tree/$SDK_COMMIT"
           fi
-          gh release upload "$tag" release-archives/* --repo AxiomCore/AxiomCore
+          gh release upload "$tag" "$archives"/* --repo AxiomCore/AxiomCore
