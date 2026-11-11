@@ -13,3 +13,8 @@ npm test --prefix "$sdk_root/typescript"
 npm pack "$sdk_root/typescript" --dry-run --json --ignore-scripts >/dev/null
 uv build "$sdk_root/python"
 uv run --no-project --python 3.12 python -B -m unittest discover -s "$sdk_root/scripts" -p 'test_*.py'
+# In the AxiomCore workspace, the runtime keeps mirrors of these sources; they
+# must not drift. Standalone public checkouts have no sibling runtime.
+if [[ -d "$sdk_root/../axiom-runtime/extensions" ]]; then
+  python3 -I "$sdk_root/scripts/check_sdk_mirror.py" --workspace "$sdk_root/.."
+fi

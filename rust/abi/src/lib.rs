@@ -327,6 +327,32 @@ where
     Ok(frame)
 }
 
+/// Decode a frame from a trusted peer: same size, trailing-data, magic and
+/// version checks as [`decode_frame`], without the canonical re-encoding.
+/// Guests use this for host frames (the host is trusted and canonical by
+/// construction), saving metered guest work on every message. Hosts must keep
+/// using [`decode_frame`] for guest output.
+pub fn decode_frame_trusted<T>(bytes: &[u8], limits: CodecLimits) -> Result<Frame<T>, ProtocolError>
+where
+    T: DeserializeOwned,
+{
+    if bytes.len() > limits.max_bytes {
+        return Err(ProtocolError::Oversize);
+    }
+    let (frame, remainder): (Frame<T>, _) =
+        postcard::take_from_bytes(bytes).map_err(|_| ProtocolError::Malformed)?;
+    if !remainder.is_empty() {
+        return Err(ProtocolError::Malformed);
+    }
+    if frame.magic != WIRE_MAGIC {
+        return Err(ProtocolError::WrongMagic);
+    }
+    if frame.abi.major != ABI_VERSION.major || frame.abi.minor > ABI_VERSION.minor {
+        return Err(ProtocolError::AbiMismatch);
+    }
+    Ok(frame)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SessionState {
     New,
@@ -335,12 +361,17 @@ enum SessionState {
     Running(RequestId),
     Yielded(RequestId),
     Draining,
+    /// The guest acknowledged `Drain`; only `Shutdown` may follow. This is the
+    /// guest SDK's rule too, and the only host sequence in use (drain, then
+    /// shut down), so the protocol checker and the guest cannot disagree.
+    Drained,
     Stopping,
     Stopped,
 }
 
 /// Protocol-only lifecycle checker. Engines call this before accepting a guest
 /// response, so duplicate terminal outcomes and post-shutdown use fail closed.
+#[derive(Clone, Debug)]
 pub struct Lifecycle {
     state: SessionState,
 }
@@ -374,7 +405,10 @@ impl Lifecycle {
                 HostMessage::Cancel { request_id },
             ) if active == *request_id => SessionState::Running(active),
             (SessionState::Ready, HostMessage::Drain) => SessionState::Draining,
-            (SessionState::Ready | SessionState::Draining, HostMessage::Shutdown) => {
+            (
+                SessionState::Ready | SessionState::Draining | SessionState::Drained,
+                HostMessage::Shutdown,
+            ) => {
                 SessionState::Stopping
             }
             _ => return Err(ProtocolError::InvalidTransition),
@@ -404,7 +438,7 @@ impl Lifecycle {
                 | GuestMessage::Failed { request_id, .. }
                 | GuestMessage::Cancelled { request_id },
             ) if active == *request_id => SessionState::Ready,
-            (SessionState::Draining, GuestMessage::Drained) => SessionState::Ready,
+            (SessionState::Draining, GuestMessage::Drained) => SessionState::Drained,
             (SessionState::Stopping, GuestMessage::Shutdown) => SessionState::Stopped,
             (
                 SessionState::Ready,
@@ -616,5 +650,189 @@ mod tests {
                 u8::from_str_radix(text, 16).unwrap()
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod trusted_decode_tests {
+    use super::*;
+    use alloc::vec;
+
+    fn frames() -> Vec<HostMessage> {
+        let id = RequestId(7);
+        vec![
+            HostMessage::Negotiate {
+                supported: vec![ABI_VERSION],
+            },
+            HostMessage::Initialize {
+                instance_id: 300,
+                application: "app".into(),
+                extension: "ext".into(),
+            },
+            HostMessage::Invoke {
+                request_id: id,
+                invocation: Invocation {
+                    export: "run".into(),
+                    input: Value::Record(vec![Field {
+                        name: "n".into(),
+                        value: Value::Unsigned(1 << 40),
+                    }]),
+                    snapshots: vec![Snapshot {
+                        resource: "ui:c".into(),
+                        revision: 70_000,
+                        value: Value::Signed(-5),
+                    }],
+                    deadline_unix_ms: 1_700_000_000_000,
+                },
+            },
+            HostMessage::Resume {
+                request_id: id,
+                outcomes: vec![EffectOutcome {
+                    index: 0,
+                    result: Ok(Value::Bytes(vec![1, 2, 3])),
+                }],
+                events: vec![],
+            },
+            HostMessage::Cancel { request_id: id },
+            HostMessage::Drain,
+            HostMessage::Shutdown,
+        ]
+    }
+
+    #[test]
+    fn trusted_decode_agrees_with_checked_decode_on_a_mutation_corpus() {
+        let limits = CodecLimits { max_bytes: 4096 };
+        let mut checked_accepts = 0;
+        for message in frames() {
+            let canonical = encode(&Frame::new(message), limits).unwrap();
+            let mut corpus = vec![canonical.clone()];
+            for end in 0..canonical.len() {
+                corpus.push(canonical[..end].to_vec());
+            }
+            for index in 0..canonical.len() {
+                for mask in [0x01_u8, 0x80, 0xff] {
+                    let mut mutated = canonical.clone();
+                    mutated[index] ^= mask;
+                    corpus.push(mutated);
+                }
+            }
+            let mut trailing = canonical.clone();
+            trailing.push(0);
+            corpus.push(trailing);
+            for bytes in corpus {
+                let checked = decode_frame::<HostMessage>(&bytes, limits);
+                let trusted = decode_frame_trusted::<HostMessage>(&bytes, limits);
+                match (&checked, &trusted) {
+                    (Ok(left), Ok(right)) => {
+                        assert_eq!(left, right);
+                        checked_accepts += 1;
+                    }
+                    (Ok(_), Err(error)) => {
+                        panic!("trusted decoder rejected a valid frame: {error:?}")
+                    }
+                    // Only canonical-form violations may be accepted by the trusted decoder.
+                    (Err(ProtocolError::NonCanonical), _) | (Err(_), Err(_)) => {}
+                    (Err(error), Ok(_)) => {
+                        panic!("trusted decoder accepted a frame rejected with {error:?}")
+                    }
+                }
+            }
+        }
+        assert!(
+            checked_accepts >= frames().len(),
+            "the corpus must contain accepted frames"
+        );
+    }
+
+    #[test]
+    fn trusted_decode_keeps_size_trailing_magic_and_version_checks() {
+        let limits = CodecLimits::default();
+        let bytes = encode(&Frame::new(HostMessage::Drain), limits).unwrap();
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert_eq!(
+            decode_frame_trusted::<HostMessage>(&trailing, limits),
+            Err(ProtocolError::Malformed)
+        );
+        let mut magic = bytes.clone();
+        magic[0] ^= 1;
+        assert_eq!(
+            decode_frame_trusted::<HostMessage>(&magic, limits),
+            Err(ProtocolError::WrongMagic)
+        );
+        assert_eq!(
+            decode_frame_trusted::<HostMessage>(&bytes, CodecLimits { max_bytes: 1 }),
+            Err(ProtocolError::Oversize)
+        );
+        for abi in [
+            AbiVersion {
+                major: ABI_VERSION.major,
+                minor: ABI_VERSION.minor + 1,
+            },
+            AbiVersion {
+                major: ABI_VERSION.major + 1,
+                minor: 0,
+            },
+            AbiVersion { major: 0, minor: 0 },
+        ] {
+            let frame = Frame {
+                magic: WIRE_MAGIC,
+                abi,
+                message: HostMessage::Drain,
+            };
+            let bytes = encode(&frame, limits).unwrap();
+            assert_eq!(
+                decode_frame_trusted::<HostMessage>(&bytes, limits),
+                Err(ProtocolError::AbiMismatch)
+            );
+            assert_eq!(
+                decode_frame::<HostMessage>(&bytes, limits),
+                Err(ProtocolError::AbiMismatch)
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod drained_tests {
+    use super::*;
+
+    #[test]
+    fn after_drained_only_shutdown_is_accepted() {
+        let ready = || {
+            let mut life = Lifecycle::default();
+            life.host(&HostMessage::Negotiate {
+                supported: alloc::vec![ABI_VERSION],
+            })
+            .unwrap();
+            life.guest(&GuestMessage::Negotiated {
+                selected: ABI_VERSION,
+            })
+            .unwrap();
+            life.host(&HostMessage::Initialize {
+                instance_id: 1,
+                application: "a".into(),
+                extension: "e".into(),
+            })
+            .unwrap();
+            life.guest(&GuestMessage::Initialized).unwrap();
+            life.host(&HostMessage::Drain).unwrap();
+            life.guest(&GuestMessage::Drained).unwrap();
+            life
+        };
+        for rejected in [
+            HostMessage::Drain,
+            HostMessage::Cancel {
+                request_id: RequestId(1),
+            },
+        ] {
+            assert_eq!(
+                ready().host(&rejected),
+                Err(ProtocolError::InvalidTransition)
+            );
+        }
+        let mut life = ready();
+        life.host(&HostMessage::Shutdown).unwrap();
+        life.guest(&GuestMessage::Shutdown).unwrap();
     }
 }

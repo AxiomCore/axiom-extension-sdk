@@ -357,6 +357,13 @@ impl TypedInvocation {
         self.invocation.deadline_unix_ms
     }
 
+    /// An explicitly injected invocation-scoped host capability. This API
+    /// never returns material and fails when the binding was not reviewed.
+    pub fn secret(&self,alias:&str)->Result<crate::secrets::SecretHandle> {
+        let snapshot=self.snapshot(&format!("secret:{alias}")).ok_or_else(||SdkError::denied("secret injection is unavailable"))?;
+        crate::secrets::SecretHandle::decode(&snapshot.value)
+    }
+
     fn snapshot(&self, resource: &str) -> Option<&abi::Snapshot> {
         self.invocation
             .snapshots

@@ -5,6 +5,7 @@ extern crate alloc;
 extern crate self as axiom_extension_sdk;
 
 mod primitives;
+pub mod secrets;
 #[cfg(feature = "std")]
 pub mod test;
 mod typed;
@@ -50,6 +51,27 @@ pub mod raw {
 pub mod __private {
     pub use crate::typed::{canonical_record, RecordDecoder};
     pub use alloc::boxed::Box;
+
+    /// Guest error text handed to the host through `axiom_extension_last_error`
+    /// is bounded and cut at a UTF-8 boundary.
+    pub fn bounded_error(message: &str) -> Box<[u8]> {
+        let mut end = message.len().min(crate::MAX_GUEST_ERROR_BYTES);
+        while !message.is_char_boundary(end) {
+            end -= 1;
+        }
+        message.as_bytes()[..end].to_vec().into_boxed_slice()
+    }
+
+    /// Packs a guest buffer as `(length << 32) | pointer`, or 0 when absent.
+    pub fn pack_error(bytes: Option<&[u8]>) -> i64 {
+        match bytes {
+            Some(bytes) if !bytes.is_empty() => match u32::try_from(bytes.as_ptr() as usize) {
+                Ok(pointer) => ((u64::from(bytes.len() as u32) << 32) | u64::from(pointer)) as i64,
+                Err(_) => 0,
+            },
+            _ => 0,
+        }
+    }
 
     pub fn unknown_export(export: &str, expected: &[&str]) -> alloc::string::String {
         alloc::format!(
@@ -130,10 +152,18 @@ enum MachineState {
 
 /// Deterministic guest harness shared by generated exports and unit tests.
 /// It performs negotiation and lifecycle framing before guest code is called.
+/// Upper bound for guest error text exposed to the host.
+pub const MAX_GUEST_ERROR_BYTES: usize = 1024;
+
 pub struct GuestMachine<E> {
     extension: E,
     state: MachineState,
     limits: CodecLimits,
+    last_error: Option<String>,
+    /// The ABI crate's protocol checker is the single source of transition
+    /// rules: every host message and every guest response must also be legal
+    /// there, so this harness and host-side checkers cannot drift apart.
+    protocol: abi::Lifecycle,
 }
 
 impl<E: Extension> GuestMachine<E> {
@@ -142,11 +172,46 @@ impl<E: Extension> GuestMachine<E> {
             extension,
             state: MachineState::New,
             limits,
+            last_error: None,
+            protocol: abi::Lifecycle::default(),
         }
     }
 
+    /// Why the most recent `dispatch` failed, if it did. Protocol errors carry
+    /// no text on the wire, so the export glue surfaces this to the host.
+    pub fn last_error(&self) -> Option<&str> {
+        self.last_error.as_deref()
+    }
+
     pub fn dispatch(&mut self, bytes: &[u8]) -> core::result::Result<Vec<u8>, abi::ProtocolError> {
-        let frame = abi::decode_frame::<HostMessage>(bytes, self.limits)?;
+        self.last_error = None;
+        let checkpoint = (self.protocol.clone(), self.state);
+        let result = self.dispatch_frame(bytes);
+        if result.is_err() {
+            // The host receives no response for a failed dispatch, so neither
+            // the harness state nor the protocol checker may advance.
+            (self.protocol, self.state) = checkpoint;
+        }
+        if let Err(error) = &result {
+            if self.last_error.is_none() {
+                self.last_error = Some(alloc::format!(
+                    "guest rejected the host frame in state {:?}: {error:?}",
+                    self.state
+                ));
+            }
+        }
+        result
+    }
+
+    fn dispatch_frame(
+        &mut self,
+        bytes: &[u8],
+    ) -> core::result::Result<Vec<u8>, abi::ProtocolError> {
+        // Host frames are trusted; the host still canonically checks our output.
+        let frame = abi::decode_frame_trusted::<HostMessage>(bytes, self.limits)?;
+        if self.state != MachineState::Stopped {
+            self.protocol.host(&frame.message)?;
+        }
         let response = match (self.state, frame.message) {
             (MachineState::New, HostMessage::Negotiate { supported }) => {
                 if !supported.contains(&abi::ABI_VERSION) {
@@ -158,9 +223,14 @@ impl<E: Extension> GuestMachine<E> {
                 }
             }
             (MachineState::Negotiated, HostMessage::Initialize { .. }) => {
-                self.extension
-                    .initialize()
-                    .map_err(|_| abi::ProtocolError::InvalidTransition)?;
+                if let Err(error) = self.extension.initialize() {
+                    self.last_error = Some(alloc::format!(
+                        "extension initialize failed ({:?}): {}",
+                        error.code,
+                        error.message
+                    ));
+                    return Err(abi::ProtocolError::InvalidTransition);
+                }
                 self.state = MachineState::Ready;
                 GuestMessage::Initialized
             }
@@ -211,6 +281,7 @@ impl<E: Extension> GuestMachine<E> {
             (MachineState::Stopped, _) => return Err(abi::ProtocolError::UseAfterShutdown),
             _ => return Err(abi::ProtocolError::InvalidTransition),
         };
+        self.protocol.guest(&response)?;
         abi::encode(&Frame::new(response), self.limits)
     }
 
@@ -610,6 +681,7 @@ pub struct GuestExports<E> {
     machine: GuestMachine<E>,
     allocations: BTreeMap<u32, Box<[u8]>>,
     max_bytes: usize,
+    last_error: Option<Box<[u8]>>,
 }
 
 impl<E: Extension> GuestExports<E> {
@@ -618,7 +690,19 @@ impl<E: Extension> GuestExports<E> {
             machine: GuestMachine::new(extension, limits),
             allocations: BTreeMap::new(),
             max_bytes: limits.max_bytes,
+            last_error: None,
         }
+    }
+
+    /// Bounded text for the most recent failed `dispatch` (0 is returned to
+    /// the host in that case). Read by the `axiom_extension_last_error` export.
+    pub fn last_error(&self) -> Option<&[u8]> {
+        self.last_error.as_deref()
+    }
+
+    fn fail(&mut self, message: &str) -> u64 {
+        self.last_error = Some(crate::__private::bounded_error(message));
+        0
     }
 
     pub fn allocate(&mut self, length: u32) -> u32 {
@@ -641,17 +725,26 @@ impl<E: Extension> GuestExports<E> {
     /// `(response_length << 32) | response_pointer`. Zero is a terminal
     /// transport failure; protocol failures never expose partial output.
     pub fn dispatch(&mut self, pointer: u32, length: u32) -> u64 {
+        self.last_error = None;
         let Some(input) = self.allocations.remove(&pointer) else {
-            return 0;
+            return self.fail("host frame pointer is not a live guest allocation");
         };
         if input.len() != length as usize {
-            return 0;
+            return self.fail("host frame length does not match its allocation");
         }
-        let Ok(response) = self.machine.dispatch(&input) else {
-            return 0;
+        let response = match self.machine.dispatch(&input) {
+            Ok(response) => response,
+            Err(_) => {
+                let message = String::from(
+                    self.machine
+                        .last_error()
+                        .unwrap_or("guest rejected the host frame"),
+                );
+                return self.fail(&message);
+            }
         };
         if response.is_empty() || response.len() > self.max_bytes {
-            return 0;
+            return self.fail("guest response frame is empty or exceeds the message limit");
         }
         let mut response = response.into_boxed_slice();
         let response_length = response.len() as u32;
@@ -706,6 +799,7 @@ macro_rules! export_extension {
         #[cfg(target_arch = "wasm32")]
         #[unsafe(no_mangle)]
         pub extern "C" fn axiom_extension_alloc(length: i32) -> i32 {
+            axiom_extension_install_panic_hook();
             if length <= 0 {
                 return 0;
             }
@@ -740,6 +834,60 @@ macro_rules! export_extension {
                         .deallocate(pointer as u32, length as u32),
                 )
             })
+        }
+
+        // Panics abort (trap) without unwinding, so the message is captured by
+        // a hook into its own cell; the exports cell may still be borrowed.
+        #[cfg(target_arch = "wasm32")]
+        std::thread_local! {
+            static AXIOM_EXTENSION_LAST_PANIC: std::cell::RefCell<Option<$crate::__private::Box<[u8]>>> =
+                std::cell::RefCell::new(None);
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        fn axiom_extension_install_panic_hook() {
+            static INSTALLED: std::sync::Once = std::sync::Once::new();
+            INSTALLED.call_once(|| {
+                std::panic::set_hook(std::boxed::Box::new(|info| {
+                    // Payload only: the location would disclose build paths.
+                    let payload = info
+                        .payload()
+                        .downcast_ref::<&str>()
+                        .map(|text| *text)
+                        .or_else(|| info.payload().downcast_ref::<std::string::String>().map(|text| text.as_str()))
+                        .unwrap_or("non-text panic payload");
+                    let message = std::format!("guest panicked: {payload}");
+                    let _ = AXIOM_EXTENSION_LAST_PANIC.try_with(|cell| {
+                        if let Ok(mut slot) = cell.try_borrow_mut() {
+                            *slot = Some($crate::__private::bounded_error(&message));
+                        }
+                    });
+                }));
+            });
+        }
+
+        /// Optional export: `(length << 32) | pointer` of bounded UTF-8 text
+        /// explaining the last failed dispatch or trap, or 0. Hosts that do
+        /// not know it ignore it; the ABI wire format is unchanged.
+        #[cfg(target_arch = "wasm32")]
+        #[unsafe(no_mangle)]
+        pub extern "C" fn axiom_extension_last_error() -> i64 {
+            let panicked = AXIOM_EXTENSION_LAST_PANIC
+                .try_with(|cell| cell.try_borrow().ok().map(|slot| $crate::__private::pack_error(slot.as_deref())))
+                .ok()
+                .flatten()
+                .unwrap_or(0);
+            if panicked != 0 {
+                return panicked;
+            }
+            AXIOM_EXTENSION_EXPORTS
+                .try_with(|runtime| {
+                    runtime
+                        .try_borrow()
+                        .map(|runtime| $crate::__private::pack_error(runtime.last_error()))
+                        .unwrap_or(0)
+                })
+                .unwrap_or(0)
         }
     };
 }
@@ -771,6 +919,7 @@ macro_rules! export_extension_factory {
         #[cfg(target_arch = "wasm32")]
         #[unsafe(no_mangle)]
         pub extern "C" fn axiom_extension_alloc(length: i32) -> i32 {
+            axiom_extension_install_panic_hook();
             if length <= 0 {
                 return 0;
             }
@@ -805,6 +954,60 @@ macro_rules! export_extension_factory {
                         .deallocate(pointer as u32, length as u32),
                 )
             })
+        }
+
+        // Panics abort (trap) without unwinding, so the message is captured by
+        // a hook into its own cell; the exports cell may still be borrowed.
+        #[cfg(target_arch = "wasm32")]
+        std::thread_local! {
+            static AXIOM_EXTENSION_LAST_PANIC: std::cell::RefCell<Option<$crate::__private::Box<[u8]>>> =
+                std::cell::RefCell::new(None);
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        fn axiom_extension_install_panic_hook() {
+            static INSTALLED: std::sync::Once = std::sync::Once::new();
+            INSTALLED.call_once(|| {
+                std::panic::set_hook(std::boxed::Box::new(|info| {
+                    // Payload only: the location would disclose build paths.
+                    let payload = info
+                        .payload()
+                        .downcast_ref::<&str>()
+                        .map(|text| *text)
+                        .or_else(|| info.payload().downcast_ref::<std::string::String>().map(|text| text.as_str()))
+                        .unwrap_or("non-text panic payload");
+                    let message = std::format!("guest panicked: {payload}");
+                    let _ = AXIOM_EXTENSION_LAST_PANIC.try_with(|cell| {
+                        if let Ok(mut slot) = cell.try_borrow_mut() {
+                            *slot = Some($crate::__private::bounded_error(&message));
+                        }
+                    });
+                }));
+            });
+        }
+
+        /// Optional export: `(length << 32) | pointer` of bounded UTF-8 text
+        /// explaining the last failed dispatch or trap, or 0. Hosts that do
+        /// not know it ignore it; the ABI wire format is unchanged.
+        #[cfg(target_arch = "wasm32")]
+        #[unsafe(no_mangle)]
+        pub extern "C" fn axiom_extension_last_error() -> i64 {
+            let panicked = AXIOM_EXTENSION_LAST_PANIC
+                .try_with(|cell| cell.try_borrow().ok().map(|slot| $crate::__private::pack_error(slot.as_deref())))
+                .ok()
+                .flatten()
+                .unwrap_or(0);
+            if panicked != 0 {
+                return panicked;
+            }
+            AXIOM_EXTENSION_EXPORTS
+                .try_with(|runtime| {
+                    runtime
+                        .try_borrow()
+                        .map(|runtime| $crate::__private::pack_error(runtime.last_error()))
+                        .unwrap_or(0)
+                })
+                .unwrap_or(0)
         }
     };
 }
@@ -1342,5 +1545,222 @@ mod tests {
                 ..
             }
         ));
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod protocol_tests {
+    use super::*;
+    use abi::{EffectPlan, ErrorCode, ABI_VERSION};
+
+    struct Yielding;
+    impl Extension for Yielding {
+        fn invoke(&mut self, request_id: RequestId, _: Invocation) -> GuestMessage {
+            GuestMessage::Yielded {
+                request_id,
+                plan: EffectPlan { effects: vec![] },
+            }
+        }
+        fn resume(
+            &mut self,
+            request_id: RequestId,
+            _: Vec<EffectOutcome>,
+            _: Vec<EventBatch>,
+        ) -> GuestMessage {
+            completed(request_id, Value::Null)
+        }
+    }
+
+    struct FailingInit;
+    impl Extension for FailingInit {
+        fn initialize(&mut self) -> core::result::Result<(), ExtensionError> {
+            Err(ExtensionError {
+                code: ErrorCode::Guest,
+                message: "pricing table is missing tier `gold`".into(),
+                retryable: false,
+            })
+        }
+        fn invoke(&mut self, request_id: RequestId, _: Invocation) -> GuestMessage {
+            completed(request_id, Value::Null)
+        }
+    }
+
+    fn messages() -> Vec<(&'static str, HostMessage)> {
+        let id = RequestId(1);
+        vec![
+            (
+                "negotiate",
+                HostMessage::Negotiate {
+                    supported: vec![ABI_VERSION],
+                },
+            ),
+            (
+                "initialize",
+                HostMessage::Initialize {
+                    instance_id: 1,
+                    application: "a".into(),
+                    extension: "e".into(),
+                },
+            ),
+            (
+                "invoke",
+                HostMessage::Invoke {
+                    request_id: id,
+                    invocation: Invocation {
+                        export: "x".into(),
+                        input: Value::Null,
+                        snapshots: vec![],
+                        deadline_unix_ms: 0,
+                    },
+                },
+            ),
+            (
+                "resume",
+                HostMessage::Resume {
+                    request_id: id,
+                    outcomes: vec![],
+                    events: vec![],
+                },
+            ),
+            ("cancel", HostMessage::Cancel { request_id: id }),
+            ("drain", HostMessage::Drain),
+            ("shutdown", HostMessage::Shutdown),
+        ]
+    }
+
+    fn frame(message: &HostMessage) -> Vec<u8> {
+        abi::encode(&Frame::new(message.clone()), CodecLimits::default()).unwrap()
+    }
+
+    /// Every reachable state x every host message: the guest harness accepts
+    /// exactly what the ABI protocol checker accepts.
+    #[test]
+    fn guest_machine_and_abi_lifecycle_agree_everywhere() {
+        let names = [
+            "negotiate",
+            "initialize",
+            "invoke",
+            "resume",
+            "cancel",
+            "drain",
+            "shutdown",
+        ];
+        let mut prefixes: Vec<Vec<&str>> = vec![vec![]];
+        let mut checked = 0;
+        while let Some(prefix) = prefixes.pop() {
+            if prefix.len() > 5 {
+                continue;
+            }
+            for candidate in names {
+                let mut machine = GuestMachine::new(Yielding, CodecLimits::default());
+                let mut checker = abi::Lifecycle::default();
+                for step in &prefix {
+                    let message = messages().into_iter().find(|(n, _)| n == step).unwrap().1;
+                    let reply = machine.dispatch(&frame(&message)).unwrap();
+                    checker.host(&message).unwrap();
+                    checker
+                        .guest(
+                            &abi::decode_frame::<GuestMessage>(&reply, CodecLimits::default())
+                                .unwrap()
+                                .message,
+                        )
+                        .unwrap();
+                }
+                let message = messages()
+                    .into_iter()
+                    .find(|(n, _)| *n == candidate)
+                    .unwrap()
+                    .1;
+                let machine_ok = machine.dispatch(&frame(&message));
+                let checker_ok = checker.host(&message).is_ok()
+                    && machine_ok.as_ref().map_or(true, |reply| {
+                        checker
+                            .guest(
+                                &abi::decode_frame::<GuestMessage>(reply, CodecLimits::default())
+                                    .unwrap()
+                                    .message,
+                            )
+                            .is_ok()
+                    });
+                assert_eq!(machine_ok.is_ok(), checker_ok, "{prefix:?} + {candidate}");
+                checked += 1;
+                if machine_ok.is_ok() {
+                    let mut next = prefix.clone();
+                    next.push(candidate);
+                    prefixes.push(next);
+                }
+            }
+        }
+        assert!(checked > 50, "explored {checked} transitions");
+    }
+
+    #[test]
+    fn failures_keep_an_explanation_for_the_host() {
+        let mut machine = GuestMachine::new(FailingInit, CodecLimits::default());
+        machine.dispatch(&frame(&messages()[0].1)).unwrap();
+        assert!(machine.dispatch(&frame(&messages()[1].1)).is_err());
+        assert_eq!(
+            machine.last_error(),
+            Some("extension initialize failed (Guest): pricing table is missing tier `gold`")
+        );
+        // A failed dispatch does not advance the protocol: initialize may be retried.
+        assert!(machine.dispatch(&frame(&messages()[1].1)).is_err());
+
+        // An oversize response restores both the harness state and the checker,
+        // so the host can still shut the guest down cleanly.
+        struct Large;
+        impl Extension for Large {
+            fn invoke(&mut self, request_id: RequestId, _: Invocation) -> GuestMessage {
+                GuestMessage::Yielded {
+                    request_id,
+                    plan: EffectPlan {
+                        effects: vec![abi::Effect {
+                            namespace: "n".into(),
+                            operation: "o".into(),
+                            input: Value::String("x".repeat(600)),
+                        }],
+                    },
+                }
+            }
+        }
+        let mut machine = GuestMachine::new(Large, CodecLimits { max_bytes: 512 });
+        for step in &messages()[..2] {
+            machine
+                .dispatch(
+                    &abi::encode(&Frame::new(step.1.clone()), CodecLimits { max_bytes: 512 })
+                        .unwrap(),
+                )
+                .unwrap();
+        }
+        let invoke = abi::encode(
+            &Frame::new(messages()[2].1.clone()),
+            CodecLimits { max_bytes: 512 },
+        )
+        .unwrap();
+        assert_eq!(machine.dispatch(&invoke), Err(abi::ProtocolError::Oversize));
+        for step in [&messages()[5].1, &messages()[6].1] {
+            machine
+                .dispatch(
+                    &abi::encode(&Frame::new(step.clone()), CodecLimits { max_bytes: 512 })
+                        .unwrap(),
+                )
+                .unwrap();
+        }
+
+        let mut machine = GuestMachine::new(Yielding, CodecLimits::default());
+        assert!(machine.dispatch(&[0xff, 0x00]).is_err());
+        assert!(
+            machine.last_error().unwrap().contains("Malformed"),
+            "{:?}",
+            machine.last_error()
+        );
+    }
+
+    #[test]
+    fn bounded_error_text_cuts_at_a_char_boundary() {
+        let long = "é".repeat(MAX_GUEST_ERROR_BYTES);
+        let bounded = __private::bounded_error(&long);
+        assert!(bounded.len() <= MAX_GUEST_ERROR_BYTES);
+        assert!(core::str::from_utf8(&bounded).is_ok());
     }
 }

@@ -1,14 +1,30 @@
 export type AxiomValue =
   | "Null"
   | { Bool: boolean }
-  | { Signed: number }
-  | { Unsigned: number }
+  // 64-bit values outside the JS safe-integer range travel as exact decimal
+  // strings and decode to `bigint`; they are never rounded.
+  | { Signed: number | string }
+  | { Unsigned: number | string }
   | { String: string }
   | { Bytes: number[] }
   | { List: AxiomValue[] }
   | { Record: Array<{ name: string; value: AxiomValue }> }
   | { Variant: { case: string; value: AxiomValue | null } }
-  | { Handle: { id: number; generation: number; kind: string } };
+  | { Handle: { id: number | string; generation: number; kind: string } };
+
+declare const secretBrand: unique symbol;
+export type SecretHandle = {readonly id:number|string;readonly generation:number;readonly kind:"Secret";readonly [secretBrand]:true};
+function checkedSecret(value:unknown):SecretHandle {
+  if(value===null||typeof value!=="object") throw new Error("secret injection is unavailable");
+  const handle=value as {id?:number|string;generation?:number;kind?:string};
+  // Handle IDs are opaque 64-bit values; large ones arrive as exact decimal strings.
+  const exactId=Number.isSafeInteger(handle.id)&&(handle.id as number)>0||typeof handle.id==="string"&&/^[1-9][0-9]{0,19}$/.test(handle.id);
+  if(handle.kind!=="Secret"||!exactId||!Number.isSafeInteger(handle.generation)) throw new Error("secret injection is unavailable");
+  return handle as SecretHandle;
+}
+export function authenticatedRequest(binding:Pick<Effect,"namespace"|"operation">,path:string,body:Uint8Array|readonly number[],secret:SecretHandle):Effect {
+  return {...binding,input:{Record:[{name:"body",value:{Bytes:Array.from(body)}},{name:"path",value:{String:path}},{name:"secret",value:{Handle:checkedSecret(secret)}}]}};
+}
 
 export interface Snapshot {
   resource: string;
@@ -64,6 +80,8 @@ export type ExtensionResponse = Completed | Yielded | Failed | { kind: "cancelle
 export interface ExtensionContext {
   invocation: Invocation;
   input: unknown;
+  secret(alias:string):SecretHandle;
+  authenticated_request(namespace:string,operation:string,path:string,body:Uint8Array|readonly number[],secret:SecretHandle):Effect;
   snapshot(resource: string): StateSnapshot;
   patch(resource: string): PatchBuilder;
   effects(...effects: Effect[]): Yielded;
@@ -73,11 +91,26 @@ export interface ExtensionContext {
 export type ExtensionHandler = (context: ExtensionContext) => ExtensionResponse;
 export interface ExtensionDefinition {
   exports: Record<string, ExtensionHandler>;
-  resume?: (context: {
-    requestId?: number;
-    outcomes: unknown[];
-    events: unknown[];
-  }) => ExtensionResponse;
+  resume?: (context: ResumeContext) => ExtensionResponse;
+}
+
+export interface ResumeContext {
+  requestId?: number;
+  outcomes: unknown[];
+  events: unknown[];
+  outcome(index: number): unknown;
+  complete(output?: unknown): Completed;
+}
+export function createResumeContext(outcomes: unknown[], events: unknown[], requestId?: number): ResumeContext {
+  return {outcomes, events, requestId,
+    outcome(index) {
+      if (!Number.isSafeInteger(index) || index < 0 || index >= outcomes.length) throw new Error("host outcome is unavailable");
+      const outcome = outcomes[index] as {index?: number; result?: {Ok?: AxiomValue; Err?: unknown}};
+      if (!outcome || outcome.index !== index || !outcome.result || !("Ok" in outcome.result) || "Err" in outcome.result) throw new Error("host operation denied");
+      return decodeValue(outcome.result.Ok!);
+    },
+    complete(output = null) {return {kind:"completed",result:{output:encodeValue(output),patches:[],transactions:[],emitted_events:[]}};},
+  };
 }
 
 export function defineExtension(definition: ExtensionDefinition): ExtensionDefinition {
@@ -134,6 +167,8 @@ export function createContext(invocation: Invocation): ExtensionContext {
   return {
     invocation,
     input: decodeValue(invocation.input),
+    secret(alias) {const snapshot=snapshots.get(`secret:${alias}`);return checkedSecret(snapshot&&decodeValue(snapshot.value));},
+    authenticated_request(namespace,operation,path,body,secret) {return authenticatedRequest({namespace,operation},path,body,secret);},
     snapshot(resource) {
       const snapshot = snapshots.get(resource);
       if (!snapshot) throw new Error(`authorized snapshot ${resource} was not supplied`);
@@ -168,6 +203,12 @@ export function encodeValue(value: unknown): AxiomValue {
     if (!Number.isSafeInteger(value)) throw new Error("Axiom numbers must be safe integers");
     return value >= 0 ? { Unsigned: value } : { Signed: value };
   }
+  if (typeof value === "bigint") {
+    if (value < -(2n ** 63n) || value > 2n ** 64n - 1n) throw new Error("Axiom integers must fit in 64 bits");
+    const safe = value >= BigInt(Number.MIN_SAFE_INTEGER) && value <= BigInt(Number.MAX_SAFE_INTEGER);
+    const exact = safe ? Number(value) : value.toString();
+    return value >= 0n ? { Unsigned: exact } : { Signed: exact };
+  }
   if (typeof value === "string") return { String: value };
   if (value instanceof Uint8Array) return { Bytes: Array.from(value) };
   if (Array.isArray(value)) return { List: value.map(encodeValue) };
@@ -181,11 +222,15 @@ export function encodeValue(value: unknown): AxiomValue {
   throw new Error(`unsupported Axiom value: ${typeof value}`);
 }
 
+function exactInteger(value: number | string): number | bigint {
+  return typeof value === "string" ? BigInt(value) : value;
+}
+
 export function decodeValue(value: AxiomValue): unknown {
   if (value === "Null") return null;
   if ("Bool" in value) return value.Bool;
-  if ("Signed" in value) return value.Signed;
-  if ("Unsigned" in value) return value.Unsigned;
+  if ("Signed" in value) return exactInteger(value.Signed);
+  if ("Unsigned" in value) return exactInteger(value.Unsigned);
   if ("String" in value) return value.String;
   if ("Bytes" in value) return new Uint8Array(value.Bytes);
   if ("List" in value) return value.List.map(decodeValue);
