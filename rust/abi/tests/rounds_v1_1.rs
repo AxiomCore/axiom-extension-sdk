@@ -401,9 +401,13 @@ fn round_sequencing_is_exact() {
     life.guest(&yielded_round(1, 2, 1)).unwrap();
     life.host(&invoke_round(1, 3, 3, 2)).unwrap();
     life.guest(&yielded_round(1, 3, 2)).unwrap();
-    // No round 4 when max_rounds is 3; the host must cancel.
+    // max_rounds counts yields: three yields are allowed, so round 4 (the
+    // completing round) still runs ...
+    life.host(&invoke_round(1, 4, 3, 3)).unwrap();
+    life.guest(&yielded_round(1, 4, 3)).unwrap();
+    // ... but there is no round 5 after a fourth yield; the host must cancel.
     assert_eq!(
-        life.clone().host(&invoke_round(1, 4, 3, 3)),
+        life.clone().host(&invoke_round(1, 5, 3, 4)),
         Err(ProtocolError::InvalidTransition)
     );
     life.host(&HostMessage::Cancel {
@@ -471,5 +475,53 @@ fn round_frames_survive_a_mutation_corpus_without_panics() {
                 assert_eq!(encode(&frame, limits).unwrap(), bytes);
             }
         }
+    }
+}
+
+/// `max_rounds = N` allows N yields: rounds 1..=N+1 are valid, round N+2 is
+/// not (boundary cases N-1, N and N+1 yields for N = 1, 2 and 16).
+#[test]
+fn max_rounds_counts_yields_not_invokes() {
+    assert_eq!(last_round(1), 2);
+    assert_eq!(last_round(MAX_ROUNDS_CEILING), MAX_ROUNDS_CEILING + 1);
+    for n in [1u16, 2, MAX_ROUNDS_CEILING] {
+        // N - 1 and N yields, each followed by a completing round.
+        for yields in [n - 1, n] {
+            let mut life = session(&SUPPORTED_ABI_VERSIONS, ABI_VERSION_1_1).unwrap();
+            for round in 1..=yields {
+                life.host(&invoke_round(1, round, n, usize::from(round - 1)))
+                    .unwrap();
+                life.guest(&yielded_round(1, round, usize::from(round - 1)))
+                    .unwrap();
+            }
+            let last = yields + 1;
+            life.host(&invoke_round(1, last, n, usize::from(yields)))
+                .unwrap_or_else(|error| panic!("N={n} yields={yields}: {error:?}"));
+            life.guest(&completed_round(1, last, usize::from(yields)))
+                .unwrap();
+        }
+        // N + 1 yields: the (N+1)th yield arrives in round N+1, and no round
+        // N+2 may follow; only Cancel is valid.
+        let mut life = session(&SUPPORTED_ABI_VERSIONS, ABI_VERSION_1_1).unwrap();
+        for round in 1..=n + 1 {
+            life.host(&invoke_round(1, round, n, usize::from(round - 1)))
+                .unwrap();
+            life.guest(&yielded_round(1, round, usize::from(round - 1)))
+                .unwrap();
+        }
+        assert_eq!(
+            life.clone()
+                .host(&invoke_round(1, n + 2, n, usize::from(n + 1))),
+            Err(ProtocolError::InvalidTransition),
+            "N={n}"
+        );
+        life.host(&HostMessage::Cancel {
+            request_id: RequestId(1),
+        })
+        .unwrap();
+        life.guest(&GuestMessage::Cancelled {
+            request_id: RequestId(1),
+        })
+        .unwrap();
     }
 }

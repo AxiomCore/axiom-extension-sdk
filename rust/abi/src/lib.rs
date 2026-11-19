@@ -17,7 +17,19 @@ pub const ABI_VERSION_1_1: AbiVersion = AbiVersion { major: 1, minor: 1 };
 /// Every version this crate speaks, newest first: the offer a 1.1 host makes.
 pub const SUPPORTED_ABI_VERSIONS: [AbiVersion; 2] = [ABI_VERSION_1_1, ABI_VERSION];
 /// Hard ceiling for `budgets.maxRounds`; larger values are rejected, never clamped.
+///
+/// `maxRounds` counts effect rounds (yields), not invokes: `maxRounds = N`
+/// lets a guest yield at most N times and then complete, so a full
+/// invocation runs at most `N + 1` `InvokeRound` exchanges (lead decision,
+/// 19 Nov 2026). The default 1 gives a 1.1 guest exactly the one yield a 1.0
+/// guest has.
 pub const MAX_ROUNDS_CEILING: u16 = 16;
+
+/// Largest round number an invocation with `max_rounds` allowed yields can
+/// reach: `max_rounds + 1` (the completing round is not counted).
+pub const fn last_round(max_rounds: u16) -> u16 {
+    max_rounds.saturating_add(1)
+}
 /// Domain separator of [`round_plan_hash`].
 pub const ROUND_PLAN_HASH_DOMAIN: &[u8] = b"axiom-extension-round-plan/v1";
 
@@ -273,7 +285,10 @@ pub enum HostMessage {
     Shutdown,
     /// ABI 1.1 only (appended; 1.0 peers never see it). Round `round` of the
     /// invocation: the same `invocation` bytes and request ID in every round,
-    /// plus the tape of the `round - 1` earlier rounds.
+    /// plus the tape of the `round - 1` earlier rounds. `max_rounds` is the
+    /// number of yields the guest may make (authority `maxRounds`); rounds
+    /// run from 1 to at most `max_rounds + 1`, and a yield in round
+    /// `max_rounds + 1` is refused by the host (`Exhausted`, guest cancelled).
     InvokeRound {
         request_id: RequestId,
         invocation: Invocation,
@@ -595,7 +610,7 @@ impl Lifecycle {
                 && active == *request_id
                 && *max_rounds == self.max_rounds
                 && *round == self.round.saturating_add(1)
-                && *round <= self.max_rounds
+                && *round <= last_round(self.max_rounds)
                 && tape.len() == usize::from(*round - 1) =>
             {
                 self.round = *round;
