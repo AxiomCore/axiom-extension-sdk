@@ -153,11 +153,19 @@ impl Checkout {
   `cx.emit(..)` add to the final result; `cx.invocation()` gives the input and
   the round-1 snapshots (`UiState::generated(cx.invocation())` as in sync
   exports). The host revision-checks final patches against the round-1
-  snapshots. When the input parameter is `Value`, the input is moved into the
-  argument (no copy every round); in such an export read it from the
-  argument: `cx.input()` returns `InvalidInput` and `cx.invocation().input()`
-  sees `Null`. Typed inputs are decoded by reference and stay readable both
-  ways.
+  snapshots. When the input parameter is `Value` and the export uses its
+  context only for `cx.call`, `cx.round`, `cx.max_rounds`, `cx.patch`,
+  `cx.transaction` or `cx.emit`, the input is moved into the argument (no copy
+  every round). Any other use of the context (`cx.input()`,
+  `cx.invocation()`, passing `cx` to a helper) keeps the input copied, so
+  `cx.input()` and `cx.invocation().input()` always see it. Typed inputs are
+  decoded by reference and stay readable both ways.
+- **Sites (X9c).** Generated binding items are `#[track_caller]`; with the
+  site table the build embeds, every `cx.call(..)`, typed ticket and group
+  ticket carries the site of its binding call, and an ABI 1.1 yield is sent as
+  `YieldedRoundSited` (as the plain `YieldedRound` when no site is known; ABI
+  1.0 never carries sites). Sites are labels for audit and spans only. Do not
+  mark your own helpers `#[track_caller]`: their effects then get no site.
 - **ABI version.** An impl with at least one async export makes
   `axiom_extension()` return an `AsyncExtension`; the module then exports ABI
   1.1 (`axiom_extension_abi_version`, a constant read at package time) and
