@@ -1,0 +1,477 @@
+{
+  "format": "axiom-extension-replay-tape",
+  "version": 1,
+  "header": {
+    "notice": "Axiom extension dev replay tape. It contains the real input, the round-1 snapshots (as the guest saw them), every plan the guest yielded, the host's outcomes and events, and the final result of one invocation. Secret values are never recorded (handles and granted names only); host context, request ids, trace ids and wall-clock deadlines are not recorded. Keep it local and treat it like the data it holds. The integrity digest detects accidental change; it is not a trust anchor.",
+    "contains": [
+      "identity",
+      "input",
+      "snapshots",
+      "plans",
+      "sites",
+      "outcomes",
+      "events",
+      "hostExchanges",
+      "result",
+      "budgets",
+      "usage"
+    ],
+    "sensitive": "none-present",
+    "redactions": [],
+    "replayable": true,
+    "recorder": "axiom-extension-broker/0.1.0"
+  },
+  "identity": {
+    "application": "x8d",
+    "extension": "rounds"
+  },
+  "abi": "1.1",
+  "maxRounds": 3,
+  "hostGroups": true,
+  "budgets": {
+    "maxHostCalls": 64,
+    "maxReadBytes": 65536,
+    "maxWriteBytes": 65536,
+    "maxMutations": 16,
+    "maxEvents": 16,
+    "maxConcurrentStreams": 1,
+    "maxRounds": 3
+  },
+  "invocation": {
+    "export": "run",
+    "input": {
+      "Record": [
+        {
+          "name": "steps",
+          "value": {
+            "List": [
+              {
+                "Record": [
+                  {
+                    "name": "kind",
+                    "value": {
+                      "String": "plan"
+                    }
+                  },
+                  {
+                    "name": "effects",
+                    "value": {
+                      "List": [
+                        {
+                          "Record": [
+                            {
+                              "name": "namespace",
+                              "value": {
+                                "String": "catalog"
+                              }
+                            },
+                            {
+                              "name": "operation",
+                              "value": {
+                                "String": "load"
+                              }
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  }
+                ]
+              },
+              {
+                "Record": [
+                  {
+                    "name": "kind",
+                    "value": {
+                      "String": "plan"
+                    }
+                  },
+                  {
+                    "name": "effects",
+                    "value": {
+                      "List": [
+                        {
+                          "Record": [
+                            {
+                              "name": "namespace",
+                              "value": {
+                                "String": "catalog"
+                              }
+                            },
+                            {
+                              "name": "operation",
+                              "value": {
+                                "String": "price"
+                              }
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  }
+                ]
+              },
+              {
+                "Record": [
+                  {
+                    "name": "kind",
+                    "value": {
+                      "String": "plan"
+                    }
+                  },
+                  {
+                    "name": "effects",
+                    "value": {
+                      "List": [
+                        {
+                          "Record": [
+                            {
+                              "name": "namespace",
+                              "value": {
+                                "String": "catalog"
+                              }
+                            },
+                            {
+                              "name": "operation",
+                              "value": {
+                                "String": "reserve"
+                              }
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "chain",
+          "value": {
+            "Bool": true
+          }
+        },
+        {
+          "name": "patch",
+          "value": {
+            "Record": [
+              {
+                "name": "resource",
+                "value": {
+                  "String": "ui:checkout"
+                }
+              },
+              {
+                "name": "path",
+                "value": {
+                  "String": "count"
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "snapshots": [
+      {
+        "resource": "ui:checkout",
+        "revision": 1,
+        "value": {
+          "Record": [
+            {
+              "name": "count",
+              "value": {
+                "Unsigned": 1
+              }
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "rounds": [
+    {
+      "round": 1,
+      "planHash": "2d5dab2e86b9ef629e665e2c991ea6e6e7314035a74d96e5a45f8cdb524e92ba",
+      "plan": {
+        "Plan": {
+          "effects": [
+            {
+              "namespace": "catalog",
+              "operation": "load",
+              "input": {
+                "Record": [
+                  {
+                    "name": "prev",
+                    "value": "Null"
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "status": "executed",
+      "outcomes": [
+        {
+          "index": 0,
+          "result": {
+            "Ok": {
+              "Unsigned": 10
+            }
+          }
+        }
+      ]
+    },
+    {
+      "round": 2,
+      "planHash": "484561495c6767df862d36c7eb7b7a98650aa809d3b2a13da78c336da177ad46",
+      "plan": {
+        "Plan": {
+          "effects": [
+            {
+              "namespace": "catalog",
+              "operation": "price",
+              "input": {
+                "Record": [
+                  {
+                    "name": "prev",
+                    "value": {
+                      "Unsigned": 10
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "status": "executed",
+      "outcomes": [
+        {
+          "index": 0,
+          "result": {
+            "Ok": {
+              "Unsigned": 20
+            }
+          }
+        }
+      ]
+    },
+    {
+      "round": 3,
+      "planHash": "34b957da3c76043d9f3076e995a1b35ff03f93ea0b3103a74d4b12763817e73d",
+      "plan": {
+        "Plan": {
+          "effects": [
+            {
+              "namespace": "catalog",
+              "operation": "reserve",
+              "input": {
+                "Record": [
+                  {
+                    "name": "prev",
+                    "value": {
+                      "Unsigned": 20
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "status": "executed",
+      "outcomes": [
+        {
+          "index": 0,
+          "result": {
+            "Ok": {
+              "Unsigned": 30
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "hostExchanges": [
+    {
+      "round": 1,
+      "call": {
+        "kind": "contract",
+        "service": "catalog",
+        "method": "load",
+        "access": "query",
+        "input": {
+          "Record": [
+            {
+              "name": "prev",
+              "value": "Null"
+            }
+          ]
+        }
+      },
+      "reply": {
+        "kind": "value",
+        "value": {
+          "Unsigned": 10
+        }
+      }
+    },
+    {
+      "round": 2,
+      "call": {
+        "kind": "contract",
+        "service": "catalog",
+        "method": "price",
+        "access": "query",
+        "input": {
+          "Record": [
+            {
+              "name": "prev",
+              "value": {
+                "Unsigned": 10
+              }
+            }
+          ]
+        }
+      },
+      "reply": {
+        "kind": "value",
+        "value": {
+          "Unsigned": 20
+        }
+      }
+    },
+    {
+      "round": 3,
+      "call": {
+        "kind": "commit",
+        "patches": [
+          {
+            "resource": "ui:checkout",
+            "expected_revision": 1,
+            "operations": [
+              {
+                "Set": {
+                  "path": [
+                    "count"
+                  ],
+                  "value": {
+                    "Unsigned": 60
+                  }
+                }
+              }
+            ]
+          }
+        ],
+        "transactions": []
+      },
+      "reply": {
+        "kind": "commit",
+        "revisions": [
+          [
+            "ui:checkout",
+            2
+          ]
+        ],
+        "replayed": false
+      }
+    },
+    {
+      "round": 3,
+      "call": {
+        "kind": "contract",
+        "service": "catalog",
+        "method": "reserve",
+        "access": "query",
+        "input": {
+          "Record": [
+            {
+              "name": "prev",
+              "value": {
+                "Unsigned": 20
+              }
+            }
+          ]
+        }
+      },
+      "reply": {
+        "kind": "value",
+        "value": {
+          "Unsigned": 30
+        }
+      }
+    }
+  ],
+  "terminal": {
+    "status": "completed",
+    "result": {
+      "output": {
+        "Record": [
+          {
+            "name": "outcomes",
+            "value": {
+              "List": [
+                {
+                  "Unsigned": 10
+                },
+                {
+                  "Unsigned": 20
+                },
+                {
+                  "Unsigned": 30
+                }
+              ]
+            }
+          },
+          {
+            "name": "round",
+            "value": {
+              "Unsigned": 4
+            }
+          }
+        ]
+      },
+      "patches": [
+        {
+          "resource": "ui:checkout",
+          "expected_revision": 1,
+          "operations": [
+            {
+              "Set": {
+                "path": [
+                  "count"
+                ],
+                "value": {
+                  "Unsigned": 60
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "transactions": [],
+      "emitted_events": []
+    },
+    "committed": true
+  },
+  "usage": {
+    "rounds": 4,
+    "fuelPerRound": [
+      1730969039,
+      1781347030,
+      1832105634,
+      1919768379
+    ],
+    "hostCalls": 4,
+    "readBytes": 6,
+    "writeBytes": 52
+  },
+  "integrity": {
+    "algorithm": "sha256",
+    "digest": "60a2589b8305b2b5b367caaad8c7a0ccaf9f871c39ef4e0652627845d2ee2659"
+  }
+}

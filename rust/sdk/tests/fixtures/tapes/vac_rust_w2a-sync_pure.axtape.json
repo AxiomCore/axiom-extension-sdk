@@ -1,0 +1,88 @@
+{
+  "format": "axiom-extension-replay-tape",
+  "version": 1,
+  "header": {
+    "notice": "Axiom extension dev replay tape. It contains the real input, the round-1 snapshots (as the guest saw them), every plan the guest yielded, the host's outcomes and events, and the final result of one invocation. Secret values are never recorded (handles and granted names only); host context, request ids, trace ids and wall-clock deadlines are not recorded. Keep it local and treat it like the data it holds. The integrity digest detects accidental change; it is not a trust anchor.",
+    "contains": [
+      "identity",
+      "input",
+      "snapshots",
+      "plans",
+      "sites",
+      "outcomes",
+      "events",
+      "hostExchanges",
+      "result",
+      "budgets",
+      "usage"
+    ],
+    "sensitive": "none-present",
+    "redactions": [],
+    "replayable": true,
+    "recorder": "axiom-extension-broker/0.1.0"
+  },
+  "identity": {
+    "application": "x8d",
+    "extension": "rounds"
+  },
+  "abi": "1.1",
+  "maxRounds": 1,
+  "hostGroups": true,
+  "budgets": {
+    "maxHostCalls": 64,
+    "maxReadBytes": 65536,
+    "maxWriteBytes": 65536,
+    "maxMutations": 16,
+    "maxEvents": 16,
+    "maxConcurrentStreams": 1
+  },
+  "invocation": {
+    "export": "sync_pure",
+    "input": {
+      "Unsigned": 4
+    },
+    "snapshots": [
+      {
+        "resource": "ui:checkout",
+        "revision": 1,
+        "value": {
+          "Record": [
+            {
+              "name": "count",
+              "value": {
+                "Unsigned": 1
+              }
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "rounds": [],
+  "hostExchanges": [],
+  "terminal": {
+    "status": "completed",
+    "result": {
+      "output": {
+        "Unsigned": 5
+      },
+      "patches": [],
+      "transactions": [],
+      "emitted_events": []
+    },
+    "committed": true
+  },
+  "usage": {
+    "rounds": 1,
+    "fuelPerRound": [
+      39158
+    ],
+    "hostCalls": 0,
+    "readBytes": 0,
+    "writeBytes": 0
+  },
+  "integrity": {
+    "algorithm": "sha256",
+    "digest": "e4bfb9a69d0016f89cbc46f1deed2aab9aa83373d3691777a1ab8a5b14cc6977"
+  }
+}
