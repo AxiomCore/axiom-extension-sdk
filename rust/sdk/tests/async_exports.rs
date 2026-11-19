@@ -204,18 +204,38 @@ impl Guest {
         Ok(a + b + c)
     }
 
-    /// A `Value` input is moved into the argument (H-1): it is intact in every
-    /// round, and `cx.input()` reports that it was moved.
+    /// A `Value` input with `cx.input()` and `cx.invocation()` also used
+    /// (W2A-1): the input is copied, as before H-1, so all three see it.
     #[export]
     async fn value_input(cx: &Cx, input: Value) -> Result<Value> {
-        let moved = cx.input::<Value>().err().map(|error| error.message);
+        let again = cx.input::<Value>()?;
         let a = cx.call(LOAD.call(input.clone())).await?;
         Ok(Value::List(vec![
             input,
             n(a),
-            Value::String(moved.unwrap_or_default()),
+            again,
             cx.invocation().input::<Value>()?,
+            Value::Bool(cx.__input_moved()),
         ]))
+    }
+
+    /// A `Value` input whose context is used only for host operations: the
+    /// input is moved into the argument (H-1, the cost win) in every round.
+    #[export]
+    async fn moved_value_input(cx: &Cx, input: Value) -> Result<Value> {
+        let a = cx.call(LOAD.call(input.clone())).await?;
+        Ok(Value::List(vec![input, n(a), Value::Bool(cx.__input_moved())]))
+    }
+
+    /// The context handed to a helper that reads the input (W2A-1): the
+    /// input is copied, so the helper sees it.
+    #[export]
+    async fn value_input_in_helper(cx: &Cx, input: Value) -> Result<Value> {
+        fn read(cx: &Cx) -> Result<Value> {
+            cx.input()
+        }
+        let a = cx.call(LOAD.call(input.clone())).await?;
+        Ok(Value::List(vec![input, n(a), read(cx)?]))
     }
 
     /// The same through a qualified path.
@@ -621,7 +641,7 @@ fn factory_abi_version_is_1_1_only_for_async_extensions() {
     }
     assert_eq!(factory_abi_version(&|| Box::new(Raw)), ABI_VERSION.packed());
     assert_eq!(<AsyncExtension as FactoryOutput>::ABI, ABI_VERSION_1_1);
-    assert_eq!(AXIOM_EXTENSION_EXPORTS.len(), 26);
+    assert_eq!(AXIOM_EXTENSION_EXPORTS.len(), 28);
     assert!(AXIOM_EXTENSION_EXPORTS.windows(2).all(|w| w[0] < w[1]));
 }
 
@@ -1075,9 +1095,10 @@ fn memo_less_rounds_give_the_same_replies_as_the_warm_adapter() {
 }
 
 /// H-1: an export whose input parameter is `Value` takes the input by move
-/// (no per-round copy). The argument is intact in every round; `cx.input()`
-/// reports the move and `cx.invocation().input()` sees `Null`. Typed inputs
-/// are unchanged.
+/// (no per-round copy) when its context cannot read the input. W2A-1: an
+/// export that also reads the input through `cx.input()`,
+/// `cx.invocation().input()` or a helper given `cx` gets it everywhere, as
+/// before H-1 (the input is copied). Typed inputs are unchanged.
 #[test]
 fn a_value_input_is_moved_into_the_argument_and_typed_inputs_are_unchanged() {
     let mut host = guest();
@@ -1087,11 +1108,20 @@ fn a_value_input_is_moved_into_the_argument_and_typed_inputs_are_unchanged() {
     let Value::List(items) = run.output() else { panic!("{:?}", run.output()) };
     assert_eq!(items[0], input, "the argument holds the input in the completing round");
     assert_eq!(items[1], n(10));
-    let Value::String(message) = &items[2] else { panic!() };
-    assert!(message.contains("moved into the export's `Value` argument"), "{message}");
-    assert_eq!(items[3], Value::Null);
+    assert_eq!(items[2], input, "cx.input() sees the input (W2A-1)");
+    assert_eq!(items[3], input, "cx.invocation().input() sees the input (W2A-1)");
+    assert_eq!(items[4], Value::Bool(false), "an export reading cx.input() copies the input");
     // The plan used the input in round 1 and replayed it in round 2.
     assert_eq!(run.plans, vec![RoundPlan::Plan(EffectPlan { effects: vec![effect("load", input.clone())] })]);
+
+    // Context used only for host operations: moved in every round.
+    let run = host.invoke("moved_value_input", input.clone(), 1);
+    assert_eq!(run.invokes, 2);
+    assert_eq!(run.output(), &Value::List(vec![input.clone(), n(10), Value::Bool(true)]));
+
+    // A helper given the context reads the input.
+    let run = host.invoke("value_input_in_helper", input.clone(), 1);
+    assert_eq!(run.output(), &Value::List(vec![input.clone(), n(10), input.clone()]));
 
     assert_eq!(host.invoke("qualified_value_input", input.clone(), 1).output(), &input);
 

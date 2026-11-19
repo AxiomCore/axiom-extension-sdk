@@ -473,6 +473,10 @@ pub struct ExtensionResponse {
     effects: Option<abi::EffectPlan>,
     group: Option<abi::EffectGroup>,
     plan: PlanMark,
+    /// X9c: the site label of each yielded effect or branch, from the typed
+    /// tickets ([`Effects::push`], [`EffectGroup::push`]). Sent only in an
+    /// ABI 1.1 session, beside the plan (never part of its bytes or hash).
+    sites: Vec<Option<abi::SiteId>>,
 }
 
 impl ExtensionResponse {
@@ -485,13 +489,15 @@ impl ExtensionResponse {
             effects: None,
             group: None,
             plan: PlanMark(None),
+            sites: Vec::new(),
         }
     }
 
     /// Suspend this invocation while the host executes the generated,
     /// capability-scoped effect plan. Continue in [`TypedExtension::resume`].
-    pub fn yield_for(effects: Effects) -> Self {
+    pub fn yield_for(mut effects: Effects) -> Self {
         let plan = PlanMark(Some(effects.record()));
+        let sites = core::mem::take(&mut effects.sites);
         Self {
             output: Value::Null,
             patches: Vec::new(),
@@ -500,6 +506,7 @@ impl ExtensionResponse {
             effects: Some(effects.build()),
             group: None,
             plan,
+            sites,
         }
     }
 
@@ -507,8 +514,9 @@ impl ExtensionResponse {
     /// [`EffectGroup::push`]; its tickets read the branches in the resume.
     /// The yielded bytes equal [`ExtensionResponse::yield_group`] of the same
     /// raw group.
-    pub fn yield_effect_group(group: EffectGroup) -> Self {
+    pub fn yield_effect_group(mut group: EffectGroup) -> Self {
         let plan = PlanMark(Some(group.record()));
+        let sites = core::mem::take(&mut group.sites);
         Self {
             output: Value::Null,
             patches: Vec::new(),
@@ -517,6 +525,7 @@ impl ExtensionResponse {
             effects: None,
             group: Some(group.build()),
             plan,
+            sites,
         }
     }
 
@@ -533,6 +542,7 @@ impl ExtensionResponse {
             effects: None,
             group: Some(group),
             plan: PlanMark(None),
+            sites: Vec::new(),
         }
     }
     pub fn patch(mut self, patch: impl Into<Patch>) -> Self {
@@ -597,19 +607,46 @@ pub struct TypedAdapter<T> {
     /// The plan of the request that is currently yielded, if any. Guest-local
     /// bookkeeping only; nothing here reaches the wire.
     yielded: Option<(RequestId, PlanRecord)>,
+    /// X9c: the site labels of the plan just yielded, kept only when at least
+    /// one is known, for an ABI 1.1 session to send beside the plan
+    /// ([`TypedAdapter::take_yield_sites`]). The ABI 1.0 messages never
+    /// carry them.
+    yielded_sites: Option<(RequestId, Vec<Option<abi::SiteId>>)>,
 }
 
 impl<T> TypedAdapter<T> {
+    pub(crate) fn new(extension: T) -> Self {
+        Self {
+            extension,
+            yielded: None,
+            yielded_sites: None,
+        }
+    }
+
     fn respond(&mut self, request_id: RequestId, result: Result<ExtensionResponse>) -> GuestMessage {
         self.yielded = None;
+        self.yielded_sites = None;
         match result {
-            Ok(response) => {
+            Ok(mut response) => {
                 if let PlanMark(Some(plan)) = response.plan {
                     self.yielded = Some((request_id, plan));
+                }
+                if response.sites.iter().any(Option::is_some) {
+                    self.yielded_sites = Some((request_id, core::mem::take(&mut response.sites)));
                 }
                 response.into_message(request_id)
             }
             Err(error) => failed(request_id, error),
+        }
+    }
+
+    /// X9c, ABI 1.1: the site labels of the plan `request_id` just yielded,
+    /// in plan or branch order; empty when none is known (the round is then
+    /// sent as a plain `YieldedRound`, byte for byte as before X9c).
+    pub(crate) fn take_yield_sites(&mut self, request_id: RequestId) -> Vec<Option<abi::SiteId>> {
+        match self.yielded_sites.take() {
+            Some((id, sites)) if id == request_id => sites,
+            _ => Vec::new(),
         }
     }
 }
@@ -619,10 +656,7 @@ impl<T> TypedAdapter<T> {
 pub fn boxed_extension<T: TypedExtension + 'static>(
     extension: T,
 ) -> alloc::boxed::Box<dyn Extension> {
-    alloc::boxed::Box::new(TypedAdapter {
-        extension,
-        yielded: None,
-    })
+    alloc::boxed::Box::new(TypedAdapter::new(extension))
 }
 
 impl<T: TypedExtension> Extension for TypedAdapter<T> {
@@ -661,11 +695,13 @@ impl<T: TypedExtension> Extension for TypedAdapter<T> {
 
     fn cancel(&mut self, request_id: RequestId) -> core::result::Result<(), ExtensionError> {
         self.yielded = None;
+        self.yielded_sites = None;
         TypedExtension::cancel(&mut self.extension, request_id).map_err(Into::into)
     }
 
     fn shutdown(&mut self) {
         self.yielded = None;
+        self.yielded_sites = None;
         TypedExtension::shutdown(&mut self.extension)
     }
 }
@@ -976,22 +1012,22 @@ impl SiteTable {
         sites: &[],
     };
 
-    /// The X9c interning rule (contract `x9c-sites-and-spans.md` §3). A call
-    /// whose caller location is (`file`, `line`, `column`) and that goes
+    /// The X9c interning rule (contract `x9c-sites-and-spans.md` §3.2): a
+    /// call whose caller location is (`file`, `line`, `column`) and that goes
     /// through the generated item `binding` has the site id of the table entry
-    /// with the same file (after stripping `root`), the same line and the
-    /// same binding, and the smallest column that is at least `column`.
+    /// with exactly that file (after stripping `root`), line, column and
+    /// binding. Anything else has no site (`None`): never a guess from a
+    /// nearby column, another line or another file.
     ///
-    /// Why "smallest column at or after": `#[track_caller]` reports the
-    /// method-name token for a method call (`cart.subscribe_total()`), which
-    /// is exactly the X9a binding token, and the first token of the path for
-    /// a path call (`operations::catalog_name(..)`), where X9a records the
-    /// last path segment (the first one when a turbofish follows). In both
-    /// cases the X9a token is the first entry for that binding at or after
-    /// the reported column: every other call of the same binding on the line
-    /// either ends before this call starts or begins after this call's
-    /// binding token. No entry means no site (`None`), never a guess from
-    /// another line.
+    /// The table is normalised at build time to the positions rustc's
+    /// `#[track_caller]` reports: the method-name token for a method call
+    /// (`cart.subscribe_total()`), the first token of the path for a path call
+    /// (`operations::catalog_name(..)`, also with a turbofish or split over
+    /// lines), and the first token of the outermost macro invocation for a
+    /// call inside a `macro_rules!` body. An exact match cannot pick another
+    /// call's entry: two different calls never start at the same column of
+    /// the same line, so a location that is not itself a binding call (for
+    /// example a user helper marked `#[track_caller]`) has no site.
     pub fn locate(&self, file: &str, line: u32, column: u32, binding: &str) -> Option<abi::SiteId> {
         if self.sites.is_empty() || self.sites.len() > abi::MAX_SITE_TABLE_LEN as usize {
             return None;
@@ -1008,7 +1044,7 @@ impl SiteTable {
             .sites
             .partition_point(|site| (site.file, site.line, site.column) < (relative, line, column));
         for (offset, site) in self.sites[start..].iter().enumerate() {
-            if site.file != relative || site.line != line {
+            if site.file != relative || site.line != line || site.column != column {
                 break;
             }
             if site.binding == binding {
@@ -1933,7 +1969,8 @@ mod site_tests {
         output: "String",
     };
 
-    // Sorted by (file, line, column, binding), id = index, as X9a interns.
+    // Sorted by (file, line, column, binding), id = index, as X9a interns;
+    // columns are the normalised `#[track_caller]` positions (path start).
     static SITES: [SiteKey; 6] = [
         SiteKey { file: "src/a.rs", line: 3, column: 9, binding: "operations::catalog" },
         SiteKey { file: "src/a.rs", line: 3, column: 40, binding: "operations::catalog" },
@@ -1949,33 +1986,36 @@ mod site_tests {
     }
 
     #[test]
-    fn exact_and_first_at_or_after_rule() {
+    fn only_an_exact_location_and_binding_has_a_site() {
         let f = "members/x/src/sources/src/a.rs";
-        // Method call: the reported column is the binding token itself.
+        // Exact (file, line, column, binding).
         assert_eq!(at(f, 7, 5, "ui::Cart::subscribe_total"), Some(3));
-        // Two path calls on one line: each reported column is its path start,
-        // the X9a token is the last segment further right.
-        assert_eq!(at(f, 3, 1, "operations::catalog"), Some(0));
         assert_eq!(at(f, 3, 9, "operations::catalog"), Some(0));
-        assert_eq!(at(f, 3, 10, "operations::catalog"), Some(1));
         assert_eq!(at(f, 3, 40, "operations::catalog"), Some(1));
-        // Nothing for that binding at or after the column on the line.
-        assert_eq!(at(f, 3, 41, "operations::catalog"), None);
         // Same position, different binding (X9a over-approximation entries).
-        assert_eq!(at(f, 7, 1, "operations::catalog"), Some(2));
-        // Never another line or file.
-        assert_eq!(at(f, 4, 1, "operations::catalog"), None);
-        assert_eq!(at("members/x/src/sources/src/b.rs", 2, 1, "operations::stock"), Some(5));
-        assert_eq!(at("members/x/src/sources/src/b.rs", 2, 1, "operations::catalog"), None);
+        assert_eq!(at(f, 7, 5, "operations::catalog"), Some(2));
+        // W2B-1: a nearby column is never matched, before or after an entry
+        // (a user `#[track_caller]` helper reports its caller's column).
+        for column in [1, 8, 10, 39, 41, u32::MAX] {
+            assert_eq!(at(f, 3, column, "operations::catalog"), None, "column {column}");
+        }
+        assert_eq!(at(f, 7, 1, "operations::catalog"), None);
+        assert_eq!(at(f, 7, 6, "ui::Cart::subscribe_total"), None);
+        // Never another binding, line or file.
+        assert_eq!(at(f, 3, 9, "operations::stock"), None);
+        assert_eq!(at(f, 4, 9, "operations::catalog"), None);
+        assert_eq!(at("members/x/src/sources/src/b.rs", 2, 30, "operations::stock"), Some(5));
+        assert_eq!(at("members/x/src/sources/src/b.rs", 2, 1, "operations::stock"), None);
+        assert_eq!(at("members/x/src/sources/src/b.rs", 2, 30, "operations::catalog"), None);
     }
 
     #[test]
     fn root_is_required_and_paths_are_normalised() {
         // A file outside the root (another crate, the SDK itself) has no site.
-        assert_eq!(at("src/a.rs", 3, 1, "operations::catalog"), None);
-        assert_eq!(at("/abs/members/x/src/sources/src/a.rs", 3, 1, "operations::catalog"), None);
+        assert_eq!(at("src/a.rs", 3, 9, "operations::catalog"), None);
+        assert_eq!(at("/abs/members/x/src/sources/src/a.rs", 3, 9, "operations::catalog"), None);
         // Windows separators from the compiler are normalised.
-        assert_eq!(at("members\\x\\src\\sources\\src\\a.rs", 3, 1, "operations::catalog"), Some(0));
+        assert_eq!(at("members\\x\\src\\sources\\src\\a.rs", 3, 9, "operations::catalog"), Some(0));
         // The empty table never matches.
         assert_eq!(SiteTable::EMPTY.locate("src/a.rs", 3, 9, "operations::catalog"), None);
     }
@@ -2025,6 +2065,41 @@ mod site_tests {
         let (group_plan, group_sites) = group.into_round_plan();
         assert_eq!(group_sites, vec![Some(4), None]);
         assert_eq!(group_plan.len(), 2);
+    }
+
+    /// W2B-1 regression: a user helper marked `#[track_caller]` reports its
+    /// caller's location. With a table entry for a direct call of the same
+    /// binding later on that line, the old "smallest column at or after" rule
+    /// gave the helper's effect the direct call's site. The exact rule gives
+    /// it no site, and the direct call keeps its own.
+    #[test]
+    fn a_track_caller_user_helper_never_takes_another_calls_site() {
+        #[track_caller]
+        fn item(table: &'static SiteTable) -> (Operation<u64, String>, &'static core::panic::Location<'static>) {
+            (Operation::generated_sited(BINDING, table, "operations::catalog"), core::panic::Location::caller())
+        }
+        #[track_caller]
+        fn tracked_helper(table: &'static SiteTable) -> (Operation<u64, String>, &'static core::panic::Location<'static>) {
+            item(table)
+        }
+        fn line(table: &'static SiteTable) -> [(Operation<u64, String>, &'static core::panic::Location<'static>); 2] {
+            [tracked_helper(table), item(table)]
+        }
+        // Pass 1 learns where rustc puts both calls (as the build would).
+        let [(_, helper_at), (_, direct_at)] = line(&SiteTable::EMPTY);
+        assert_eq!(helper_at.line(), direct_at.line());
+        assert!(helper_at.column() < direct_at.column());
+        let sites: &'static [SiteKey] = alloc::boxed::Box::leak(alloc::boxed::Box::new([SiteKey {
+            file: direct_at.file(),
+            line: direct_at.line(),
+            column: direct_at.column(),
+            binding: "operations::catalog",
+        }]));
+        let table: &'static SiteTable = alloc::boxed::Box::leak(alloc::boxed::Box::new(SiteTable { root: "", sites }));
+        // Pass 2 with the table: the direct call has its site, the helper none.
+        let [(helper, _), (direct, _)] = line(table);
+        assert_eq!(direct.site(), Some(0));
+        assert_eq!(helper.site(), None);
     }
 
     #[test]

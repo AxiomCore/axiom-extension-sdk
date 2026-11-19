@@ -10,6 +10,18 @@ pub mod secrets;
 #[cfg(feature = "std")]
 pub mod test;
 mod typed;
+/// Selected descriptor validation is advisory to the guest. The broker always
+/// rechecks returned values and proposals independently of this helper.
+#[cfg(feature = "schema")]
+pub mod schema {
+    pub use axiom_lib::ir::TypeRef;
+    pub use axiom_lib::language::pure::NumericProfile;
+    pub use axiom_lib::language::failure::{PublicCase, PublicContracts, Outcome};
+    pub use axiom_lib::language::schema::{Codec, Engine, Field, Language, Schema, ValidationIssue, ValidationReport, PathSegment};
+    pub use serde_json::Value;
+}
+
+
 use abi::{
     CodecLimits, Effect, EffectOutcome, EventBatch, ExtensionError, Field, Frame, GuestMessage,
     HostMessage, Invocation, InvocationResult, Patch, PatchOperation, RequestId,
@@ -396,7 +408,12 @@ impl<E: Extension, const ROUNDS: bool> GuestMachine<E, ROUNDS> {
         response: GuestMessage,
     ) -> core::result::Result<GuestMessage, abi::ProtocolError> {
         match &response {
+            // X9c: a sited yield (`abi::yielded_round` with known sites) is a
+            // yield like any other; the labels ride beside the plan.
             GuestMessage::YieldedRound {
+                request_id: actual, ..
+            }
+            | GuestMessage::YieldedRoundSited {
                 request_id: actual, ..
             } if *actual == request_id => self.state = MachineState::Yielded(request_id),
             GuestMessage::CompletedRound {
