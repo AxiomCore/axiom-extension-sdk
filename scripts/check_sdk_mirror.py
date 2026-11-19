@@ -24,6 +24,7 @@ PAIRS = [
     ("rust/abi/src/value_decode.rs", "extensions/abi/src/value_decode.rs"),
     ("rust/sdk/src/lib.rs", "extensions/sdk/src/lib.rs"),
     ("rust/sdk/src/typed.rs", "extensions/sdk/src/typed.rs"),
+    ("rust/sdk/src/async_rt.rs", "extensions/sdk/src/async_rt.rs"),
     ("rust/sdk/src/test.rs", "extensions/sdk/src/test.rs"),
     ("rust/sdk/src/primitives.rs", "extensions/sdk/src/primitives.rs"),
     ("rust/sdk/src/secrets.rs", "extensions/sdk/src/secrets.rs"),

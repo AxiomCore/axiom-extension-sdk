@@ -13,6 +13,14 @@ use syn::{
 ///
 /// Exported methods must take `&mut self` and one `TypedInvocation`, and return
 /// `Result<ExtensionResponse>`. The extension type must implement `Default`.
+///
+/// An exported `async fn name(cx: &Cx, input: In) -> Result<Out>` (no
+/// receiver: no guest state survives between ABI 1.1 rounds) is an async
+/// export: it runs on the SDK's replaying executor (`axiom_extension_sdk::
+/// async_rt`), `In: AxiomDecode`, `Out: AxiomEncode`. An impl with at least
+/// one async export makes `axiom_extension()` return an `AsyncExtension`, so
+/// the module exports and negotiates ABI 1.1; its sync exports keep working
+/// (inside 1.1 rounds). An impl with only sync exports is unchanged (ABI 1.0).
 #[proc_macro_attribute]
 pub fn extension(arguments: TokenStream, input: TokenStream) -> TokenStream {
     if !arguments.is_empty() {
@@ -156,6 +164,7 @@ fn expand_extension(mut implementation: ItemImpl) -> syn::Result<proc_macro2::To
     }
     let extension_type = implementation.self_ty.clone();
     let mut exports = Vec::new();
+    let mut async_exports = Vec::new();
     for item in &mut implementation.items {
         let ImplItem::Fn(method) = item else {
             continue;
@@ -171,10 +180,10 @@ fn expand_extension(mut implementation: ItemImpl) -> syn::Result<proc_macro2::To
         };
         method.attrs.remove(index);
         if method.sig.asyncness.is_some() {
-            return Err(syn::Error::new_spanned(
-                &method.sig,
-                "Rust core-WASM exports are continuation-based and cannot be async functions",
-            ));
+            check_async_export(&method.sig)?;
+            let export_name = export_name(&attribute, &method.sig.ident)?;
+            async_exports.push((export_name, method.sig.ident.clone()));
+            continue;
         }
         if method.sig.inputs.len() != 2 {
             return Err(syn::Error::new_spanned(
@@ -194,14 +203,14 @@ fn expand_extension(mut implementation: ItemImpl) -> syn::Result<proc_macro2::To
         let export_name = export_name(&attribute, &method.sig.ident)?;
         exports.push((export_name, method.sig.ident.clone()));
     }
-    if exports.is_empty() {
+    if exports.is_empty() && async_exports.is_empty() {
         return Err(syn::Error::new_spanned(
             &implementation,
             "extension requires at least one #[export] method",
         ));
     }
     let mut names = BTreeSet::new();
-    for (name, _) in &exports {
+    for (name, _) in exports.iter().chain(&async_exports) {
         if !names.insert(name.value()) {
             return Err(syn::Error::new_spanned(
                 name,
@@ -209,7 +218,10 @@ fn expand_extension(mut implementation: ItemImpl) -> syn::Result<proc_macro2::To
             ));
         }
     }
-    exports.sort_by(|left, right| left.0.value().cmp(&right.0.value()));
+    exports.sort_by_key(|export| export.0.value());
+    if !async_exports.is_empty() {
+        return Ok(expand_async_extension(implementation, exports, async_exports));
+    }
     let export_names: Vec<_> = exports.iter().map(|(name, _)| name).collect();
     let dispatch: Vec<_> = exports
         .iter()
@@ -240,6 +252,108 @@ fn expand_extension(mut implementation: ItemImpl) -> syn::Result<proc_macro2::To
             ::axiom_extension_sdk::boxed_extension(<#extension_type as ::core::default::Default>::default())
         }
     })
+}
+
+/// `async fn name(cx: &Cx, input: In) -> Result<Out>`: no receiver, a
+/// reference context and exactly one input.
+fn check_async_export(signature: &syn::Signature) -> syn::Result<()> {
+    if let Some(receiver) = signature.receiver() {
+        return Err(syn::Error::new_spanned(
+            receiver,
+            "an async export takes no self: no guest state survives between ABI 1.1 rounds; write `async fn name(cx: &Cx, input: In) -> Result<Out>`",
+        ));
+    }
+    if !signature.generics.params.is_empty() {
+        return Err(syn::Error::new_spanned(
+            &signature.generics,
+            "an async export cannot be generic",
+        ));
+    }
+    let shape = "an async export must be `async fn name(cx: &Cx, input: In) -> Result<Out>`";
+    if signature.inputs.len() != 2 {
+        return Err(syn::Error::new_spanned(signature, shape));
+    }
+    match signature.inputs.first() {
+        Some(syn::FnArg::Typed(argument)) if matches!(*argument.ty, syn::Type::Reference(ref r) if r.mutability.is_none()) => {}
+        _ => return Err(syn::Error::new_spanned(&signature.inputs, shape)),
+    }
+    if matches!(signature.output, syn::ReturnType::Default) {
+        return Err(syn::Error::new_spanned(signature, shape));
+    }
+    Ok(())
+}
+
+fn expand_async_extension(
+    implementation: ItemImpl,
+    mut exports: Vec<(LitStr, syn::Ident)>,
+    mut async_exports: Vec<(LitStr, syn::Ident)>,
+) -> proc_macro2::TokenStream {
+    let extension_type = implementation.self_ty.clone();
+    exports.sort_by_key(|export| export.0.value());
+    async_exports.sort_by_key(|export| export.0.value());
+    let mut all: Vec<_> = exports.iter().chain(&async_exports).map(|(name, _)| name.clone()).collect();
+    all.sort_by_key(LitStr::value);
+    let async_names: Vec<_> = async_exports.iter().map(|(name, _)| name).collect();
+    let dispatch: Vec<_> = exports
+        .iter()
+        .map(|(name, method)| quote! { #name => self.#method(invocation) })
+        .collect();
+    let async_dispatch: Vec<_> = async_exports
+        .iter()
+        .map(|(name, method)| {
+            quote! {
+                #name => {
+                    let future: ::axiom_extension_sdk::LocalBoxFuture<'cx, ::axiom_extension_sdk::Result<::axiom_extension_sdk::abi::Value>> =
+                        ::axiom_extension_sdk::__private::Box::pin(async move {
+                            let output = <#extension_type>::#method(cx, cx.input()?).await?;
+                            ::core::result::Result::<::axiom_extension_sdk::abi::Value, ::axiom_extension_sdk::SdkError>::Ok(::axiom_extension_sdk::AxiomEncode::encode(output))
+                        });
+                    ::core::option::Option::Some(future)
+                }
+            }
+        })
+        .collect();
+    quote! {
+        #implementation
+
+        impl ::axiom_extension_sdk::TypedExtension for #extension_type {
+            fn invoke(
+                &mut self,
+                invocation: ::axiom_extension_sdk::TypedInvocation,
+            ) -> ::axiom_extension_sdk::Result<::axiom_extension_sdk::ExtensionResponse> {
+                match invocation.export() {
+                    #(#dispatch,)*
+                    #(#async_names)|* => Err(::axiom_extension_sdk::SdkError::invalid_input(
+                        "this export is async; it runs only through the ABI 1.1 executor",
+                    )),
+                    unknown => Err(::axiom_extension_sdk::SdkError::invalid_input(
+                        ::axiom_extension_sdk::__private::unknown_export(unknown, AXIOM_EXTENSION_EXPORTS),
+                    )),
+                }
+            }
+        }
+
+        impl ::axiom_extension_sdk::__private::AsyncExports for #extension_type {
+            const ASYNC_EXPORTS: &'static [&'static str] = &[#(#async_names),*];
+
+            fn dispatch_async<'cx>(
+                cx: &'cx ::axiom_extension_sdk::Cx,
+                export: &str,
+            ) -> ::core::option::Option<::axiom_extension_sdk::LocalBoxFuture<'cx, ::axiom_extension_sdk::Result<::axiom_extension_sdk::abi::Value>>> {
+                match export {
+                    #(#async_dispatch)*
+                    _ => ::core::option::Option::None,
+                }
+            }
+        }
+
+        #[doc(hidden)]
+        pub const AXIOM_EXTENSION_EXPORTS: &[&str] = &[#(#all),*];
+
+        pub fn axiom_extension() -> ::axiom_extension_sdk::AsyncExtension {
+            ::axiom_extension_sdk::AsyncExtension::new(<#extension_type as ::core::default::Default>::default())
+        }
+    }
 }
 
 fn is_export(attribute: &Attribute) -> bool {

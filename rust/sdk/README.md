@@ -110,6 +110,90 @@ earlier yield step is an `InvalidInput` error, never another call's value.
 languages the resume rebuilds the plan in a fresh engine; see the root
 README.)
 
+## Async exports: rounds, replay, determinism
+
+An `async fn` export gets several dependent host results in one invocation
+(ABI 1.1, ADR 0001). Write straight-line code; independent calls awaited
+together are sent as one batch automatically:
+
+```rust
+use axiom_extension_sdk::{prelude::*, Binding};
+
+const LOAD: Operation<u64, u64> = Operation::generated(Binding {
+    namespace: "catalog", operation: "load", input: "Unsigned", output: "Unsigned",
+});
+const PRICE: Operation<u64, u64> = Operation::generated(Binding {
+    namespace: "catalog", operation: "price", input: "Unsigned", output: "Unsigned",
+});
+const STOCK: Operation<u64, u64> = Operation::generated(Binding {
+    namespace: "catalog", operation: "stock", input: "Unsigned", output: "Unsigned",
+});
+
+#[derive(Default)]
+struct Checkout;
+
+#[extension]
+impl Checkout {
+    #[export]
+    async fn apply(cx: &Cx, id: u64) -> Result<u64> {
+        let user = cx.call(LOAD.call(id)).await?;                          // round 1
+        let (price, stock) =
+            join!(cx.call(PRICE.call(user)), cx.call(STOCK.call(user))).await; // round 2: one group
+        Ok(price? * stock?)                                                // completes
+    }
+}
+```
+
+- **Signature.** `#[export] async fn name(cx: &Cx, input: In) -> Result<Out>`
+  inside an `#[extension]` impl; `In: AxiomDecode`, `Out: AxiomEncode`. No
+  `self`: no guest memory survives from one round to the next. `cx.call(op)`
+  takes the typed call of a generated binding (`OPERATION.call(input)`) and
+  resolves to the operation's declared output type (`Result<O>`), so output
+  types are checked as with tickets. `cx.patch(..)`, `cx.transaction(..)`,
+  `cx.emit(..)` add to the final result; `cx.invocation()` gives the input and
+  the round-1 snapshots (`UiState::generated(cx.invocation())` as in sync
+  exports). The host revision-checks final patches against the round-1
+  snapshots.
+- **ABI version.** An impl with at least one async export makes
+  `axiom_extension()` return an `AsyncExtension`; the module then exports ABI
+  1.1 (`axiom_extension_abi_version`, a constant read at package time) and
+  negotiates 1.1 when the host offers it. Its sync exports keep working
+  inside 1.1 sessions. An impl with only sync exports is unchanged: ABI 1.0,
+  identical frames. On a host that offers only 1.0, an async export may yield
+  once (one batched resume) and fails `Exhausted` if it needs more.
+- **Rounds.** Each host operation registers in the current round when first
+  polled. When nothing else can run, the executor sends **one** plan with
+  every pending operation, in registration order: one operation is a plain
+  plan, several are a `Collect` group (branches `b0`, `b1`, …; all results
+  returned, no fail-fast; at most 32 branches and the package's `maxEffects`).
+  Sequential awaits cost one round each; `join!` / `join_all` cost one round
+  for the whole batch. `maxRounds` (authority, default 1, at most 16) bounds
+  the number of rounds that yield; one more yield is refused (`Exhausted`) and
+  nothing commits.
+- **Replay.** Every round re-runs the export from the top with the same input.
+  Awaits the host already answered resolve immediately from its tape, in
+  order; the first unanswered batch becomes the next plan. The SDK reports the
+  hashes of the replayed plans and checks them against the tape; a guest that
+  plans differently on replay fails with `Protocol` ("non-deterministic
+  guest") and nothing commits.
+- **Determinism rules.** Time, randomness and state come only from host
+  operations (they are on the tape). Do not branch on `static`/global state
+  or on `cx.round()` before an await. `join!` polls in argument order. There
+  is no `select!`: if a hand-written combinator drops an operation after it
+  was polled, it still runs in its round and its result is discarded;
+  operations still pending when the export returns are never sent. Awaiting a
+  non-host future (a timer, a channel) fails with `InvalidInput`.
+- **Errors.** A failed or denied operation resolves its future with `Err`
+  (use `?`, or handle it and continue). In a `join!` group a domain failure
+  is returned to its branch only; a branch the broker refuses before dispatch
+  (no grant) fails the whole invocation. A panic traps as in sync exports.
+  Effects run in earlier rounds have happened even if a later round fails;
+  only patches and transactions are atomic. Prefer idempotent operations.
+- **Cost.** Replay re-executes the prefix every round, so guest fuel grows
+  roughly with the square of the number of rounds and is cumulative within
+  one invocation (see `planning/extension-sandbox/contracts/x8c-rust-async.md`
+  for measurements).
+
 ## Third-party crates
 
 Dependencies are declared per extension in `AxiomDeps.toml`, using an exact

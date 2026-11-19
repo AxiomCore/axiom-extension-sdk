@@ -4,6 +4,7 @@
 extern crate alloc;
 extern crate self as axiom_extension_sdk;
 
+pub mod async_rt;
 mod primitives;
 pub mod secrets;
 #[cfg(feature = "std")]
@@ -16,6 +17,7 @@ use abi::{
 };
 use alloc::{boxed::Box, collections::BTreeMap, string::String, vec, vec::Vec};
 pub use axiom_extension_abi as abi;
+pub use async_rt::{join_all, AsyncExtension, Call, Cx, LocalBoxFuture, RoundInvocation};
 pub use axiom_extension_sdk_derive::{export, extension, AxiomType};
 pub use primitives::{Cents, DurationMs, Id, Percentage, Revision, TimestampMs};
 pub use typed::{
@@ -29,8 +31,8 @@ pub use typed::{
 /// typed, deterministic SDK surface and intentionally omits transport framing.
 pub mod prelude {
     pub use crate::{
-        boxed_extension, export, extension, AxiomDecode, AxiomEncode, AxiomType, Cents, DurationMs,
-        EffectCall, Effects, ExtensionResponse, Id, Operation, Percentage, Result, ResumeContext,
+        boxed_extension, export, extension, join, join_all, AxiomDecode, AxiomEncode, AxiomType,
+        Cents, Cx, DurationMs, EffectCall, Effects, ExtensionResponse, Id, Operation, Percentage, Result, ResumeContext,
         Revision, SdkError, Store, StoreField, StoreObject, StorePatch, StoreTransaction, Stream, StreamBatch,
         Ticket, TimestampMs, TypedExtension, TypedInvocation, UiField, UiPatch, UiScope, UiState,
     };
@@ -49,6 +51,7 @@ pub mod raw {
 
 #[doc(hidden)]
 pub mod __private {
+    pub use crate::async_rt::{factory_abi_version, factory_extension, AsyncExports};
     pub use crate::typed::{canonical_record, RecordDecoder};
     pub use alloc::boxed::Box;
 
@@ -107,6 +110,23 @@ pub trait Extension {
         Ok(())
     }
     fn shutdown(&mut self) {}
+    /// ABI 1.1 (X8c): true when this extension answers `InvokeRound`
+    /// ([`Extension::invoke_round`]); `GuestMachine` then selects 1.1 when the
+    /// host offers it. Extensions with async exports return true.
+    fn supports_rounds(&self) -> bool {
+        false
+    }
+    /// ABI 1.1 (X8c): one round of a multi-round invocation.
+    fn invoke_round(&mut self, request: RoundInvocation) -> GuestMessage {
+        GuestMessage::Failed {
+            request_id: request.request_id,
+            error: ExtensionError {
+                code: abi::ErrorCode::Protocol,
+                message: "extension does not support ABI 1.1 rounds".into(),
+                retryable: false,
+            },
+        }
+    }
 }
 
 // Generated source wrappers construct a trait object so authored modules do
@@ -138,6 +158,14 @@ impl<T: Extension + ?Sized> Extension for Box<T> {
     fn shutdown(&mut self) {
         (**self).shutdown()
     }
+
+    fn supports_rounds(&self) -> bool {
+        (**self).supports_rounds()
+    }
+
+    fn invoke_round(&mut self, request: RoundInvocation) -> GuestMessage {
+        (**self).invoke_round(request)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -160,6 +188,9 @@ pub struct GuestMachine<E> {
     state: MachineState,
     limits: CodecLimits,
     last_error: Option<String>,
+    /// Negotiated ABI version (1.0 until a rounds-capable extension selects
+    /// 1.1); every frame after `Negotiated` carries it.
+    abi: abi::AbiVersion,
     /// The ABI crate's protocol checker is the single source of transition
     /// rules: every host message and every guest response must also be legal
     /// there, so this harness and host-side checkers cannot drift apart.
@@ -173,6 +204,7 @@ impl<E: Extension> GuestMachine<E> {
             state: MachineState::New,
             limits,
             last_error: None,
+            abi: abi::ABI_VERSION,
             protocol: abi::Lifecycle::default(),
         }
     }
@@ -185,12 +217,12 @@ impl<E: Extension> GuestMachine<E> {
 
     pub fn dispatch(&mut self, bytes: &[u8]) -> core::result::Result<Vec<u8>, abi::ProtocolError> {
         self.last_error = None;
-        let checkpoint = (self.protocol.clone(), self.state);
+        let checkpoint = (self.protocol.clone(), self.state, self.abi);
         let result = self.dispatch_frame(bytes);
         if result.is_err() {
             // The host receives no response for a failed dispatch, so neither
             // the harness state nor the protocol checker may advance.
-            (self.protocol, self.state) = checkpoint;
+            (self.protocol, self.state, self.abi) = checkpoint;
         }
         if let Err(error) = &result {
             if self.last_error.is_none() {
@@ -208,19 +240,31 @@ impl<E: Extension> GuestMachine<E> {
         bytes: &[u8],
     ) -> core::result::Result<Vec<u8>, abi::ProtocolError> {
         // Host frames are trusted; the host still canonically checks our output.
-        let frame = abi::decode_frame_trusted::<HostMessage>(bytes, self.limits)?;
+        // A 1.1 session accepts exactly 1.1 frames; 1.0 is decoded as before.
+        let reply_abi = self.abi;
+        let frame = if reply_abi == abi::ABI_VERSION_1_1 {
+            abi::decode_frame_trusted_versioned::<HostMessage>(bytes, self.limits, &[reply_abi])?
+        } else {
+            abi::decode_frame_trusted::<HostMessage>(bytes, self.limits)?
+        };
         if self.state != MachineState::Stopped {
             self.protocol.host(&frame.message)?;
         }
         let response = match (self.state, frame.message) {
             (MachineState::New, HostMessage::Negotiate { supported }) => {
-                if !supported.contains(&abi::ABI_VERSION) {
+                let selected = if self.extension.supports_rounds()
+                    && supported.contains(&abi::ABI_VERSION_1_1)
+                {
+                    abi::ABI_VERSION_1_1
+                } else if supported.contains(&abi::ABI_VERSION) {
+                    abi::ABI_VERSION
+                } else {
                     return Err(abi::ProtocolError::AbiMismatch);
-                }
+                };
                 self.state = MachineState::Negotiated;
-                GuestMessage::Negotiated {
-                    selected: abi::ABI_VERSION,
-                }
+                // `Negotiated` itself goes out in a 1.0 frame (`reply_abi`).
+                self.abi = selected;
+                GuestMessage::Negotiated { selected }
             }
             (MachineState::Negotiated, HostMessage::Initialize { .. }) => {
                 if let Err(error) = self.extension.initialize() {
@@ -255,6 +299,27 @@ impl<E: Extension> GuestMachine<E> {
                 let response = self.extension.resume(request_id, outcomes, events);
                 self.accept_outcome(request_id, response)?
             }
+            (
+                MachineState::Ready | MachineState::Yielded(_),
+                HostMessage::InvokeRound {
+                    request_id,
+                    invocation,
+                    round,
+                    max_rounds,
+                    tape,
+                },
+            ) if matches!(self.state, MachineState::Ready)
+                || self.state == MachineState::Yielded(request_id) =>
+            {
+                let response = self.extension.invoke_round(RoundInvocation {
+                    request_id,
+                    invocation,
+                    round,
+                    max_rounds,
+                    tape,
+                });
+                self.accept_round(request_id, response)?
+            }
             (MachineState::Yielded(active), HostMessage::Cancel { request_id })
                 if active == request_id =>
             {
@@ -282,7 +347,36 @@ impl<E: Extension> GuestMachine<E> {
             _ => return Err(abi::ProtocolError::InvalidTransition),
         };
         self.protocol.guest(&response)?;
-        abi::encode(&Frame::new(response), self.limits)
+        if reply_abi == abi::ABI_VERSION {
+            abi::encode(&Frame::new(response), self.limits)
+        } else {
+            abi::encode(&Frame::with_abi(reply_abi, response), self.limits)
+        }
+    }
+
+    fn accept_round(
+        &mut self,
+        request_id: RequestId,
+        response: GuestMessage,
+    ) -> core::result::Result<GuestMessage, abi::ProtocolError> {
+        match &response {
+            GuestMessage::YieldedRound {
+                request_id: actual, ..
+            } if *actual == request_id => self.state = MachineState::Yielded(request_id),
+            GuestMessage::CompletedRound {
+                request_id: actual, ..
+            }
+            | GuestMessage::Failed {
+                request_id: actual, ..
+            }
+            | GuestMessage::Cancelled { request_id: actual }
+                if *actual == request_id =>
+            {
+                self.state = MachineState::Ready
+            }
+            _ => return Err(abi::ProtocolError::InvalidTransition),
+        }
+        Ok(response)
     }
 
     fn accept_outcome(
@@ -904,7 +998,7 @@ macro_rules! export_extension_factory {
         std::thread_local! {
             static AXIOM_EXTENSION_EXPORTS: std::cell::RefCell<$crate::GuestExports<Box<dyn $crate::Extension>>> =
                 std::cell::RefCell::new($crate::GuestExports::new(
-                    $factory(),
+                    $crate::__private::factory_extension($factory),
                     $crate::abi::CodecLimits { max_bytes: $max_bytes },
                 ));
         }
@@ -912,8 +1006,10 @@ macro_rules! export_extension_factory {
         #[cfg(target_arch = "wasm32")]
         #[unsafe(no_mangle)]
         pub extern "C" fn axiom_extension_abi_version() -> i32 {
-            (($crate::abi::ABI_VERSION.major as i32) << 16)
-                | $crate::abi::ABI_VERSION.minor as i32
+            // 1.0 for `Box<dyn Extension>` factories, 1.1 for `AsyncExtension`
+            // (async exports). A constant, so the body is `i32.const N`.
+            const AXIOM_EXTENSION_ABI: i32 = $crate::__private::factory_abi_version(&$factory);
+            AXIOM_EXTENSION_ABI
         }
 
         #[cfg(target_arch = "wasm32")]
