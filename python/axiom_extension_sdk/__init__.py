@@ -4,7 +4,8 @@ The Axiom compiler parses authored source; it never imports this module while
 building or running an extension. The host supplies the real context.
 """
 
-from typing import Any, Callable, Generic, Mapping, Protocol, TypedDict, TypeVar, overload
+import asyncio
+from typing import Any, Awaitable, Callable, Generic, Mapping, Protocol, TypedDict, TypeVar, overload
 
 from .money import Cents, Percentage
 
@@ -110,6 +111,40 @@ class ResumeContext(Protocol):
         by the host runtime, not by this module."""
         ...
     def complete(self, output: Any = ...) -> Any: ...
+
+class HostOperationError(Exception):
+    """A host operation failed (async exports). ``code`` is the ABI error code
+    (``"Guest"``, ``"Denied"``, ``"Exhausted"``, ...). An export that lets it
+    escape fails the invocation with the same code."""
+
+    def __init__(self, code: str, message: str, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.code = code
+        self.retryable = retryable
+
+
+class AsyncContext(Protocol):
+    """The context of an ``async def`` export (ABI 1.1 rounds)."""
+    input: Any
+    def call(self, effect: TypedEffect[ValueT]) -> Awaitable[ValueT]:
+        """Start a host operation when awaited (or scheduled by ``gather``);
+        operations started together before the export waits form one round."""
+        ...
+    def round(self) -> int: ...
+    def max_rounds(self) -> int: ...
+    def secret(self, alias: str) -> SecretHandle: ...
+    def snapshot(self, resource: str) -> Snapshot: ...
+    def patch(self, resource: str) -> Patch: ...
+    def complete(self, output: Any = ..., *, patches: list[Any] = ...,
+                 transactions: list[Any] = ..., emitted_events: list[Any] = ...) -> Any: ...
+
+
+def gather(*awaitables: Awaitable[Any], return_exceptions: bool = False) -> Awaitable[list[Any]]:
+    """Await several operations or coroutines together (``asyncio.gather``):
+    their host operations go to the host as one round group. There is no
+    ``asyncio`` in the AOT profile; under CPython this is ``asyncio.gather``."""
+    return asyncio.gather(*awaitables, return_exceptions=return_exceptions)
+
 
 class _Extension:
     def export(self, function: T) -> T:

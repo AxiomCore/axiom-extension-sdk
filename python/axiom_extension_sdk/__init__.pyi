@@ -1,4 +1,4 @@
-from typing import Any, Callable, Generic, Mapping, Protocol, TypedDict, TypeVar, overload
+from typing import Any, Awaitable, Callable, Generic, Mapping, Protocol, TypedDict, TypeVar, overload
 
 from .money import Cents as Cents, Percentage as Percentage
 
@@ -90,6 +90,41 @@ class ResumeContext(Protocol):
         from ``plan.push(effect)``."""
         ...
     def complete(self, output: Any = ...) -> Any: ...
+
+class HostOperationError(Exception):
+    """A failed host operation in an async export; ``code`` is the ABI error code.
+    An export that lets it escape fails the invocation with the same code."""
+    code: str
+    retryable: bool
+    def __init__(self, code: str, message: str, retryable: bool = ...) -> None: ...
+
+class AsyncContext(Protocol):
+    """The context of an ``async def`` export (ABI 1.1 rounds, replay)."""
+    input: Any
+    def call(self, effect: TypedEffect[O]) -> Awaitable[O]:
+        """A host operation; it registers when awaited or scheduled by
+        ``gather``. Operations started together form one round."""
+        ...
+    def round(self) -> int:
+        """The current invoke number; it must not influence which operations are called."""
+        ...
+    def max_rounds(self) -> int: ...
+    def secret(self, alias: str) -> SecretHandle: ...
+    def snapshot(self, resource: str) -> Snapshot: ...
+    def patch(self, resource: str) -> Patch: ...
+    def complete(
+        self,
+        output: Any = ...,
+        *,
+        patches: list[Any] = ...,
+        transactions: list[Any] = ...,
+        emitted_events: list[Any] = ...,
+    ) -> Any: ...
+
+def gather(*awaitables: Awaitable[Any], return_exceptions: bool = ...) -> Awaitable[list[Any]]:
+    """Await operations or coroutines together; their host operations form
+    one round group (``asyncio.gather`` semantics; no ``asyncio`` in the AOT profile)."""
+    ...
 
 class _Extension:
     def export(self, function: T) -> T: ...
