@@ -287,6 +287,8 @@ class RoundRun {
   private readonly completions = new WeakSet<object>();
   /** The root of this run's async call tree (plan order). */
   private readonly root: OrderNode = { path: [], next: 0 };
+  /** Set when an operation started outside the async call tree (see `register`). */
+  private outsideTree = false;
 
   constructor(private readonly request: RoundRequest, private readonly write: (response: RoundResponse) => void) {}
 
@@ -335,6 +337,12 @@ class RoundRun {
     if (this.settled || this.answered) return new Promise(() => {});
     const plain = plainEffect(effect);
     const decode = effectDecoder(effect as object);
+    // In a lowered (async) build all guest code runs inside the call tree;
+    // only a custom thenable's `then`, called by the engine itself, runs
+    // outside it. Such an operation has no defined place in the plan, so the
+    // round fails at its stall (a deterministic error, not an arbitrary
+    // order). Unlowered (node tests) everything runs under the root.
+    if (currentNode === undefined && LOWERED_ASYNC) this.outsideTree = true;
     const node = currentNode ?? this.root;
     const key = [...node.path, node.next++];
     let entry!: Registered;
@@ -378,6 +386,10 @@ class RoundRun {
         ? (value as Completed).result
         : { output: encodeValue(value), patches: [], transactions: [], emitted_events: [] };
       this.answer({ kind: "completedRound", result, replayed });
+      return;
+    }
+    if (this.outsideTree) {
+      this.answer({ kind: "failed", error: failure("InvalidInput", "a host operation was started outside the async call tree (for example from a custom thenable's `then`, which the engine calls itself); its place in the round's plan is not defined. Start host operations from async functions or promise callbacks"), replayed });
       return;
     }
     // Depth-first order of the async call tree (independent of microtask hops).
