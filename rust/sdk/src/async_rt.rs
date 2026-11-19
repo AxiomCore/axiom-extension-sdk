@@ -55,7 +55,7 @@ use crate::{
 use abi::{
     Effect, EffectGroup, EffectGroupMode, EffectOutcome, EffectPlan, ErrorCode, Event, EventBatch,
     ExtensionError, GuestMessage, Invocation, InvocationResult, NamedEffect, Patch, PlanHash,
-    RequestId, RoundPlan, RoundRecord, TransactionProposal, Value,
+    RequestId, RoundPlan, RoundRecord, SiteId, TransactionProposal, Value,
 };
 use alloc::{boxed::Box, format, string::String, vec::Vec};
 use core::{
@@ -100,8 +100,9 @@ struct RunState {
     /// Tape records consumed by replay so far.
     cursor: usize,
     slots: Vec<Slot>,
-    /// Operations registered since the last stall: (slot, effect).
-    segment: Vec<(usize, Effect)>,
+    /// Operations registered since the last stall: (slot, effect, X9c site
+    /// label of the generated binding call that built it).
+    segment: Vec<(usize, Effect, Option<SiteId>)>,
     replayed: Vec<PlanHash>,
     patches: Vec<Patch>,
     transactions: Vec<TransactionProposal>,
@@ -127,8 +128,12 @@ impl Cx {
     fn new(request: RoundInvocation, move_input: bool) -> Self {
         let mut invocation = request.invocation;
         let moved_input = move_input.then(|| core::mem::replace(&mut invocation.input, Value::Null));
+        let mut invocation = TypedInvocation::new(request.request_id, invocation);
+        if move_input {
+            invocation.mark_input_moved();
+        }
         Self {
-            invocation: TypedInvocation::new(request.request_id, invocation),
+            invocation,
             moved_input: RefCell::new(moved_input),
             input_taken: Cell::new(false),
             round: request.round,
@@ -151,9 +156,10 @@ impl Cx {
     /// outcome decoded as the operation's declared output type `O`, or the
     /// host's error. The operation joins the round plan when first polled.
     pub fn call<O: AxiomDecode>(&self, call: EffectCall<O>) -> Call<'_, O> {
+        let (effect, site) = call.into_parts();
         Call {
             cx: self,
-            state: CallState::Unpolled(call.into_effect()),
+            state: CallState::Unpolled(effect, site),
             marker: PhantomData,
         }
     }
@@ -161,27 +167,30 @@ impl Cx {
     /// The invocation: export name, input and the round-1 snapshots (use it
     /// with `UiState::generated` / `Store::generated` as in sync exports).
     ///
-    /// In an export whose input parameter is `Value`, the input is moved into
-    /// that argument (no per-round copy), so `invocation().input()` sees
-    /// `Null` there; read the argument instead.
+    /// Its `input()` always sees the input. (In an export whose input
+    /// parameter is `Value`, the input is moved into that argument, without a
+    /// per-round copy; reading it here decodes it again from the round's
+    /// frame, W2A-1.)
     pub fn invocation(&self) -> &TypedInvocation {
         &self.invocation
     }
 
-    /// The export input decoded as `T`.
-    ///
-    /// In an export whose input parameter is `Value`, the input was moved
-    /// into that argument and this returns `InvalidInput`; read the argument.
+    /// The export input decoded as `T`. Always works: in an export whose
+    /// input parameter is `Value` the input was moved into that argument
+    /// (H-1), and this decodes it again from the round's frame (W2A-1), so
+    /// only exports that read the input both ways pay for a second copy.
     pub fn input<T: AxiomDecode>(&self) -> Result<T> {
         if let Some(value) = self.moved_input.borrow().as_ref() {
             return T::decode(value);
         }
-        if self.input_taken.get() {
-            return Err(SdkError::invalid_input(
-                "the export input was moved into the export's `Value` argument; read it from the argument",
-            ));
-        }
         self.invocation.input()
+    }
+
+    /// Whether this run moved the export input into its `Value` argument
+    /// (H-1) instead of copying it. For tests of the move.
+    #[doc(hidden)]
+    pub fn __input_moved(&self) -> bool {
+        self.input_taken.get()
     }
 
     /// The export's input argument (used by `#[extension]` for exports whose
@@ -237,11 +246,11 @@ impl Cx {
         });
     }
 
-    fn register(&self, effect: Effect, waker: &Waker) -> usize {
+    fn register(&self, effect: Effect, site: Option<SiteId>, waker: &Waker) -> usize {
         let mut state = self.state.borrow_mut();
         let slot = state.slots.len();
         state.slots.push(Slot::Waiting(Some(waker.clone())));
-        state.segment.push((slot, effect));
+        state.segment.push((slot, effect, site));
         slot
     }
 
@@ -268,7 +277,7 @@ impl Cx {
 }
 
 enum CallState {
-    Unpolled(Effect),
+    Unpolled(Effect, Option<SiteId>),
     Registered(usize),
     Done,
 }
@@ -290,8 +299,8 @@ impl<O: AxiomDecode> Future for Call<'_, O> {
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Result<O>> {
         let this = self.get_mut();
         match core::mem::replace(&mut this.state, CallState::Done) {
-            CallState::Unpolled(effect) => {
-                this.state = CallState::Registered(this.cx.register(effect, context.waker()));
+            CallState::Unpolled(effect, site) => {
+                this.state = CallState::Registered(this.cx.register(effect, site, context.waker()));
                 Poll::Pending
             }
             CallState::Registered(slot) => match this.cx.take(slot, context.waker()) {
@@ -470,7 +479,7 @@ pub fn run_round<S>(request: RoundInvocation, start: S) -> RoundStep
 where
     S: for<'cx> FnOnce(&'cx Cx) -> Option<LocalBoxFuture<'cx, Result<Value>>>,
 {
-    run_round_with(request, false, &mut PlanMemo::default(), start)
+    run_round_with(request, false, &mut PlanMemo::default(), start).step
 }
 
 /// Plan hashes of one invocation, kept by the warm instance between rounds
@@ -524,24 +533,35 @@ impl PlanMemo {
     }
 }
 
+/// X9c site labels of a yielded plan, one per effect (plan) or branch
+/// (group), in plan order; empty for every other step.
+type YieldSites = Vec<Option<SiteId>>;
+
+/// One run of an async export.
+struct RunOutput {
+    step: RoundStep,
+    sites: YieldSites,
+}
+
 /// [`run_round`], holding the input aside when `move_input` is set so the
 /// export's `Value` argument takes it without a copy
 /// ([`AsyncExports::input_moves`]), and reusing plan hashes from `memo`.
+/// Also returns the site labels of a yielded plan.
 fn run_round_with<S>(
     request: RoundInvocation,
     move_input: bool,
     memo: &mut PlanMemo,
     start: S,
-) -> RoundStep
+) -> RunOutput
 where
     S: for<'cx> FnOnce(&'cx Cx) -> Option<LocalBoxFuture<'cx, Result<Value>>>,
 {
     memo.begin(request.request_id, request.tape.len());
-    let step = run_round_memo(request, move_input, memo, start);
-    if !matches!(step, RoundStep::Yielded { .. }) {
+    let output = run_round_memo(request, move_input, memo, start);
+    if !matches!(output.step, RoundStep::Yielded { .. }) {
         memo.clear();
     }
-    step
+    output
 }
 
 fn run_round_memo<S>(
@@ -549,16 +569,17 @@ fn run_round_memo<S>(
     move_input: bool,
     memo: &mut PlanMemo,
     start: S,
-) -> RoundStep
+) -> RunOutput
 where
     S: for<'cx> FnOnce(&'cx Cx) -> Option<LocalBoxFuture<'cx, Result<Value>>>,
 {
+    let step = |step: RoundStep| RunOutput { step, sites: Vec::new() };
     let cx = Cx::new(request, move_input);
     let Some(mut future) = start(&cx) else {
-        return RoundStep::Failed(error(
+        return step(RoundStep::Failed(error(
             ErrorCode::InvalidInput,
             format!("unknown async export `{}`", cx.invocation.export()),
-        ));
+        )));
     };
     let mut context = Context::from_waker(Waker::noop());
     let output = loop {
@@ -568,36 +589,45 @@ where
         let mut state = cx.state.borrow_mut();
         let segment = core::mem::take(&mut state.segment);
         if segment.is_empty() {
-            return RoundStep::Failed(error(
+            return step(RoundStep::Failed(error(
                 ErrorCode::InvalidInput,
                 "async export is waiting on something that is not a host operation; only `Cx::call` futures can be awaited (no timers, channels or other executors)",
-            ));
+            )));
         }
         if segment.len() > MAX_GROUP_BRANCHES {
-            return RoundStep::Failed(error(
+            return step(RoundStep::Failed(error(
                 ErrorCode::Exhausted,
                 format!(
                     "{} host operations are pending together; one round group allows at most {MAX_GROUP_BRANCHES}",
                     segment.len()
                 ),
-            ));
+            )));
         }
-        let (slots, effects): (Vec<usize>, Vec<Effect>) = segment.into_iter().unzip();
+        let mut slots = Vec::with_capacity(segment.len());
+        let mut effects = Vec::with_capacity(segment.len());
+        let mut sites = Vec::new();
+        for (slot, effect, site) in segment {
+            slots.push(slot);
+            effects.push(effect);
+            sites.push(site);
+        }
+        // `segment_plan` keeps registration order for a plan and for a
+        // group's branches, so the labels line up with the plan.
         let plan = segment_plan(effects);
         if state.cursor >= state.tape.len() {
             let replayed = core::mem::take(&mut state.replayed);
-            return RoundStep::Yielded { replayed, plan };
+            return RunOutput { step: RoundStep::Yielded { replayed, plan }, sites };
         }
         let k = state.cursor;
         let hash = memo.hash(k, plan);
         if state.tape[k].plan_hash != hash {
-            return RoundStep::Failed(error(
+            return step(RoundStep::Failed(error(
                 ErrorCode::Protocol,
                 format!(
                     "non-deterministic guest: the plan re-derived for effect round {} differs from the tape",
                     k + 1
                 ),
-            ));
+            )));
         }
         state.replayed.push(hash);
         state.cursor += 1;
@@ -627,16 +657,16 @@ where
     drop(future);
     let state = cx.state.into_inner();
     if state.cursor != state.tape.len() {
-        return RoundStep::Failed(error(
+        return step(RoundStep::Failed(error(
             ErrorCode::Protocol,
             format!(
                 "non-deterministic guest: the export completed after replaying {} of {} effect rounds",
                 state.cursor,
                 state.tape.len()
             ),
-        ));
+        )));
     }
-    match output {
+    step(match output {
         Ok(output) => RoundStep::Completed {
             replayed: state.replayed,
             result: InvocationResult {
@@ -647,7 +677,7 @@ where
             },
         },
         Err(error) => RoundStep::Failed(error.into()),
-    }
+    })
 }
 
 // ------------------------------------------------------------------ adapter
@@ -666,8 +696,10 @@ pub trait AsyncExports {
 
     /// True when async export `export` takes its input as `Value`: the
     /// executor then moves the input into the argument instead of cloning it
-    /// every round (H-1). Defaults to false (the input is decoded by
-    /// reference, as before).
+    /// every round (H-1). `Cx::input` and `cx.invocation().input()` still see
+    /// the input: they decode it again from the round's frame when asked
+    /// (W2A-1). Defaults to false (the input is decoded by reference, as
+    /// before).
     fn input_moves(export: &str) -> bool {
         let _ = export;
         false
@@ -682,7 +714,7 @@ pub struct AsyncExtension(Box<dyn Extension>);
 impl AsyncExtension {
     pub fn new<T: TypedExtension + AsyncExports + 'static>(extension: T) -> Self {
         Self(Box::new(RoundsAdapter::<T> {
-            sync: crate::boxed_extension(extension),
+            sync: crate::typed::TypedAdapter::new(extension),
             sync_rounds: None,
             legacy: None,
             memo: PlanMemo::default(),
@@ -758,8 +790,9 @@ struct Legacy {
 }
 
 struct RoundsAdapter<T> {
-    /// Sync exports of the same impl, through the ordinary typed adapter.
-    sync: Box<dyn Extension>,
+    /// Sync exports of the same impl, through the ordinary typed adapter
+    /// (held by type so the yielded plan's site labels can be read back).
+    sync: crate::typed::TypedAdapter<T>,
     /// A sync export inside a 1.1 session: its request and the hashes of the
     /// plans it yielded. Sync exports keep their continuation in instance
     /// memory, exactly as on ABI 1.0.
@@ -771,13 +804,21 @@ struct RoundsAdapter<T> {
     marker: PhantomData<fn() -> T>,
 }
 
-impl<T: AsyncExports> RoundsAdapter<T> {
+impl<T: TypedExtension + AsyncExports> RoundsAdapter<T> {
     fn is_async(export: &str) -> bool {
         T::ASYNC_EXPORTS.contains(&export)
     }
 
-    fn run(&mut self, request: RoundInvocation) -> RoundStep {
-        let move_input = T::input_moves(&request.invocation.export);
+    fn run(&mut self, request: RoundInvocation) -> RunOutput {
+        self.run_moving(request, true)
+    }
+
+    /// `allow_move`: the input may be moved into a `Value` argument (H-1),
+    /// which needs the round's frame to read it again (W2A-1, `round_frame`).
+    fn run_moving(&mut self, request: RoundInvocation, allow_move: bool) -> RunOutput {
+        let move_input = allow_move
+            && T::input_moves(&request.invocation.export)
+            && crate::round_frame::available();
         run_round_with(request, move_input, &mut self.memo, |cx| {
             T::dispatch_async(cx, cx.invocation.export())
         })
@@ -812,12 +853,10 @@ impl<T: AsyncExports> RoundsAdapter<T> {
             hashes.push(abi::round_plan_hash(&plan));
         }
         self.sync_rounds = Some((request_id, hashes));
-        GuestMessage::YieldedRound {
-            request_id,
-            round,
-            replayed,
-            plan: response,
-        }
+        // X9c: the typed tickets' site labels go beside the plan; with none
+        // known this is the plain `YieldedRound`, byte for byte.
+        let sites = self.sync.take_yield_sites(request_id);
+        abi::yielded_round(request_id, round, replayed, response, sites)
     }
 }
 
@@ -825,7 +864,7 @@ fn failed(request_id: RequestId, error: ExtensionError) -> GuestMessage {
     GuestMessage::Failed { request_id, error }
 }
 
-impl<T: AsyncExports> Extension for RoundsAdapter<T> {
+impl<T: TypedExtension + AsyncExports> Extension for RoundsAdapter<T> {
     fn initialize(&mut self) -> core::result::Result<(), ExtensionError> {
         self.sync.initialize()
     }
@@ -839,19 +878,19 @@ impl<T: AsyncExports> Extension for RoundsAdapter<T> {
         let round = request.round;
         if Self::is_async(&request.invocation.export) {
             self.sync_rounds = None;
-            return match self.run(request) {
+            let RunOutput { step, sites } = self.run(request);
+            return match step {
                 RoundStep::Completed { replayed, result } => GuestMessage::CompletedRound {
                     request_id,
                     round,
                     replayed,
                     result,
                 },
-                RoundStep::Yielded { replayed, plan } => GuestMessage::YieldedRound {
-                    request_id,
-                    round,
-                    replayed,
-                    plan,
-                },
+                // X9c: sited when a generated binding supplied a site, else the
+                // plain `YieldedRound`, byte for byte as before.
+                RoundStep::Yielded { replayed, plan } => {
+                    abi::yielded_round(request_id, round, replayed, plan, sites)
+                }
                 RoundStep::Failed(error) => failed(request_id, error),
             };
         }
@@ -899,7 +938,9 @@ impl<T: AsyncExports> Extension for RoundsAdapter<T> {
             max_rounds: 1,
             tape: Vec::new(),
         };
-        match self.run(request) {
+        // ABI 1.0 has no site labels: the plan goes out as before. The 1.0
+        // path holds its own copy of the invocation, so the input is copied.
+        match self.run_moving(request, false).step {
             RoundStep::Completed { result, .. } => GuestMessage::Completed { request_id, result },
             RoundStep::Yielded { plan, .. } => {
                 self.legacy = Some(Legacy {
@@ -942,7 +983,7 @@ impl<T: AsyncExports> Extension for RoundsAdapter<T> {
                 events,
             }],
         };
-        match self.run(request) {
+        match self.run_moving(request, false).step {
             RoundStep::Completed { result, .. } => GuestMessage::Completed { request_id, result },
             RoundStep::Yielded { .. } => failed(
                 request_id,

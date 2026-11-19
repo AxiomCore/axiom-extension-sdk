@@ -6,6 +6,7 @@ extern crate self as axiom_extension_sdk;
 
 pub mod async_rt;
 mod primitives;
+pub(crate) mod round_frame;
 pub mod secrets;
 #[cfg(feature = "std")]
 pub mod test;
@@ -347,12 +348,18 @@ impl<E: Extension, const ROUNDS: bool> GuestMachine<E, ROUNDS> {
                 && (matches!(self.state, MachineState::Ready)
                     || self.state == MachineState::Yielded(request_id)) =>
             {
-                let response = self.extension.invoke_round(RoundInvocation {
+                let request = RoundInvocation {
                     request_id,
                     invocation,
                     round,
                     max_rounds,
                     tape,
+                };
+                // W2A-1: the frame stays readable for this round, so an async
+                // export whose `Value` input was moved can still read it.
+                let extension = &mut self.extension;
+                let response = round_frame::scoped(bytes, self.limits, reply_abi, || {
+                    extension.invoke_round(request)
                 });
                 self.accept_round(request_id, response)?
             }
@@ -396,7 +403,12 @@ impl<E: Extension, const ROUNDS: bool> GuestMachine<E, ROUNDS> {
         response: GuestMessage,
     ) -> core::result::Result<GuestMessage, abi::ProtocolError> {
         match &response {
+            // X9c: a sited yield (`abi::yielded_round` with known sites) is a
+            // yield like any other; the labels ride beside the plan.
             GuestMessage::YieldedRound {
+                request_id: actual, ..
+            }
+            | GuestMessage::YieldedRoundSited {
                 request_id: actual, ..
             } if *actual == request_id => self.state = MachineState::Yielded(request_id),
             GuestMessage::CompletedRound {
