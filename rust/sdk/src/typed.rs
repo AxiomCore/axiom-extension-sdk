@@ -937,8 +937,102 @@ impl<S: StoreObject> From<StoreTransaction<S>> for TransactionProposal {
     }
 }
 
+/// One entry of the X9a site table (`axiom-extension-effect-summary/v1`
+/// `sites[]`): the binding token a guest source uses, as the static analyser
+/// records it. `file` is relative to the extension source root with `/`
+/// separators; `line` and `column` are 1-based, the column counted in
+/// Unicode scalar values; `binding` is the qualified generated item (for
+/// example `operations::catalog_name` or `ui::Cart::subscribe_total`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SiteKey {
+    pub file: &'static str,
+    pub line: u32,
+    pub column: u32,
+    pub binding: &'static str,
+}
+
+/// The interned X9a site table embedded in the generated bindings by the
+/// build (X9c). The id of a site is its index; the table is sorted by
+/// (`file`, `line`, `column`, `binding`), exactly as X9a interns it, so the
+/// ids the guest emits at run time are the ids of the package's static
+/// summary. `root` is the prefix the compiler puts in front of the source
+/// root in [`core::panic::Location::file`] (for the Axiom source build,
+/// `members/<alias>/src/sources/`); it is stripped before matching, so no
+/// path of the build machine is compared or emitted.
+///
+/// The table is data for labels only. A site id never changes what an
+/// effect does, and the host treats it as untrusted.
+#[derive(Clone, Copy, Debug)]
+pub struct SiteTable {
+    pub root: &'static str,
+    pub sites: &'static [SiteKey],
+}
+
+impl SiteTable {
+    /// No table: every generated binding call carries no site, and a 1.1
+    /// guest yields plain `YieldedRound` frames, byte for byte as before X9c.
+    pub const EMPTY: SiteTable = SiteTable {
+        root: "",
+        sites: &[],
+    };
+
+    /// The X9c interning rule (contract `x9c-sites-and-spans.md` §3). A call
+    /// whose caller location is (`file`, `line`, `column`) and that goes
+    /// through the generated item `binding` has the site id of the table entry
+    /// with the same file (after stripping `root`), the same line and the
+    /// same binding, and the smallest column that is at least `column`.
+    ///
+    /// Why "smallest column at or after": `#[track_caller]` reports the
+    /// method-name token for a method call (`cart.subscribe_total()`), which
+    /// is exactly the X9a binding token, and the first token of the path for
+    /// a path call (`operations::catalog_name(..)`), where X9a records the
+    /// last path segment (the first one when a turbofish follows). In both
+    /// cases the X9a token is the first entry for that binding at or after
+    /// the reported column: every other call of the same binding on the line
+    /// either ends before this call starts or begins after this call's
+    /// binding token. No entry means no site (`None`), never a guess from
+    /// another line.
+    pub fn locate(&self, file: &str, line: u32, column: u32, binding: &str) -> Option<abi::SiteId> {
+        if self.sites.is_empty() || self.sites.len() > abi::MAX_SITE_TABLE_LEN as usize {
+            return None;
+        }
+        let normalised;
+        let file = if file.contains('\\') {
+            normalised = file.replace('\\', "/");
+            normalised.as_str()
+        } else {
+            file
+        };
+        let relative = file.strip_prefix(self.root)?;
+        let start = self
+            .sites
+            .partition_point(|site| (site.file, site.line, site.column) < (relative, line, column));
+        for (offset, site) in self.sites[start..].iter().enumerate() {
+            if site.file != relative || site.line != line {
+                break;
+            }
+            if site.binding == binding {
+                return abi::SiteId::try_from(start + offset).ok();
+            }
+        }
+        None
+    }
+
+    /// [`Self::locate`] at the caller's location. Generated binding items are
+    /// `#[track_caller]`, so this is the guest's call of the binding.
+    #[track_caller]
+    pub fn here(&self, binding: &str) -> Option<abi::SiteId> {
+        if self.sites.is_empty() {
+            return None;
+        }
+        let location = core::panic::Location::caller();
+        self.locate(location.file(), location.line(), location.column(), binding)
+    }
+}
+
 pub struct Operation<I, O> {
     binding: Binding,
+    site: Option<abi::SiteId>,
     marker: PhantomData<fn(I) -> O>,
 }
 
@@ -947,8 +1041,29 @@ impl<I, O> Operation<I, O> {
     pub const fn generated(binding: Binding) -> Self {
         Self {
             binding,
+            site: None,
             marker: PhantomData,
         }
+    }
+
+    /// Generated binding items (X9c) call this from a `#[track_caller]`
+    /// function, so the site is the guest's call of the generated item,
+    /// interned through the embedded X9a table. With [`SiteTable::EMPTY`]
+    /// this is [`Self::generated`].
+    #[doc(hidden)]
+    #[track_caller]
+    pub fn generated_sited(binding: Binding, table: &SiteTable, name: &str) -> Self {
+        Self {
+            binding,
+            site: table.here(name),
+            marker: PhantomData,
+        }
+    }
+
+    /// The interned X9a site of the binding call that produced this
+    /// operation, if the build embedded a site table and the call is in it.
+    pub fn site(&self) -> Option<abi::SiteId> {
+        self.site
     }
 }
 
@@ -956,6 +1071,7 @@ impl<I: AxiomEncode, O> Operation<I, O> {
     pub fn call(&self, input: I) -> EffectCall<O> {
         EffectCall {
             effect: self.binding.effect(input.encode()),
+            site: self.site,
             marker: PhantomData,
         }
     }
@@ -963,12 +1079,24 @@ impl<I: AxiomEncode, O> Operation<I, O> {
 
 pub struct EffectCall<O> {
     effect: Effect,
+    site: Option<abi::SiteId>,
     marker: PhantomData<fn() -> O>,
 }
 
 impl<O> EffectCall<O> {
     pub fn into_effect(self) -> Effect {
         self.effect
+    }
+
+    /// The X9c site label carried with this call (never part of the effect
+    /// bytes or the plan hash).
+    pub fn site(&self) -> Option<abi::SiteId> {
+        self.site
+    }
+
+    /// The effect and its site label.
+    pub fn into_parts(self) -> (Effect, Option<abi::SiteId>) {
+        (self.effect, self.site)
     }
 }
 
@@ -1065,6 +1193,7 @@ impl<O> core::fmt::Debug for Ticket<O> {
 
 pub struct Effects {
     effects: Vec<Effect>,
+    sites: Vec<Option<abi::SiteId>>,
     plan: u64,
 }
 
@@ -1078,6 +1207,7 @@ impl Effects {
     pub fn new() -> Self {
         Self {
             effects: Vec::new(),
+            sites: Vec::new(),
             plan: NEXT_PLAN.fetch_add(1, Ordering::Relaxed),
         }
     }
@@ -1085,7 +1215,9 @@ impl Effects {
     /// Append a call, chaining by value. The outcome can only be read
     /// positionally; prefer [`Effects::push`], which returns a typed ticket.
     pub fn call<O>(mut self, call: EffectCall<O>) -> Self {
-        self.effects.push(call.into_effect());
+        let (effect, site) = call.into_parts();
+        self.effects.push(effect);
+        self.sites.push(site);
         self
     }
 
@@ -1093,7 +1225,9 @@ impl Effects {
     /// bytes are identical to the ones [`Effects::call`] produces.
     pub fn push<O>(&mut self, call: EffectCall<O>) -> Ticket<O> {
         let index = u32::try_from(self.effects.len()).unwrap_or(u32::MAX);
-        self.effects.push(call.into_effect());
+        let (effect, site) = call.into_parts();
+        self.effects.push(effect);
+        self.sites.push(site);
         Ticket {
             plan: self.plan,
             index,
@@ -1108,6 +1242,19 @@ impl Effects {
 
     pub fn is_empty(&self) -> bool {
         self.effects.is_empty()
+    }
+
+    /// X9c: the site label of each call, in plan order (`None` when unknown).
+    pub fn sites(&self) -> &[Option<abi::SiteId>] {
+        &self.sites
+    }
+
+    /// X9c, ABI 1.1: the round plan and its site labels, for
+    /// [`abi::yielded_round`], which sends the plain `YieldedRound` when no
+    /// label is known.
+    pub fn into_round_plan(self) -> (abi::RoundPlan, Vec<Option<abi::SiteId>>) {
+        let sites = self.sites.clone();
+        (abi::RoundPlan::Plan(self.build()), sites)
     }
 
     fn record(&self) -> PlanRecord {
@@ -1136,6 +1283,7 @@ pub struct EffectGroup {
     mode: abi::EffectGroupMode,
     limit: u16,
     branches: Vec<abi::NamedEffect>,
+    sites: Vec<Option<abi::SiteId>>,
     plan: u64,
 }
 
@@ -1146,6 +1294,7 @@ impl EffectGroup {
             mode,
             limit,
             branches: Vec::new(),
+            sites: Vec::new(),
             plan: NEXT_PLAN.fetch_add(1, Ordering::Relaxed),
         }
     }
@@ -1153,10 +1302,12 @@ impl EffectGroup {
     /// Append a named branch and return the typed ticket for its outcome.
     pub fn push<O>(&mut self, name: impl Into<String>, call: EffectCall<O>) -> Ticket<O> {
         let index = u32::try_from(self.branches.len()).unwrap_or(u32::MAX);
+        let (effect, site) = call.into_parts();
         self.branches.push(abi::NamedEffect {
             name: name.into(),
-            effect: call.into_effect(),
+            effect,
         });
+        self.sites.push(site);
         Ticket {
             plan: self.plan,
             index,
@@ -1171,6 +1322,17 @@ impl EffectGroup {
 
     pub fn is_empty(&self) -> bool {
         self.branches.is_empty()
+    }
+
+    /// X9c: the site label of each branch, in branch order.
+    pub fn sites(&self) -> &[Option<abi::SiteId>] {
+        &self.sites
+    }
+
+    /// X9c, ABI 1.1: the round plan (a group) and its site labels.
+    pub fn into_round_plan(self) -> (abi::RoundPlan, Vec<Option<abi::SiteId>>) {
+        let sites = self.sites.clone();
+        (abi::RoundPlan::Group(self.build()), sites)
     }
 
     fn record(&self) -> PlanRecord {
@@ -1756,5 +1918,126 @@ mod ticket_tests {
             via_adapter(boxed_extension(Chained)),
             via_adapter(boxed_extension(TwoCalls::default()))
         );
+    }
+}
+
+#[cfg(test)]
+mod site_tests {
+    use super::*;
+    use alloc::vec;
+
+    const BINDING: Binding = Binding {
+        namespace: "contract:catalog",
+        operation: "query_product",
+        input: "Unsigned",
+        output: "String",
+    };
+
+    // Sorted by (file, line, column, binding), id = index, as X9a interns.
+    static SITES: [SiteKey; 6] = [
+        SiteKey { file: "src/a.rs", line: 3, column: 9, binding: "operations::catalog" },
+        SiteKey { file: "src/a.rs", line: 3, column: 40, binding: "operations::catalog" },
+        SiteKey { file: "src/a.rs", line: 7, column: 5, binding: "operations::catalog" },
+        SiteKey { file: "src/a.rs", line: 7, column: 5, binding: "ui::Cart::subscribe_total" },
+        SiteKey { file: "src/b.rs", line: 1, column: 1, binding: "operations::catalog" },
+        SiteKey { file: "src/b.rs", line: 2, column: 30, binding: "operations::stock" },
+    ];
+    const TABLE: SiteTable = SiteTable { root: "members/x/src/sources/", sites: &SITES };
+
+    fn at(file: &str, line: u32, column: u32, binding: &str) -> Option<u32> {
+        TABLE.locate(file, line, column, binding)
+    }
+
+    #[test]
+    fn exact_and_first_at_or_after_rule() {
+        let f = "members/x/src/sources/src/a.rs";
+        // Method call: the reported column is the binding token itself.
+        assert_eq!(at(f, 7, 5, "ui::Cart::subscribe_total"), Some(3));
+        // Two path calls on one line: each reported column is its path start,
+        // the X9a token is the last segment further right.
+        assert_eq!(at(f, 3, 1, "operations::catalog"), Some(0));
+        assert_eq!(at(f, 3, 9, "operations::catalog"), Some(0));
+        assert_eq!(at(f, 3, 10, "operations::catalog"), Some(1));
+        assert_eq!(at(f, 3, 40, "operations::catalog"), Some(1));
+        // Nothing for that binding at or after the column on the line.
+        assert_eq!(at(f, 3, 41, "operations::catalog"), None);
+        // Same position, different binding (X9a over-approximation entries).
+        assert_eq!(at(f, 7, 1, "operations::catalog"), Some(2));
+        // Never another line or file.
+        assert_eq!(at(f, 4, 1, "operations::catalog"), None);
+        assert_eq!(at("members/x/src/sources/src/b.rs", 2, 1, "operations::stock"), Some(5));
+        assert_eq!(at("members/x/src/sources/src/b.rs", 2, 1, "operations::catalog"), None);
+    }
+
+    #[test]
+    fn root_is_required_and_paths_are_normalised() {
+        // A file outside the root (another crate, the SDK itself) has no site.
+        assert_eq!(at("src/a.rs", 3, 1, "operations::catalog"), None);
+        assert_eq!(at("/abs/members/x/src/sources/src/a.rs", 3, 1, "operations::catalog"), None);
+        // Windows separators from the compiler are normalised.
+        assert_eq!(at("members\\x\\src\\sources\\src\\a.rs", 3, 1, "operations::catalog"), Some(0));
+        // The empty table never matches.
+        assert_eq!(SiteTable::EMPTY.locate("src/a.rs", 3, 9, "operations::catalog"), None);
+    }
+
+    #[test]
+    fn an_unsorted_or_hostile_table_never_panics() {
+        static BAD: [SiteKey; 3] = [
+            SiteKey { file: "z", line: 9, column: 9, binding: "b" },
+            SiteKey { file: "a", line: 0, column: 0, binding: "" },
+            SiteKey { file: "", line: u32::MAX, column: u32::MAX, binding: "b" },
+        ];
+        let table = SiteTable { root: "", sites: &BAD };
+        for (file, line, column) in [("z", 9, 9), ("a", 0, 0), ("", u32::MAX, u32::MAX), ("q", 1, 1)] {
+            let _ = table.locate(file, line, column, "b");
+        }
+    }
+
+    #[track_caller]
+    fn generated_item() -> Operation<u64, String> {
+        Operation::generated_sited(BINDING, &TRACKED, "operations::catalog")
+    }
+
+    // The table for this very file, built from the caller locations below.
+    static TRACKED_SITES: [SiteKey; 0] = [];
+    static TRACKED: SiteTable = SiteTable { root: "", sites: &TRACKED_SITES };
+
+    #[test]
+    fn sites_ride_with_calls_and_never_change_effect_bytes() {
+        let plain = Operation::<u64, String>::generated(BINDING);
+        assert_eq!(plain.site(), None);
+        // Unknown location (empty table): no site.
+        assert_eq!(generated_item().site(), None);
+        let sited = Operation::<u64, String> { binding: BINDING, site: Some(4), marker: PhantomData };
+        let mut effects = Effects::new();
+        let _ = effects.push(plain.call(1));
+        let _ = effects.push(sited.call(1));
+        assert_eq!(effects.sites(), &[None, Some(4)]);
+        let (plan, sites) = effects.into_round_plan();
+        assert_eq!(sites, vec![None, Some(4)]);
+        // Both effects encode identically: the site is not in the effect.
+        let abi::RoundPlan::Plan(plan) = plan else { panic!("plan") };
+        assert_eq!(plan.effects[0], plan.effects[1]);
+        let mut group = EffectGroup::new(abi::EffectGroupMode::Collect, 2);
+        let _ = group.push("a", sited.call(2));
+        let _ = group.push("b", Operation::<u64, String>::generated(BINDING).call(2));
+        assert_eq!(group.sites(), &[Some(4), None]);
+        let (group_plan, group_sites) = group.into_round_plan();
+        assert_eq!(group_sites, vec![Some(4), None]);
+        assert_eq!(group_plan.len(), 2);
+    }
+
+    #[test]
+    fn track_caller_reports_the_guest_call_through_generated_items() {
+        // Two calls on one line get their own columns; the location is the
+        // call of the generated item, not a line inside the SDK.
+        #[track_caller]
+        fn whereami() -> &'static core::panic::Location<'static> {
+            core::panic::Location::caller()
+        }
+        let (a, b) = (whereami(), whereami());
+        assert_eq!(a.line(), b.line());
+        assert!(a.column() < b.column());
+        assert!(a.file().ends_with("typed.rs"));
     }
 }
