@@ -183,7 +183,14 @@ enum MachineState {
 /// Upper bound for guest error text exposed to the host.
 pub const MAX_GUEST_ERROR_BYTES: usize = 1024;
 
-pub struct GuestMachine<E> {
+///
+/// `ROUNDS` (L-5): whether this machine can negotiate ABI 1.1 rounds. The
+/// export macros set it to `false` for modules that export ABI 1.0 (every
+/// sync-only extension), which makes the 1.1 decoding, round dispatch and
+/// 1.1 framing dead code, so the linker drops them and a sync-only module is
+/// built from the same code as before async exports existed. The default
+/// `true` keeps `GuestMachine<E>` exactly as it was.
+pub struct GuestMachine<E, const ROUNDS: bool = true> {
     extension: E,
     state: MachineState,
     limits: CodecLimits,
@@ -199,6 +206,20 @@ pub struct GuestMachine<E> {
 
 impl<E: Extension> GuestMachine<E> {
     pub fn new(extension: E, limits: CodecLimits) -> Self {
+        Self::with_limits(extension, limits)
+    }
+}
+
+impl<E: Extension> GuestMachine<E, false> {
+    /// A machine that only speaks ABI 1.0 (it never selects 1.1, even for a
+    /// rounds-capable extension).
+    pub fn without_rounds(extension: E, limits: CodecLimits) -> Self {
+        Self::with_limits(extension, limits)
+    }
+}
+
+impl<E: Extension, const ROUNDS: bool> GuestMachine<E, ROUNDS> {
+    fn with_limits(extension: E, limits: CodecLimits) -> Self {
         Self {
             extension,
             state: MachineState::New,
@@ -217,12 +238,17 @@ impl<E: Extension> GuestMachine<E> {
 
     pub fn dispatch(&mut self, bytes: &[u8]) -> core::result::Result<Vec<u8>, abi::ProtocolError> {
         self.last_error = None;
-        let checkpoint = (self.protocol.clone(), self.state, self.abi);
+        let checkpoint = (self.protocol.clone(), self.state);
+        // A 1.0-only machine never changes `abi`.
+        let abi = ROUNDS.then_some(self.abi);
         let result = self.dispatch_frame(bytes);
         if result.is_err() {
             // The host receives no response for a failed dispatch, so neither
             // the harness state nor the protocol checker may advance.
-            (self.protocol, self.state, self.abi) = checkpoint;
+            (self.protocol, self.state) = checkpoint;
+            if let Some(abi) = abi {
+                self.abi = abi;
+            }
         }
         if let Err(error) = &result {
             if self.last_error.is_none() {
@@ -242,7 +268,7 @@ impl<E: Extension> GuestMachine<E> {
         // Host frames are trusted; the host still canonically checks our output.
         // A 1.1 session accepts exactly 1.1 frames; 1.0 is decoded as before.
         let reply_abi = self.abi;
-        let frame = if reply_abi == abi::ABI_VERSION_1_1 {
+        let frame = if ROUNDS && reply_abi == abi::ABI_VERSION_1_1 {
             abi::decode_frame_trusted_versioned::<HostMessage>(bytes, self.limits, &[reply_abi])?
         } else {
             abi::decode_frame_trusted::<HostMessage>(bytes, self.limits)?
@@ -251,6 +277,15 @@ impl<E: Extension> GuestMachine<E> {
             self.protocol.host(&frame.message)?;
         }
         let response = match (self.state, frame.message) {
+            (MachineState::New, HostMessage::Negotiate { supported }) if !ROUNDS => {
+                if !supported.contains(&abi::ABI_VERSION) {
+                    return Err(abi::ProtocolError::AbiMismatch);
+                }
+                self.state = MachineState::Negotiated;
+                GuestMessage::Negotiated {
+                    selected: abi::ABI_VERSION,
+                }
+            }
             (MachineState::New, HostMessage::Negotiate { supported }) => {
                 let selected = if self.extension.supports_rounds()
                     && supported.contains(&abi::ABI_VERSION_1_1)
@@ -308,8 +343,9 @@ impl<E: Extension> GuestMachine<E> {
                     max_rounds,
                     tape,
                 },
-            ) if matches!(self.state, MachineState::Ready)
-                || self.state == MachineState::Yielded(request_id) =>
+            ) if ROUNDS
+                && (matches!(self.state, MachineState::Ready)
+                    || self.state == MachineState::Yielded(request_id)) =>
             {
                 let response = self.extension.invoke_round(RoundInvocation {
                     request_id,
@@ -347,7 +383,7 @@ impl<E: Extension> GuestMachine<E> {
             _ => return Err(abi::ProtocolError::InvalidTransition),
         };
         self.protocol.guest(&response)?;
-        if reply_abi == abi::ABI_VERSION {
+        if !ROUNDS || reply_abi == abi::ABI_VERSION {
             abi::encode(&Frame::new(response), self.limits)
         } else {
             abi::encode(&Frame::with_abi(reply_abi, response), self.limits)
@@ -771,8 +807,11 @@ fn record(fields: Vec<(&str, Value)>) -> Value {
 /// Safe owner for the core-WASM transport buffers used by generated exports.
 /// Pointers are opaque allocation IDs from the host's perspective; all actual
 /// ownership remains in this table until dispatch or deallocation consumes it.
-pub struct GuestExports<E> {
-    machine: GuestMachine<E>,
+///
+/// `ROUNDS`: see [`GuestMachine`]; the export macros pass `false` for
+/// modules that export ABI 1.0.
+pub struct GuestExports<E, const ROUNDS: bool = true> {
+    machine: GuestMachine<E, ROUNDS>,
     allocations: BTreeMap<u32, Box<[u8]>>,
     max_bytes: usize,
     last_error: Option<Box<[u8]>>,
@@ -780,8 +819,17 @@ pub struct GuestExports<E> {
 
 impl<E: Extension> GuestExports<E> {
     pub fn new(extension: E, limits: CodecLimits) -> Self {
+        Self::configured(extension, limits)
+    }
+}
+
+impl<E: Extension, const ROUNDS: bool> GuestExports<E, ROUNDS> {
+    /// Used by the export macros, which choose `ROUNDS` from the module's
+    /// exported ABI version.
+    #[doc(hidden)]
+    pub fn configured(extension: E, limits: CodecLimits) -> Self {
         Self {
-            machine: GuestMachine::new(extension, limits),
+            machine: GuestMachine::with_limits(extension, limits),
             allocations: BTreeMap::new(),
             max_bytes: limits.max_bytes,
             last_error: None,
@@ -876,8 +924,8 @@ macro_rules! export_extension {
     ($extension_type:ty, $constructor:expr, max_bytes = $max_bytes:expr) => {
         #[cfg(target_arch = "wasm32")]
         std::thread_local! {
-            static AXIOM_EXTENSION_EXPORTS: std::cell::RefCell<$crate::GuestExports<$extension_type>> =
-                std::cell::RefCell::new($crate::GuestExports::new(
+            static AXIOM_EXTENSION_EXPORTS: std::cell::RefCell<$crate::GuestExports<$extension_type, false>> =
+                std::cell::RefCell::new($crate::GuestExports::configured(
                     $constructor,
                     $crate::abi::CodecLimits { max_bytes: $max_bytes },
                 ));
@@ -994,10 +1042,16 @@ macro_rules! export_extension {
 #[macro_export]
 macro_rules! export_extension_factory {
     ($factory:expr, max_bytes = $max_bytes:expr) => {
+        /// ABI 1.1 rounds only for factories that export 1.1 (async
+        /// exports); a 1.0 module carries no rounds code (L-5).
+        #[cfg(target_arch = "wasm32")]
+        const AXIOM_EXTENSION_ROUNDS: bool = $crate::__private::factory_abi_version(&$factory)
+            == $crate::abi::ABI_VERSION_1_1.packed();
+
         #[cfg(target_arch = "wasm32")]
         std::thread_local! {
-            static AXIOM_EXTENSION_EXPORTS: std::cell::RefCell<$crate::GuestExports<Box<dyn $crate::Extension>>> =
-                std::cell::RefCell::new($crate::GuestExports::new(
+            static AXIOM_EXTENSION_EXPORTS: std::cell::RefCell<$crate::GuestExports<Box<dyn $crate::Extension>, AXIOM_EXTENSION_ROUNDS>> =
+                std::cell::RefCell::new($crate::GuestExports::configured(
                     $crate::__private::factory_extension($factory),
                     $crate::abi::CodecLimits { max_bytes: $max_bytes },
                 ));

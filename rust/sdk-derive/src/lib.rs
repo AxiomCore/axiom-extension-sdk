@@ -182,7 +182,11 @@ fn expand_extension(mut implementation: ItemImpl) -> syn::Result<proc_macro2::To
         if method.sig.asyncness.is_some() {
             check_async_export(&method.sig)?;
             let export_name = export_name(&attribute, &method.sig.ident)?;
-            async_exports.push((export_name, method.sig.ident.clone()));
+            async_exports.push(AsyncExport {
+                name: export_name,
+                method: method.sig.ident.clone(),
+                value_input: value_input_type(&method.sig),
+            });
             continue;
         }
         if method.sig.inputs.len() != 2 {
@@ -210,7 +214,7 @@ fn expand_extension(mut implementation: ItemImpl) -> syn::Result<proc_macro2::To
         ));
     }
     let mut names = BTreeSet::new();
-    for (name, _) in exports.iter().chain(&async_exports) {
+    for name in exports.iter().map(|(name, _)| name).chain(async_exports.iter().map(|export| &export.name)) {
         if !names.insert(name.value()) {
             return Err(syn::Error::new_spanned(
                 name,
@@ -254,6 +258,35 @@ fn expand_extension(mut implementation: ItemImpl) -> syn::Result<proc_macro2::To
     })
 }
 
+/// One `#[export] async fn`.
+struct AsyncExport {
+    name: LitStr,
+    method: syn::Ident,
+    /// The input parameter's type when it is spelled `Value` (any path ending
+    /// in `Value`): the executor moves the input into the argument instead of
+    /// cloning it every round. Whether it really is `abi::Value` is checked
+    /// with `TypeId` in the generated code; other types decode as before.
+    value_input: Option<syn::Type>,
+}
+
+/// The type of the input parameter if its last path segment is `Value`.
+fn value_input_type(signature: &syn::Signature) -> Option<syn::Type> {
+    let Some(syn::FnArg::Typed(argument)) = signature.inputs.iter().nth(1) else {
+        return None;
+    };
+    match &*argument.ty {
+        syn::Type::Path(path)
+            if path.qself.is_none()
+                && path.path.segments.last().is_some_and(|segment| {
+                    segment.ident == "Value" && segment.arguments.is_empty()
+                }) =>
+        {
+            Some((*argument.ty).clone())
+        }
+        _ => None,
+    }
+}
+
 /// `async fn name(cx: &Cx, input: In) -> Result<Out>`: no receiver, a
 /// reference context and exactly one input.
 fn check_async_export(signature: &syn::Signature) -> syn::Result<()> {
@@ -286,26 +319,46 @@ fn check_async_export(signature: &syn::Signature) -> syn::Result<()> {
 fn expand_async_extension(
     implementation: ItemImpl,
     mut exports: Vec<(LitStr, syn::Ident)>,
-    mut async_exports: Vec<(LitStr, syn::Ident)>,
+    mut async_exports: Vec<AsyncExport>,
 ) -> proc_macro2::TokenStream {
     let extension_type = implementation.self_ty.clone();
     exports.sort_by_key(|export| export.0.value());
-    async_exports.sort_by_key(|export| export.0.value());
-    let mut all: Vec<_> = exports.iter().chain(&async_exports).map(|(name, _)| name.clone()).collect();
+    async_exports.sort_by_key(|export| export.name.value());
+    let mut all: Vec<_> = exports
+        .iter()
+        .map(|(name, _)| name.clone())
+        .chain(async_exports.iter().map(|export| export.name.clone()))
+        .collect();
     all.sort_by_key(LitStr::value);
-    let async_names: Vec<_> = async_exports.iter().map(|(name, _)| name).collect();
+    let async_names: Vec<_> = async_exports.iter().map(|export| &export.name).collect();
+    let moves: Vec<_> = async_exports
+        .iter()
+        .filter_map(|export| {
+            let name = &export.name;
+            export.value_input.as_ref().map(|ty| {
+                quote! {
+                    #name => ::core::any::TypeId::of::<#ty>()
+                        == ::core::any::TypeId::of::<::axiom_extension_sdk::abi::Value>(),
+                }
+            })
+        })
+        .collect();
     let dispatch: Vec<_> = exports
         .iter()
         .map(|(name, method)| quote! { #name => self.#method(invocation) })
         .collect();
     let async_dispatch: Vec<_> = async_exports
         .iter()
-        .map(|(name, method)| {
+        .map(|AsyncExport { name, method, value_input }| {
+            let input = match value_input {
+                Some(ty) => quote! { cx.__export_input::<#ty>()? },
+                None => quote! { cx.input()? },
+            };
             quote! {
                 #name => {
                     let future: ::axiom_extension_sdk::LocalBoxFuture<'cx, ::axiom_extension_sdk::Result<::axiom_extension_sdk::abi::Value>> =
                         ::axiom_extension_sdk::__private::Box::pin(async move {
-                            let output = <#extension_type>::#method(cx, cx.input()?).await?;
+                            let output = <#extension_type>::#method(cx, #input).await?;
                             ::core::result::Result::<::axiom_extension_sdk::abi::Value, ::axiom_extension_sdk::SdkError>::Ok(::axiom_extension_sdk::AxiomEncode::encode(output))
                         });
                     ::core::option::Option::Some(future)
@@ -343,6 +396,13 @@ fn expand_async_extension(
                 match export {
                     #(#async_dispatch)*
                     _ => ::core::option::Option::None,
+                }
+            }
+
+            fn input_moves(export: &str) -> bool {
+                match export {
+                    #(#moves)*
+                    _ => false,
                 }
             }
         }

@@ -61,6 +61,7 @@ fn n(i: u64) -> Value {
     Value::Unsigned(i)
 }
 
+static LATE: AtomicU64 = AtomicU64::new(0);
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// A future that is never ready and is not a host operation.
@@ -189,6 +190,48 @@ impl Guest {
         let seen = COUNTER.fetch_add(1, Ordering::SeqCst);
         let next = if seen.is_multiple_of(2) { &PRICE } else { &RESERVE };
         Ok(first + cx.call(next.call(n(1))).await?)
+    }
+
+    /// Diverges only on its fourth run (round 4 of a three-yield
+    /// invocation), after the instance has memoised the earlier plan hashes.
+    #[export]
+    async fn late_divergence(cx: &Cx, _input: Value) -> Result<u64> {
+        let seen = LATE.fetch_add(1, Ordering::SeqCst);
+        let first = if seen == 3 { &PRICE } else { &LOAD };
+        let a = cx.call(first.call(n(0))).await?;
+        let b = cx.call(LOAD.call(n(1))).await?;
+        let c = cx.call(LOAD.call(n(2))).await?;
+        Ok(a + b + c)
+    }
+
+    /// A `Value` input is moved into the argument (H-1): it is intact in every
+    /// round, and `cx.input()` reports that it was moved.
+    #[export]
+    async fn value_input(cx: &Cx, input: Value) -> Result<Value> {
+        let moved = cx.input::<Value>().err().map(|error| error.message);
+        let a = cx.call(LOAD.call(input.clone())).await?;
+        Ok(Value::List(vec![
+            input,
+            n(a),
+            Value::String(moved.unwrap_or_default()),
+            cx.invocation().input::<Value>()?,
+        ]))
+    }
+
+    /// The same through a qualified path.
+    #[export]
+    async fn qualified_value_input(_cx: &Cx, input: abi::Value) -> Result<Value> {
+        Ok(input)
+    }
+
+    /// A typed input is decoded by reference, as before: `cx.input()` and
+    /// `cx.invocation().input()` see it too.
+    #[export]
+    async fn typed_input(cx: &Cx, input: u64) -> Result<Vec<u64>> {
+        let again: u64 = cx.input()?;
+        let via_invocation: u64 = cx.invocation().input()?;
+        let a = cx.call(LOAD.call(n(input))).await?;
+        Ok(vec![input, again, via_invocation, a])
     }
 
     /// Branches on the round number before an await.
@@ -578,7 +621,7 @@ fn factory_abi_version_is_1_1_only_for_async_extensions() {
     }
     assert_eq!(factory_abi_version(&|| Box::new(Raw)), ABI_VERSION.packed());
     assert_eq!(<AsyncExtension as FactoryOutput>::ABI, ABI_VERSION_1_1);
-    assert_eq!(AXIOM_EXTENSION_EXPORTS.len(), 22);
+    assert_eq!(AXIOM_EXTENSION_EXPORTS.len(), 26);
     assert!(AXIOM_EXTENSION_EXPORTS.windows(2).all(|w| w[0] < w[1]));
 }
 
@@ -945,4 +988,149 @@ fn guest_panics_unwind_natively_and_trap_in_wasm() {
         host.invoke("panics", Value::Null, 1)
     }));
     assert!(result.is_err());
+}
+
+/// H-1: plan hashes are memoised per invocation on the warm instance; the
+/// checks are unchanged: an altered hash or a reordered tape in a late round
+/// (after the memo holds every earlier plan) is still a protocol failure, and
+/// so is a guest that diverges only in round 4.
+#[test]
+fn memoised_plan_hashes_keep_every_replay_check() {
+    for (round, record) in [(3u16, 0usize), (4, 0), (4, 1), (4, 2)] {
+        let mut host = guest();
+        host.tamper = Some(Box::new(move |r, tape| {
+            if r == round {
+                tape[record].plan_hash[0] ^= 1;
+            }
+        }));
+        let run = host.invoke("three", Value::Null, 3);
+        assert_eq!(run.error().code, ErrorCode::Protocol, "round {round} record {record}");
+        assert!(
+            run.error().message.contains(&format!("effect round {}", record + 1)),
+            "{}",
+            run.error().message
+        );
+    }
+    let mut host = guest();
+    host.tamper = Some(Box::new(|round, tape| {
+        if round == 4 {
+            tape.swap(1, 2);
+        }
+    }));
+    assert_eq!(host.invoke("three", Value::Null, 3).error().code, ErrorCode::Protocol);
+
+    // The same warm instance runs the next invocation from a clean memo.
+    let mut host = guest();
+    for _ in 0..3 {
+        let run = host.invoke("three", Value::Null, 3);
+        assert_eq!(run.invokes, 4);
+        run.output();
+    }
+
+    let mut host = guest();
+    let run = host.invoke("late_divergence", Value::Null, 3);
+    assert_eq!(run.invokes, 4);
+    assert_eq!(run.error().code, ErrorCode::Protocol);
+    assert!(run.error().message.contains("effect round 1"), "{}", run.error().message);
+}
+
+/// H-1: the memo-less executor (`run_round`, a fresh context per round, as
+/// on an instance that kept nothing) gives exactly the replies of the warm
+/// adapter, round by round.
+#[test]
+fn memo_less_rounds_give_the_same_replies_as_the_warm_adapter() {
+    use axiom_extension_sdk::{
+        __private::AsyncExports,
+        async_rt::{run_round, RoundInvocation, RoundStep},
+    };
+    let mut warm = guest();
+    let run = warm.invoke("three", Value::Null, 3);
+    let warm_output = run.output().clone();
+    let invocation = Host::invocation("three", Value::Null);
+    let mut tape: Vec<RoundRecord> = Vec::new();
+    for round in 1..=4u16 {
+        let request = RoundInvocation {
+            request_id: RequestId(1),
+            invocation: invocation.clone(),
+            round,
+            max_rounds: 3,
+            tape: tape.clone(),
+        };
+        let expected: Vec<_> = tape.iter().map(|record| record.plan_hash).collect();
+        match run_round(request, |cx| Guest::dispatch_async(cx, "three")) {
+            RoundStep::Yielded { replayed, plan } => {
+                assert_eq!(replayed, expected);
+                assert_eq!(plan, run.plans[usize::from(round - 1)]);
+                let outcomes = warm.execute(&plan);
+                tape.push(RoundRecord { plan_hash: abi::round_plan_hash(&plan), outcomes, events: Vec::new() });
+            }
+            RoundStep::Completed { replayed, result } => {
+                assert_eq!(round, 4);
+                assert_eq!(replayed, expected);
+                assert_eq!(result.output, warm_output);
+            }
+            RoundStep::Failed(error) => panic!("{error:?}"),
+        }
+    }
+}
+
+/// H-1: an export whose input parameter is `Value` takes the input by move
+/// (no per-round copy). The argument is intact in every round; `cx.input()`
+/// reports the move and `cx.invocation().input()` sees `Null`. Typed inputs
+/// are unchanged.
+#[test]
+fn a_value_input_is_moved_into_the_argument_and_typed_inputs_are_unchanged() {
+    let mut host = guest();
+    let input = Value::Record(vec![abi::Field { name: "steps".into(), value: n(3) }]);
+    let run = host.invoke("value_input", input.clone(), 1);
+    assert_eq!(run.invokes, 2);
+    let Value::List(items) = run.output() else { panic!("{:?}", run.output()) };
+    assert_eq!(items[0], input, "the argument holds the input in the completing round");
+    assert_eq!(items[1], n(10));
+    let Value::String(message) = &items[2] else { panic!() };
+    assert!(message.contains("moved into the export's `Value` argument"), "{message}");
+    assert_eq!(items[3], Value::Null);
+    // The plan used the input in round 1 and replayed it in round 2.
+    assert_eq!(run.plans, vec![RoundPlan::Plan(EffectPlan { effects: vec![effect("load", input.clone())] })]);
+
+    assert_eq!(host.invoke("qualified_value_input", input.clone(), 1).output(), &input);
+
+    let run = host.invoke("typed_input", n(7), 1);
+    assert_eq!(run.output(), &list(&[7, 7, 7, 10]));
+}
+
+/// L-5: the 1.0-only machine (`GuestMachine<_, false>`, what the export
+/// macros build for a module that exports ABI 1.0) never selects 1.1, even
+/// for a rounds-capable extension offered 1.1, and refuses `InvokeRound`
+/// without changing state; ordinary 1.0 invocations still work.
+#[test]
+fn a_machine_without_rounds_never_selects_1_1() {
+    let extension: Box<dyn Extension> = Guest::axiom_extension_for_tests().into();
+    let mut machine = GuestMachine::<Box<dyn Extension>, false>::without_rounds(extension, LIMITS);
+    let mut send = |abi: AbiVersion, message: HostMessage| {
+        let bytes = abi::encode(&Frame::with_abi(abi, message), LIMITS).unwrap();
+        machine
+            .dispatch(&bytes)
+            .map(|reply| abi::decode_frame::<GuestMessage>(&reply, LIMITS).unwrap().message)
+    };
+    assert_eq!(
+        send(ABI_VERSION, HostMessage::Negotiate { supported: vec![ABI_VERSION_1_1, ABI_VERSION] }),
+        Ok(GuestMessage::Negotiated { selected: ABI_VERSION })
+    );
+    assert_eq!(
+        send(ABI_VERSION, HostMessage::Initialize { instance_id: 1, application: "x8c".into(), extension: "async".into() }),
+        Ok(GuestMessage::Initialized)
+    );
+    let round = HostMessage::InvokeRound {
+        request_id: RequestId(1),
+        invocation: Host::invocation("three", Value::Null),
+        round: 1,
+        max_rounds: 3,
+        tape: Vec::new(),
+    };
+    assert!(send(ABI_VERSION, round.clone()).is_err());
+    assert!(send(ABI_VERSION_1_1, round).is_err());
+    // A sync export over 1.0 still completes.
+    let reply = send(ABI_VERSION, HostMessage::Invoke { request_id: RequestId(2), invocation: Host::invocation("sync_pure", n(4)) });
+    assert!(matches!(reply, Ok(GuestMessage::Completed { .. })), "{reply:?}");
 }
