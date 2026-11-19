@@ -204,9 +204,11 @@ export function selectedCall(profile: SelectedInterface, namespace: string, oper
 /**
  * A typed operation checked against the selected interface: `call(input)`
  * encodes with the import's input type, and a ticket from
- * `plan.call(op.call(input))` decodes its outcome with the import's output
- * type. The effect bytes equal {@link selectedCall}. Named continuations
- * already receive outcomes by branch name and need no tickets.
+ * `plan.push(op.call(input))` decodes its outcome with the import's output
+ * type (`resume.get(ticket)`). The effect bytes equal {@link selectedCall}.
+ * Named continuations already receive outcomes by branch name and need no
+ * tickets: the host answers a selected yield with one checked continuation
+ * envelope, which `defineSelectedExtension` decodes.
  */
 export function selectedOperation<I = unknown, O = unknown>(profile: SelectedInterface, namespace: string, operation: string): Operation<I, O> {
   const selected = profile.imports.find(i => i.namespace === namespace && i.operation === operation);

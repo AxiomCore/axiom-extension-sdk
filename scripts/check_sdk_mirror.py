@@ -7,12 +7,13 @@ file must equal its canonical source after removing the reviewed, intentional
 differences listed in ALLOWED_SNIPPETS; the comparison is exact. Each mirrored
 directory must also contain exactly the expected file set.
 
-Usage: python3 -I scripts/check_sdk_mirror.py [--workspace PATH]
+Usage: python3 -I scripts/check_sdk_mirror.py [--workspace PATH] [--require-vendored]
 """
 from __future__ import annotations
 
 import argparse
 import difflib
+import hashlib
 import pathlib
 import re
 import sys
@@ -73,6 +74,20 @@ CANONICAL_ONLY = {
     "python/axiom_extension_sdk/py.typed": "runtime mirror ships typing stubs only",
 }
 
+# Byte copies of canonical SDK files that other repositories embed. The
+# axiom-build Python AOT compiler bundles `money.py` as a program module and
+# pins its SHA-256 in compile.py `SDK_PROGRAM_MODULES`; both must follow the
+# canonical file. Checked when the repository is present in the workspace
+# (`--require-vendored` makes its absence an error).
+VENDORED = [
+    {
+        "canonical": "python/axiom_extension_sdk/money.py",
+        "repo": "axiom-build",
+        "copy": "python/runtime/sdk/axiom_extension_sdk/money.py",
+        "pin": "python/compile.py",
+    },
+]
+
 
 def files(root: pathlib.Path) -> set[str]:
     return {
@@ -97,6 +112,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     root = pathlib.Path(__file__).resolve().parents[1]
     parser.add_argument("--workspace", type=pathlib.Path, default=root.parent)
+    parser.add_argument("--require-vendored", action="store_true", help="fail when a repository holding a vendored copy is absent")
     arguments = parser.parse_args()
     runtime = arguments.workspace / "axiom-runtime"
     problems: list[str] = []
@@ -129,9 +145,24 @@ def main() -> int:
     for canonical, reason in CANONICAL_ONLY.items():
         if not (root / canonical).exists():
             problems.append(f"canonical-only entry is stale: {canonical} ({reason})")
+    vendored = 0
+    for entry in VENDORED:
+        repo = arguments.workspace / entry["repo"]
+        if not repo.is_dir():
+            if arguments.require_vendored:
+                problems.append(f"vendored copy not checked: {repo} is absent")
+            continue
+        vendored += 1
+        source, copy = root / entry["canonical"], repo / entry["copy"]
+        if not copy.is_file() or copy.read_bytes() != source.read_bytes():
+            problems.append(f"{entry['repo']}/{entry['copy']} is not a byte copy of {entry['canonical']}")
+        digest = hashlib.sha256(source.read_bytes()).hexdigest()
+        pin = repo / entry["pin"]
+        if not pin.is_file() or digest not in pin.read_text(encoding="utf-8"):
+            problems.append(f"{entry['repo']}/{entry['pin']} does not pin sha256 {digest} of {entry['canonical']}")
     for problem in problems:
         print(problem, file=sys.stderr)
-    print(f"checked {len(PAIRS)} mirrored files; {len(problems)} problem(s)")
+    print(f"checked {len(PAIRS)} mirrored files and {vendored} vendored copies; {len(problems)} problem(s)")
     return 1 if problems else 0
 
 
