@@ -337,6 +337,80 @@ pub enum GuestMessage {
         replayed: Vec<PlanHash>,
         result: InvocationResult,
     },
+    /// ABI 1.1 only (X9c, appended after `CompletedRound`): exactly
+    /// [`GuestMessage::YieldedRound`] plus one interned source site per
+    /// effect (plan) or branch (group), in order. `sites[i]` labels effect
+    /// or branch `i`; `None` means the guest knows no site for it.
+    ///
+    /// A site is an untrusted guest label. The host never lets it influence
+    /// authorisation, budgets, routing, the tape or the commit: it is not part
+    /// of [`round_plan_hash`] (the same plan with and without sites has the
+    /// same hash, so replay and the tape are unchanged), and an id outside the
+    /// package's site table, or a `sites` vector whose length differs from the
+    /// plan, is recorded as unknown. A guest that has no site sends
+    /// `YieldedRound`, byte for byte as before X9c ([`yielded_round`]).
+    YieldedRoundSited {
+        request_id: RequestId,
+        round: u16,
+        replayed: Vec<PlanHash>,
+        plan: RoundPlan,
+        sites: Vec<Option<SiteId>>,
+    },
+}
+
+/// X9c: an interned source-site id, the index of an entry of the package's
+/// X9a site table (`axiom-extension-effect-summary/v1`, `sites[id]`, sorted by
+/// file, line, column, binding). Only ever a label.
+pub type SiteId = u32;
+
+/// X9c: hosts never accept a site table longer than this; any id at or above
+/// it is unknown whatever the table says. Bounds the cardinality of site
+/// labels in audit storage and span attributes.
+pub const MAX_SITE_TABLE_LEN: u32 = 1 << 16;
+
+impl RoundPlan {
+    /// Number of effects (plan) or branches (group): the length a
+    /// [`GuestMessage::YieldedRoundSited`] `sites` vector must have.
+    pub fn len(&self) -> usize {
+        match self {
+            RoundPlan::Plan(plan) => plan.effects.len(),
+            RoundPlan::Group(group) => group.branches.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// X9c: the yield message of an ABI 1.1 round. With no site at all (every
+/// entry `None`, or no entries) this is exactly [`GuestMessage::YieldedRound`],
+/// so a guest without sites encodes byte for byte as before X9c; otherwise
+/// [`GuestMessage::YieldedRoundSited`]. SDKs should build every 1.1 yield
+/// through this function.
+pub fn yielded_round(
+    request_id: RequestId,
+    round: u16,
+    replayed: Vec<PlanHash>,
+    plan: RoundPlan,
+    sites: Vec<Option<SiteId>>,
+) -> GuestMessage {
+    if sites.iter().all(Option::is_none) {
+        GuestMessage::YieldedRound {
+            request_id,
+            round,
+            replayed,
+            plan,
+        }
+    } else {
+        GuestMessage::YieldedRoundSited {
+            request_id,
+            round,
+            replayed,
+            plan,
+            sites,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -661,6 +735,12 @@ impl Lifecycle {
             (
                 SessionState::Running(active),
                 GuestMessage::YieldedRound {
+                    request_id,
+                    round,
+                    replayed,
+                    ..
+                }
+                | GuestMessage::YieldedRoundSited {
                     request_id,
                     round,
                     replayed,
