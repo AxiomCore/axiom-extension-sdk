@@ -58,6 +58,28 @@ test('a ticket from another plan or an earlier yield step is rejected', () => {
   assert.equal(next.get(b), 'b');
 });
 
+test('a plan rebuilt in the resume is accepted only with the yielded shape', () => {
+  const ctx = context();
+  const yielded = ctx.plan();
+  yielded.call(getName.call(1));
+  yielded.call(inStock.call(1));
+  ctx.effects(yielded);
+  const resume = createResumeContext([ok(0, { String: 'n' }), ok(1, { Bool: true })], [], 1);
+  const same = resume.plan();
+  const name = same.call(getName.call(0));
+  same.call(inStock.call(0));
+  assert.equal(resume.get(name), 'n');
+  const again = ctx.plan();
+  again.call(getName.call(1));
+  again.call(inStock.call(1));
+  ctx.effects(again);
+  const next = createResumeContext([ok(0, { String: 'n' }), ok(1, { Bool: true })], [], 2);
+  const swapped = next.plan();
+  const first = swapped.call(inStock.call(0));
+  swapped.call(getName.call(0));
+  assert.throws(() => next.get(first), /calls different operations/);
+});
+
 test('in a fresh engine the resume rebuilds the plan and cannot mix plans', () => {
   // No plan was yielded in this heap (fresh store per exchange).
   createResumeContext([], []);

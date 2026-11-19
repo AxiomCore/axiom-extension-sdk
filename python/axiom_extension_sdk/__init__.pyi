@@ -1,7 +1,8 @@
-from typing import Any, Callable, Generic, Protocol, TypeVar
+from typing import Any, Callable, Generic, Mapping, Protocol, TypedDict, TypeVar, overload
 
 T = TypeVar("T", bound=Callable[..., Any])
 ValueT = TypeVar("ValueT")
+O = TypeVar("O")
 
 class Selector(str, Generic[ValueT]): ...
 
@@ -19,11 +20,40 @@ class SecretHandle(Protocol):
     @property
     def kind(self) -> str: ...
 
+class TypedEffect(TypedDict, Generic[O]):
+    """An effect whose outcome decodes as ``O`` (wire shape unchanged)."""
+    namespace: str
+    operation: str
+    input: Any
+
+class Ticket(Generic[O]):
+    """Typed claim on one host call's outcome in one effect plan.
+
+    Issued only by ``Effects.push``; ``index`` is the ABI outcome index.
+    """
+    @property
+    def index(self) -> int: ...
+
+class Effects(Protocol):
+    """An effect plan built call by call; yield it with ``ctx.effects(plan)``.
+
+    ``plan.push(effect)`` appends a host call and returns its ticket (the
+    AOT host bridge never exposes a member named ``call``)."""
+    @overload
+    def push(self, effect: TypedEffect[O]) -> Ticket[O]: ...
+    @overload
+    def push(self, effect: Mapping[str, Any]) -> Ticket[Any]: ...
+    @property
+    def length(self) -> int: ...
+
 class Context(Protocol):
     input: Any
     def secret(self, alias: str) -> SecretHandle: ...
     def authenticated_request(self, namespace: str, operation: str, path: str, body: bytes | list[int], secret: SecretHandle) -> Any: ...
-    def effects(self, *effects: Any) -> Any: ...
+    def effects(self, *effects: Any) -> Any:
+        """Yield ``ctx.effects(plan)`` for an ``Effects`` plan, or raw effects."""
+        ...
+    def plan(self) -> Effects: ...
     def snapshot(self, resource: str) -> Snapshot: ...
     def patch(self, resource: str) -> Patch: ...
     def complete(
@@ -38,7 +68,14 @@ class Context(Protocol):
 class ResumeContext(Protocol):
     outcomes: list[Any]
     events: list[Any]
-    def outcome(self, index: int) -> Any: ...
+    def get(self, ticket: Ticket[O]) -> O:
+        """Decode the outcome for ``ticket``; a ticket of another plan raises."""
+        ...
+    def plan(self) -> Effects: ...
+    def outcome(self, index: int) -> Any:
+        """Deprecated: positional access. Use ``ctx.get(ticket)`` with a ticket
+        from ``plan.push(effect)``."""
+        ...
     def complete(self, output: Any = ...) -> Any: ...
 
 class _Extension:

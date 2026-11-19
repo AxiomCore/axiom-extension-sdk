@@ -107,7 +107,12 @@ export interface ResumeContext {
    * operation's output. A ticket from another plan or yield step throws.
    */
   get<O>(ticket: Ticket<O>): O;
-  /** A new effect plan, for rebuilding the yielded plan's tickets in this exchange. */
+  /**
+   * A new effect plan for rebuilding the yielded plan's tickets in this
+   * exchange (managed hosts run every exchange in a fresh engine). When this
+   * heap still knows the yielded plan, the rebuilt plan must call the same
+   * operations in the same order.
+   */
   plan(): Effects;
   /**
    * Positional outcome access.
@@ -175,7 +180,13 @@ export function operation<I = unknown, O = unknown>(namespace: string, operation
 export class Effects {
   constructor() { planEffects.set(this, { effects: [], sealed: false }); }
 
-  call<O>(effect: TypedEffect<O>): Ticket<O> {
+  call<O>(effect: TypedEffect<O>): Ticket<O> { return this.push(effect); }
+
+  /**
+   * Same as {@link Effects.call}. Python sources use `plan.push(effect)`: the
+   * AOT host bridge never exposes a member named `call`.
+   */
+  push<O>(effect: TypedEffect<O>): Ticket<O> {
     const state = planEffects.get(this)!;
     if (state.sealed) throw new Error("effect plan was already yielded or read; build a new plan");
     if (effect === null || typeof effect !== "object") throw new Error("effect plan entries must be effects");
@@ -198,12 +209,16 @@ export function yieldFor(plan: Effects): Yielded {
   return { kind: "yielded", plan: { effects: [...state.effects] } };
 }
 
+const shape = (plan: Effects): string => JSON.stringify(planEffects.get(plan)!.effects.map((effect) => [effect.namespace, effect.operation]));
+
 export function createResumeContext(outcomes: unknown[], events: unknown[], requestId?: number): ResumeContext {
-  // When this heap yielded the plan being resumed, tickets must come from it.
+  // When this heap yielded the plan being resumed, tickets must come from it
+  // or from a plan rebuilt with `resume.plan()` that calls the same operations.
   // Hosts that run every exchange in a fresh engine keep no such record; then
   // the first ticket read binds the resume to its plan.
   const expected = lastYielded;
   lastYielded = undefined;
+  const rebuilt = new WeakSet<Effects>();
   let bound: Effects | undefined;
   const read = (index: number): AxiomValue => {
     if (!Number.isSafeInteger(index) || index < 0 || index >= outcomes.length) throw new Error("host outcome is unavailable");
@@ -215,8 +230,10 @@ export function createResumeContext(outcomes: unknown[], events: unknown[], requ
     get<O>(ticket: Ticket<O>): O {
       const issued = ticket !== null && typeof ticket === "object" ? tickets.get(ticket) : undefined;
       if (!issued) throw new Error("expected an effect ticket issued by Effects.call");
-      if (expected ? issued.plan !== expected : bound !== undefined && issued.plan !== bound) {
-        throw new Error(expected ? "effect ticket belongs to another effect plan or yield step" : "effect tickets from different effect plans were read in one resume");
+      if (bound !== undefined && issued.plan !== bound) throw new Error("effect tickets from different effect plans were read in one resume");
+      if (expected && issued.plan !== expected) {
+        if (!rebuilt.has(issued.plan)) throw new Error("effect ticket belongs to another effect plan or yield step");
+        if (shape(issued.plan) !== shape(expected)) throw new Error("rebuilt effect plan calls different operations than the yielded plan");
       }
       bound = issued.plan;
       const state = planEffects.get(issued.plan)!;
@@ -225,7 +242,7 @@ export function createResumeContext(outcomes: unknown[], events: unknown[], requ
       const value = read(issued.index);
       return (issued.decode ? issued.decode(value) : decodeValue(value)) as O;
     },
-    plan() { return new Effects(); },
+    plan() { const plan = new Effects(); rebuilt.add(plan); return plan; },
     outcome(index) { return decodeValue(read(index)); },
     complete(output = null) {return {kind:"completed",result:{output:encodeValue(output),patches:[],transactions:[],emitted_events:[]}};},
   };
