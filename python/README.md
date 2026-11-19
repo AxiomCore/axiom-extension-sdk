@@ -30,3 +30,56 @@ The complete source and selection are in
 workspace. Candidate source support does not imply a published package version
 or browser/mobile qualification; use the exact generated interface and managed
 toolchain selected by the CLI.
+
+## Typed tickets
+
+```python
+from typing import TYPE_CHECKING
+
+from axiom_extension_sdk import Ticket, extension, typed_effect
+
+if TYPE_CHECKING:
+    from axiom_extension_sdk import Context, Effects, ResumeContext
+
+
+def lookup(plan: "Effects", item: int) -> "tuple[Ticket[str], Ticket[bool]]":
+    # One function builds the plan, for the export and for the resume.
+    name = plan.push(typed_effect("catalog", "name", {"Unsigned": item}, str))
+    stock = plan.push(typed_effect("catalog", "stock", {"Unsigned": item}, bool))
+    return name, stock
+
+
+@extension.export
+def run(ctx: "Context"):
+    plan = ctx.plan()
+    lookup(plan, 7)
+    return ctx.effects(plan)
+
+
+@extension.resume
+def resume(ctx: "ResumeContext"):
+    name, stock = lookup(ctx.plan(), 7)  # same calls, same inputs, same order
+    return ctx.complete({"name": ctx.get(name), "stock": ctx.get(stock)})
+```
+
+`typed_effect(namespace, operation, input, output)` returns the plain effect
+dict (`input` in wire form, as for a hand-written effect) typed
+`TypedEffect[output]`, so `plan.push` gives `Ticket[output]` and `ctx.get`
+returns `output` under pyright strict, with no hand annotation. `Ticket`,
+`TypedEffect`, `Effects` and `typed_effect` import at runtime as well as under
+`TYPE_CHECKING`; importing a name the SDK does not provide fails at compile
+time. Use `plan.push`: host objects never expose a member named `call`.
+`ctx.outcome(i)` is deprecated.
+
+In TypeScript and Python every exchange runs in a fresh engine, so tickets
+do not survive from the export to the resume. The resume rebuilds the plan it
+answers with `resume.plan()`: the **same calls (namespace, operation and
+input) in the same order**, usually by calling the same function that built
+the yielded plan. The managed host echoes its record of the yielded plan with
+the resume, and `get` rejects a rebuilt plan that differs, naming the first
+differing call (for example `call 0 is catalog.stock, the yielded call 0 was
+catalog.name`). Inputs are compared exactly up to 8 KiB per call and 64 KiB
+per plan; larger inputs are compared by their canonical length. A plan of more
+than about 1,700 calls, or a host that predates the echo, gets only the
+call-count check. When a resume cannot rebuild its plan deterministically, use
+a named continuation, whose state the host carries.

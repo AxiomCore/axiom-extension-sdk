@@ -10,7 +10,11 @@ use alloc::{
     string::{String, ToString},
     vec::Vec,
 };
-use core::marker::PhantomData;
+use core::{
+    cell::Cell,
+    marker::PhantomData,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 pub type Result<T> = core::result::Result<T, SdkError>;
 
@@ -377,6 +381,11 @@ pub struct ResumeContext {
     request_id: RequestId,
     outcomes: Vec<EffectOutcome>,
     events: Vec<EventBatch>,
+    /// The plan this adapter yielded for `request_id`, when it is known.
+    plan: Option<PlanRecord>,
+    /// Without a recorded plan, the first ticket read binds this resume to
+    /// its plan so tickets from two different plans cannot be mixed.
+    bound: Cell<Option<u64>>,
 }
 
 impl ResumeContext {
@@ -384,7 +393,53 @@ impl ResumeContext {
         self.request_id
     }
 
+    /// Decode the outcome of the host call that issued `ticket`, with the
+    /// output type the operation declared.
+    ///
+    /// A ticket is only valid in the resume of the plan (yield step) that
+    /// issued it. When the adapter that yielded the plan also resumes it (the
+    /// normal case for `export_extension_factory!`), a ticket from any other
+    /// plan or an earlier step fails with `InvalidInput`. When no plan was
+    /// recorded (for example an extension instance rebuilt for every message),
+    /// the first ticket binds the resume to its plan and a ticket from another
+    /// plan fails. The check is local; it costs no host round-trip.
+    pub fn get<O: AxiomDecode>(&self, ticket: Ticket<O>) -> Result<O> {
+        match self.plan {
+            Some(plan) => {
+                if ticket.plan != plan.plan {
+                    return Err(SdkError::invalid_input(
+                        "effect ticket belongs to another effect plan or yield step",
+                    ));
+                }
+                if ticket.index >= plan.len {
+                    return Err(SdkError::invalid_input(
+                        "effect ticket index is outside its effect plan",
+                    ));
+                }
+            }
+            None => match self.bound.get() {
+                Some(bound) if bound != ticket.plan => {
+                    return Err(SdkError::invalid_input(
+                        "effect tickets from different effect plans were read in one resume",
+                    ));
+                }
+                Some(_) => {}
+                None => self.bound.set(Some(ticket.plan)),
+            },
+        }
+        self.decode_outcome(ticket.index)
+    }
+
+    /// Positional outcome access.
+    #[deprecated(
+        since = "0.1.5",
+        note = "use typed tickets: `let ticket = effects.push(operation.call(input));` then `resume.get(ticket)`"
+    )]
     pub fn outcome<T: AxiomDecode>(&self, index: u32) -> Result<T> {
+        self.decode_outcome(index)
+    }
+
+    fn decode_outcome<T: AxiomDecode>(&self, index: u32) -> Result<T> {
         let outcome = self
             .outcomes
             .iter()
@@ -417,6 +472,7 @@ pub struct ExtensionResponse {
     events: Vec<Event>,
     effects: Option<abi::EffectPlan>,
     group: Option<abi::EffectGroup>,
+    plan: PlanMark,
 }
 
 impl ExtensionResponse {
@@ -428,12 +484,14 @@ impl ExtensionResponse {
             events: Vec::new(),
             effects: None,
             group: None,
+            plan: PlanMark(None),
         }
     }
 
     /// Suspend this invocation while the host executes the generated,
     /// capability-scoped effect plan. Continue in [`TypedExtension::resume`].
     pub fn yield_for(effects: Effects) -> Self {
+        let plan = PlanMark(Some(effects.record()));
         Self {
             output: Value::Null,
             patches: Vec::new(),
@@ -441,6 +499,7 @@ impl ExtensionResponse {
             events: Vec::new(),
             effects: Some(effects.build()),
             group: None,
+            plan,
         }
     }
 
@@ -454,6 +513,7 @@ impl ExtensionResponse {
             events: Vec::new(),
             effects: None,
             group: Some(group),
+            plan: PlanMark(None),
         }
     }
     pub fn patch(mut self, patch: impl Into<Patch>) -> Self {
@@ -513,26 +573,48 @@ pub trait TypedExtension {
     fn shutdown(&mut self) {}
 }
 
-pub struct TypedAdapter<T>(T);
+pub struct TypedAdapter<T> {
+    extension: T,
+    /// The plan of the request that is currently yielded, if any. Guest-local
+    /// bookkeeping only; nothing here reaches the wire.
+    yielded: Option<(RequestId, PlanRecord)>,
+}
+
+impl<T> TypedAdapter<T> {
+    fn respond(&mut self, request_id: RequestId, result: Result<ExtensionResponse>) -> GuestMessage {
+        self.yielded = None;
+        match result {
+            Ok(response) => {
+                if let PlanMark(Some(plan)) = response.plan {
+                    self.yielded = Some((request_id, plan));
+                }
+                response.into_message(request_id)
+            }
+            Err(error) => failed(request_id, error),
+        }
+    }
+}
 
 /// Erase a typed implementation behind the ABI-compatible extension trait
 /// object expected by the generated source wrapper.
 pub fn boxed_extension<T: TypedExtension + 'static>(
     extension: T,
 ) -> alloc::boxed::Box<dyn Extension> {
-    alloc::boxed::Box::new(TypedAdapter(extension))
+    alloc::boxed::Box::new(TypedAdapter {
+        extension,
+        yielded: None,
+    })
 }
 
 impl<T: TypedExtension> Extension for TypedAdapter<T> {
     fn initialize(&mut self) -> core::result::Result<(), ExtensionError> {
-        TypedExtension::initialize(&mut self.0).map_err(Into::into)
+        TypedExtension::initialize(&mut self.extension).map_err(Into::into)
     }
 
     fn invoke(&mut self, request_id: RequestId, invocation: Invocation) -> GuestMessage {
-        match TypedExtension::invoke(&mut self.0, TypedInvocation::new(request_id, invocation)) {
-            Ok(response) => response.into_message(request_id),
-            Err(error) => failed(request_id, error),
-        }
+        let result =
+            TypedExtension::invoke(&mut self.extension, TypedInvocation::new(request_id, invocation));
+        self.respond(request_id, result)
     }
 
     fn resume(
@@ -541,25 +623,31 @@ impl<T: TypedExtension> Extension for TypedAdapter<T> {
         outcomes: Vec<EffectOutcome>,
         events: Vec<EventBatch>,
     ) -> GuestMessage {
-        match TypedExtension::resume(
-            &mut self.0,
+        let plan = match self.yielded.take() {
+            Some((yielded, plan)) if yielded == request_id => Some(plan),
+            _ => None,
+        };
+        let result = TypedExtension::resume(
+            &mut self.extension,
             ResumeContext {
                 request_id,
                 outcomes,
                 events,
+                plan,
+                bound: Cell::new(None),
             },
-        ) {
-            Ok(response) => response.into_message(request_id),
-            Err(error) => failed(request_id, error),
-        }
+        );
+        self.respond(request_id, result)
     }
 
     fn cancel(&mut self, request_id: RequestId) -> core::result::Result<(), ExtensionError> {
-        TypedExtension::cancel(&mut self.0, request_id).map_err(Into::into)
+        self.yielded = None;
+        TypedExtension::cancel(&mut self.extension, request_id).map_err(Into::into)
     }
 
     fn shutdown(&mut self) {
-        TypedExtension::shutdown(&mut self.0)
+        self.yielded = None;
+        TypedExtension::shutdown(&mut self.extension)
     }
 }
 
@@ -865,19 +953,149 @@ impl<O> EffectCall<O> {
     }
 }
 
-#[derive(Default)]
+/// Guest-local plan identities. A plain counter: plans are only compared for
+/// equality inside one extension instance, and nothing is sent to the host.
+static NEXT_PLAN: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PlanRecord {
+    plan: u64,
+    len: u32,
+}
+
+/// Guest-local plan identity carried beside a response. It never affects
+/// equality or the encoded message: two responses with the same plan bytes
+/// compare equal.
+#[derive(Clone, Copy, Debug)]
+struct PlanMark(Option<PlanRecord>);
+
+impl PartialEq for PlanMark {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+/// A typed claim on the outcome of one host call in one effect plan.
+///
+/// Returned by [`Effects::push`]; read it in [`TypedExtension::resume`] with
+/// [`ResumeContext::get`], which decodes the outcome as `O`. A ticket is
+/// `Copy` so it can be kept in the extension between invoke and resume. It
+/// cannot be built from a raw index:
+///
+/// ```compile_fail,E0451
+/// let forged: axiom_extension_sdk::Ticket<u64> = axiom_extension_sdk::Ticket {
+///     plan: 1,
+///     index: 0,
+///     marker: core::marker::PhantomData,
+/// };
+/// ```
+///
+/// and the decoded type is the one the operation declared:
+///
+/// ```compile_fail,E0308
+/// use axiom_extension_sdk::{Binding, Effects, Operation, ResumeContext};
+/// fn read(resume: &ResumeContext) {
+///     let mut effects = Effects::new();
+///     let ticket = effects.push(
+///         Operation::<u64, u64>::generated(Binding {
+///             namespace: "n", operation: "o", input: "Unsigned", output: "Unsigned",
+///         })
+///         .call(1),
+///     );
+///     let wrong: String = resume.get(ticket).unwrap();
+/// }
+/// ```
+pub struct Ticket<O> {
+    plan: u64,
+    index: u32,
+    marker: PhantomData<fn() -> O>,
+}
+
+impl<O> Ticket<O> {
+    /// The ABI outcome index (declaration order in the plan).
+    pub fn index(&self) -> u32 {
+        self.index
+    }
+}
+
+impl<O> Clone for Ticket<O> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<O> Copy for Ticket<O> {}
+
+impl<O> PartialEq for Ticket<O> {
+    fn eq(&self, other: &Self) -> bool {
+        self.plan == other.plan && self.index == other.index
+    }
+}
+
+impl<O> Eq for Ticket<O> {}
+
+impl<O> core::fmt::Debug for Ticket<O> {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("Ticket")
+            .field("plan", &self.plan)
+            .field("index", &self.index)
+            .finish()
+    }
+}
+
 pub struct Effects {
     effects: Vec<Effect>,
+    plan: u64,
+}
+
+impl Default for Effects {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Effects {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            effects: Vec::new(),
+            plan: NEXT_PLAN.fetch_add(1, Ordering::Relaxed),
+        }
     }
 
+    /// Append a call, chaining by value. The outcome can only be read
+    /// positionally; prefer [`Effects::push`], which returns a typed ticket.
     pub fn call<O>(mut self, call: EffectCall<O>) -> Self {
         self.effects.push(call.into_effect());
         self
+    }
+
+    /// Append a call and return the typed ticket for its outcome. The plan
+    /// bytes are identical to the ones [`Effects::call`] produces.
+    pub fn push<O>(&mut self, call: EffectCall<O>) -> Ticket<O> {
+        let index = u32::try_from(self.effects.len()).unwrap_or(u32::MAX);
+        self.effects.push(call.into_effect());
+        Ticket {
+            plan: self.plan,
+            index,
+            marker: PhantomData,
+        }
+    }
+
+    /// Number of host calls in the plan.
+    pub fn len(&self) -> usize {
+        self.effects.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.effects.is_empty()
+    }
+
+    fn record(&self) -> PlanRecord {
+        PlanRecord {
+            plan: self.plan,
+            len: u32::try_from(self.effects.len()).unwrap_or(u32::MAX),
+        }
     }
 
     fn build(self) -> abi::EffectPlan {
@@ -1056,4 +1274,335 @@ fn value_at_path<'a>(value: &'a Value, path: &str) -> Result<&'a Value> {
 
 fn split_path(path: &str) -> Vec<String> {
     path.split('.').map(ToString::to_string).collect()
+}
+
+#[cfg(test)]
+mod ticket_tests {
+    use super::*;
+    use alloc::{boxed::Box, vec};
+    use abi::{CodecLimits, Frame};
+
+    const LOOKUP: Binding = Binding {
+        namespace: "contract:catalog",
+        operation: "query_product",
+        input: "Unsigned",
+        output: "String",
+    };
+    const STOCK: Binding = Binding {
+        namespace: "contract:catalog",
+        operation: "in_stock",
+        input: "Unsigned",
+        output: "Boolean",
+    };
+
+    fn lookup() -> Operation<u64, String> {
+        Operation::generated(LOOKUP)
+    }
+    fn stock() -> Operation<u64, bool> {
+        Operation::generated(STOCK)
+    }
+    fn id(value: u64) -> RequestId {
+        RequestId::new(value).unwrap()
+    }
+    fn invocation(export: &str) -> Invocation {
+        Invocation {
+            export: export.into(),
+            input: Value::Null,
+            snapshots: vec![],
+            deadline_unix_ms: 1,
+        }
+    }
+    fn ok(index: u32, value: Value) -> EffectOutcome {
+        EffectOutcome {
+            index,
+            result: Ok(value),
+        }
+    }
+    fn output(message: GuestMessage) -> Value {
+        match message {
+            GuestMessage::Completed { result, .. } => result.output,
+            other => panic!("expected completion, got {other:?}"),
+        }
+    }
+    fn failure(message: GuestMessage) -> ExtensionError {
+        match message {
+            GuestMessage::Failed { error, .. } => error,
+            other => panic!("expected failure, got {other:?}"),
+        }
+    }
+
+    /// Yields two differently typed calls and reads both by ticket.
+    #[derive(Default)]
+    struct TwoCalls {
+        tickets: Option<(Ticket<String>, Ticket<bool>)>,
+    }
+    impl TypedExtension for TwoCalls {
+        fn invoke(&mut self, _: TypedInvocation) -> Result<ExtensionResponse> {
+            let mut effects = Effects::new();
+            let name = effects.push(lookup().call(7));
+            let available = effects.push(stock().call(7));
+            self.tickets = Some((name, available));
+            Ok(ExtensionResponse::yield_for(effects))
+        }
+        fn resume(&mut self, resume: ResumeContext) -> Result<ExtensionResponse> {
+            let (name, available) = self.tickets.take().unwrap();
+            let name: String = resume.get(name)?;
+            let available: bool = resume.get(available)?;
+            Ok(ExtensionResponse::new(format!("{name}:{available}")))
+        }
+    }
+
+    #[test]
+    fn tickets_round_trip_typed_outcomes() {
+        let mut extension = boxed_extension(TwoCalls::default());
+        let GuestMessage::Yielded { plan, .. } = extension.invoke(id(1), invocation("load"))
+        else {
+            panic!("expected a yield");
+        };
+        assert_eq!(plan.effects.len(), 2);
+        let resumed = extension.resume(
+            id(1),
+            vec![ok(0, Value::String("Linen".into())), ok(1, Value::Bool(true))],
+            vec![],
+        );
+        assert_eq!(output(resumed), Value::String("Linen:true".into()));
+    }
+
+    #[test]
+    fn ticket_reports_type_mismatch_and_host_errors() {
+        let mut extension = boxed_extension(TwoCalls::default());
+        extension.invoke(id(1), invocation("load"));
+        // The host returns the right index with the wrong type: decoding fails
+        // instead of silently reading another outcome.
+        let error = failure(extension.resume(
+            id(1),
+            vec![ok(0, Value::Bool(true)), ok(1, Value::Bool(true))],
+            vec![],
+        ));
+        assert_eq!(error.code, ErrorCode::InvalidInput);
+        assert!(error.message.contains("expected string"), "{}", error.message);
+
+        extension.invoke(id(2), invocation("load"));
+        let error = failure(extension.resume(
+            id(2),
+            vec![
+                EffectOutcome {
+                    index: 0,
+                    result: Err(ExtensionError {
+                        code: ErrorCode::Denied,
+                        message: "denied by host".into(),
+                        retryable: false,
+                    }),
+                },
+                ok(1, Value::Bool(true)),
+            ],
+            vec![],
+        ));
+        assert_eq!(error.code, ErrorCode::Denied);
+    }
+
+    /// Keeps the ticket of the first invocation and reads it in a later one.
+    #[derive(Default)]
+    struct StaleTicket {
+        first: Option<Ticket<String>>,
+        unyielded: Option<Ticket<String>>,
+        current: Option<Ticket<String>>,
+    }
+    impl TypedExtension for StaleTicket {
+        fn invoke(&mut self, invocation: TypedInvocation) -> Result<ExtensionResponse> {
+            let mut effects = Effects::new();
+            let ticket = effects.push(lookup().call(1));
+            if self.first.is_none() {
+                self.first = Some(ticket);
+            }
+            self.current = Some(ticket);
+            if invocation.export() == "unyielded" {
+                // A plan that is built but never yielded issues tickets that
+                // are valid for no resume.
+                let mut other = Effects::new();
+                self.unyielded = Some(other.push(lookup().call(2)));
+            }
+            Ok(ExtensionResponse::yield_for(effects))
+        }
+        fn resume(&mut self, resume: ResumeContext) -> Result<ExtensionResponse> {
+            let ticket = match self.unyielded.take() {
+                Some(ticket) => ticket,
+                None => self.first.unwrap(),
+            };
+            Ok(ExtensionResponse::new(resume.get(ticket)?))
+        }
+    }
+
+    #[test]
+    fn ticket_from_another_plan_is_rejected() {
+        let mut extension = boxed_extension(StaleTicket::default());
+        extension.invoke(id(1), invocation("load"));
+        assert_eq!(
+            output(extension.resume(id(1), vec![ok(0, Value::String("a".into()))], vec![])),
+            Value::String("a".into())
+        );
+        // Second request: same shape, same index, different plan.
+        extension.invoke(id(2), invocation("load"));
+        let error = failure(extension.resume(id(2), vec![ok(0, Value::String("b".into()))], vec![]));
+        assert_eq!(error.code, ErrorCode::InvalidInput);
+        assert!(error.message.contains("another effect plan"), "{}", error.message);
+
+        // A ticket from a plan that was never yielded.
+        let mut extension = boxed_extension(StaleTicket::default());
+        extension.invoke(id(3), invocation("unyielded"));
+        let error = failure(extension.resume(id(3), vec![ok(0, Value::String("c".into()))], vec![]));
+        assert!(error.message.contains("another effect plan"), "{}", error.message);
+    }
+
+    /// Yields twice in one request and reads the first step's ticket at the
+    /// second resume.
+    #[derive(Default)]
+    struct TwoSteps {
+        step_one: Option<Ticket<String>>,
+        step_two: Option<Ticket<String>>,
+        stale: bool,
+    }
+    impl TypedExtension for TwoSteps {
+        fn invoke(&mut self, invocation: TypedInvocation) -> Result<ExtensionResponse> {
+            self.stale = invocation.export() == "stale";
+            let mut effects = Effects::new();
+            self.step_one = Some(effects.push(lookup().call(1)));
+            Ok(ExtensionResponse::yield_for(effects))
+        }
+        fn resume(&mut self, resume: ResumeContext) -> Result<ExtensionResponse> {
+            match self.step_two {
+                None => {
+                    let first: String = resume.get(self.step_one.unwrap())?;
+                    let mut effects = Effects::new();
+                    self.step_two = Some(effects.push(lookup().call(first.len() as u64)));
+                    Ok(ExtensionResponse::yield_for(effects))
+                }
+                Some(second) => {
+                    let ticket = if self.stale { self.step_one.unwrap() } else { second };
+                    Ok(ExtensionResponse::new(resume.get(ticket)?))
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ticket_from_an_earlier_yield_step_is_rejected() {
+        for (export, expect_ok) in [("fresh", true), ("stale", false)] {
+            let mut extension = boxed_extension(TwoSteps::default());
+            extension.invoke(id(1), invocation(export));
+            let step = extension.resume(id(1), vec![ok(0, Value::String("abc".into()))], vec![]);
+            assert!(matches!(step, GuestMessage::Yielded { .. }), "{step:?}");
+            let last = extension.resume(id(1), vec![ok(0, Value::String("second".into()))], vec![]);
+            if expect_ok {
+                assert_eq!(output(last), Value::String("second".into()));
+            } else {
+                assert!(failure(last).message.contains("another effect plan"));
+            }
+        }
+    }
+
+    #[test]
+    fn cancel_and_failures_clear_the_recorded_plan() {
+        let mut extension = boxed_extension(TwoCalls::default());
+        extension.invoke(id(1), invocation("load"));
+        extension.cancel(id(1)).unwrap();
+        // After a cancel the adapter keeps no plan record (the host never
+        // resumes a cancelled request; this checks the SDK does not reuse a
+        // stale record). Both tickets come from one plan, so the unrecorded
+        // binding mode accepts them.
+        let adapter_resume = extension.resume(
+            id(1),
+            vec![ok(0, Value::String("x".into())), ok(1, Value::Bool(false))],
+            vec![],
+        );
+        assert_eq!(output(adapter_resume), Value::String("x:false".into()));
+    }
+
+    fn unrecorded(outcomes: Vec<EffectOutcome>) -> ResumeContext {
+        ResumeContext {
+            request_id: id(5),
+            outcomes,
+            events: vec![],
+            plan: None,
+            bound: Cell::new(None),
+        }
+    }
+
+    #[test]
+    fn without_a_recorded_plan_tickets_from_two_plans_cannot_be_mixed() {
+        let mut first = Effects::new();
+        let a = first.push(lookup().call(1));
+        let mut second = Effects::new();
+        let _ = second.push(lookup().call(1));
+        let b = second.push(stock().call(1));
+        let resume = unrecorded(vec![ok(0, Value::String("a".into())), ok(1, Value::Bool(true))]);
+        assert_eq!(resume.get(a).unwrap(), "a");
+        let error = resume.get(b).unwrap_err();
+        assert!(error.message.contains("different effect plans"), "{}", error.message);
+        // Re-reading a ticket of the bound plan stays valid.
+        assert_eq!(resume.get(a).unwrap(), "a");
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn deprecated_positional_outcome_still_works() {
+        let resume = unrecorded(vec![ok(0, Value::String("a".into())), ok(1, Value::Bool(true))]);
+        assert_eq!(resume.outcome::<String>(0).unwrap(), "a");
+        assert!(resume.outcome::<bool>(1).unwrap());
+        assert!(resume.outcome::<bool>(2).is_err());
+        // Positional reads do not bind the resume to a plan.
+        let mut effects = Effects::new();
+        let ticket = effects.push(lookup().call(1));
+        assert_eq!(resume.get(ticket).unwrap(), "a");
+    }
+
+    #[test]
+    fn tickets_are_copy_and_carry_declaration_order() {
+        let mut effects = Effects::new();
+        assert!(effects.is_empty());
+        let a = effects.push(lookup().call(1));
+        let b = effects.push(stock().call(2));
+        let copy = a;
+        assert_eq!(copy, a);
+        assert_eq!((a.index(), b.index()), (0, 1));
+        assert_eq!(effects.len(), 2);
+        let mut other = Effects::new();
+        assert_ne!(other.push(lookup().call(1)), a);
+    }
+
+    #[test]
+    fn plan_bytes_are_identical_with_and_without_tickets() {
+        let limits = CodecLimits { max_bytes: 65_536 };
+        let request_id = id(3);
+        let chained = ExtensionResponse::yield_for(
+            Effects::new().call(lookup().call(7)).call(stock().call(9)),
+        );
+        let mut effects = Effects::new();
+        let _name = effects.push(lookup().call(7));
+        let _stock = effects.push(stock().call(9));
+        let ticketed = ExtensionResponse::yield_for(effects);
+        assert_eq!(chained, ticketed);
+        let chained = abi::encode(&Frame::new(chained.into_message(request_id)), limits).unwrap();
+        let ticketed = abi::encode(&Frame::new(ticketed.into_message(request_id)), limits).unwrap();
+        assert!(!chained.is_empty());
+        assert_eq!(chained, ticketed);
+
+        // The same holds for the full adapter output on the wire.
+        struct Chained;
+        impl TypedExtension for Chained {
+            fn invoke(&mut self, _: TypedInvocation) -> Result<ExtensionResponse> {
+                Ok(ExtensionResponse::yield_for(
+                    Effects::new().call(lookup().call(7)).call(stock().call(7)),
+                ))
+            }
+        }
+        let via_adapter = |mut extension: Box<dyn Extension>| {
+            abi::encode(&Frame::new(extension.invoke(request_id, invocation("load"))), limits)
+                .unwrap()
+        };
+        assert_eq!(
+            via_adapter(boxed_extension(Chained)),
+            via_adapter(boxed_extension(TwoCalls::default()))
+        );
+    }
 }
