@@ -76,6 +76,7 @@ CANONICAL_ONLY = {
     "typescript/src/selected.ts": "selected-profile runtime is consumed from the published package only",
     "python/axiom_extension_sdk/__init__.py": "runtime mirror ships typing stubs only",
     "python/axiom_extension_sdk/py.typed": "runtime mirror ships typing stubs only",
+    "python/axiom_extension_sdk/replay.py": "X9d test helper (replays tapes against compiled modules); runtime mirror ships typing stubs only",
 }
 
 # Byte copies of canonical SDK files that other repositories embed. The
