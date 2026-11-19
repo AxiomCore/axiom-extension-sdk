@@ -76,3 +76,58 @@ test("values are immutable and comparable", () => {
   assert.equal(Percentage.fromWhole(25).compare(Percentage.fromBasisPoints(2500)), 0);
   assert.ok(Percentage.fromWhole(25).equals(Percentage.fromBasisPoints(2500)));
 });
+
+// Verifier finding M-2 (unit w1-f2): no silent coercion, no silent data loss.
+test("no implicit coercion: operators, template strings, Number() and JSON throw", async () => {
+  const { encodeValue } = await import("../dist/index.js");
+  const a = Cents.new(1000);
+  const b = Cents.new(999);
+  const p = Percentage.fromWhole(10);
+  const coercion = { name: "TypeError", message: /cannot be converted to a primitive.*\.compare\(\)\/\.lt\(\).*\.toString\(\).*\.encode\(\)/ };
+  for (const value of [a, p]) {
+    assert.throws(() => value < b, coercion, "`<` used to compare currency strings");
+    assert.throws(() => value >= b, coercion);
+    assert.throws(() => value + 1, coercion);
+    assert.throws(() => value == 1000, coercion);
+    assert.throws(() => `${value}`, coercion);
+    assert.throws(() => String(value), coercion);
+    assert.throws(() => Number(value), coercion);
+    assert.throws(() => +value, coercion);
+    assert.throws(() => JSON.stringify(value), { name: "TypeError", message: /cannot be serialized implicitly: call \.encode\(\)/ });
+    assert.throws(() => JSON.stringify({ price: value }), TypeError);
+    // encodeValue used to give {"Record":[]} and an empty record field.
+    assert.throws(() => encodeValue(value), { name: "TypeError", message: /is not a plain Axiom value: call \.encode\(\)/ });
+    assert.throws(() => encodeValue({ price: value }), TypeError);
+    assert.throws(() => encodeValue([value]), TypeError);
+  }
+  // The explicit forms work and are exact.
+  assert.deepEqual(encodeValue({ price: a.encode() }), { Record: [{ name: "price", value: { Unsigned: 1000 } }] });
+  assert.deepEqual(encodeValue(Cents.new(2n ** 64n - 1n).encode()), { Unsigned: "18446744073709551615" });
+  assert.equal(JSON.stringify({ price: a.encode(), rate: p.encode() }), '{"price":1000,"rate":1000}');
+  assert.deepEqual([a.lt(b), a.le(b), a.gt(b), a.ge(b), a.lt(a), a.le(a)], [false, false, true, true, false, true]);
+  assert.deepEqual([p.lt(Percentage.fromWhole(11)), p.ge(Percentage.fromBasisPoints(1000)), p.gt(p)], [true, true, false]);
+  assert.equal(a.toString(), "$10.00");
+  assert.equal(p.toString(), "Percentage(basis_points=1000)");
+  assert.equal([Cents.new(5), Cents.new(30), Cents.new(100)].sort((x, y) => x.compare(y)).map((c) => c.asCurrency()).join(","), "$0.05,$0.30,$1.00");
+});
+
+test("instances, classes and prototypes are frozen; constructors are module-private", () => {
+  const evil = Cents.new(1);
+  assert.throws(() => { Cents.ZERO = evil; }, TypeError);
+  assert.throws(() => { Cents.new = () => evil; }, TypeError);
+  assert.throws(() => { Cents.prototype.asCurrency = () => "$0.00"; }, TypeError);
+  assert.throws(() => { Percentage.fromWhole = () => null; }, TypeError);
+  assert.throws(() => { Percentage.prototype.of = () => evil; }, TypeError);
+  assert.ok(Object.isFrozen(Cents) && Object.isFrozen(Cents.prototype) && Object.isFrozen(Percentage) && Object.isFrozen(Percentage.prototype));
+  assert.equal(Cents.ZERO.value, 0n);
+  // The TypeScript-private constructor used to accept `new Cents(-5n)` and print "$0.-5".
+  assert.throws(() => new Cents(-5n), { name: "TypeError", message: /use Cents\.new\(\)/ });
+  assert.throws(() => new Percentage(-5), { name: "TypeError", message: /use Percentage\.fromWhole\(\)/ });
+  // Wrong operand types are TypeErrors, not property lookups on garbage.
+  assert.throws(() => evil.min(5), { name: "TypeError", message: "expected Cents" });
+  assert.throws(() => evil.checkedSub({ value: 1n }), { name: "TypeError", message: "expected Cents" });
+  assert.throws(() => evil.compare(Object.create(Cents.prototype)), { name: "TypeError", message: "expected Cents" });
+  assert.throws(() => evil.equals(null), { name: "TypeError", message: "expected Cents" });
+  assert.throws(() => Percentage.fromWhole(5).of(5), { name: "TypeError", message: "expected Cents" });
+  assert.throws(() => Percentage.fromWhole(5).compare(evil), { name: "TypeError", message: "expected Percentage" });
+});

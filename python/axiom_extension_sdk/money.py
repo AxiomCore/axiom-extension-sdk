@@ -10,6 +10,15 @@ integer only. `Percentage.of` truncates like Rust's u64 division. Overflow and
 negative results raise `ValueError` with the Rust `SdkError` message. They
 never wrap. Wrong types (including `bool` and `float`) raise `TypeError`.
 
+No implicit conversion: there is no arithmetic with `int` (or between
+values), ordering against anything but the same class raises `TypeError`,
+`bool(value)` raises `TypeError` (compare with `Cents.ZERO` or use `.value`),
+and `json.dumps` refuses the object (serialize `.encode()`). `==` with another
+type is `False`, consistent with `hash`. Instances are immutable. Class
+attributes such as `Cents.ZERO` are not frozen: the AOT runtime ignores a
+metaclass `__setattr__`, so a class-level freeze would behave differently
+under CPython and AOT; do not rebind them.
+
 The module stays inside the Python AOT profile: no floats, imports or
 dataclasses, only plain classes, ints and f-strings.
 """
@@ -29,6 +38,12 @@ def _unsigned64(value: object, what: str) -> int:
     if exact < 0 or exact > U64_MAX:
         raise ValueError(f"{what} must be between 0 and 18446744073709551615")
     return exact
+
+
+def _cents(value: object) -> "Cents":
+    if not isinstance(value, Cents):
+        raise TypeError("expected Cents")
+    return value
 
 
 def _decode_unsigned(value: object, maximum: int) -> int:
@@ -58,6 +73,9 @@ class Cents:
     def __setattr__(self, name: str, value: object) -> None:
         raise AttributeError("Cents is immutable")
 
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError("Cents is immutable")
+
     @classmethod
     def new(cls, value: int) -> "Cents":
         """Rust `Cents::new`."""
@@ -84,11 +102,11 @@ class Cents:
         return self._cents
 
     def min(self, other: "Cents") -> "Cents":
-        return self if self._cents <= other._cents else other
+        return self if self._cents <= _cents(other)._cents else other
 
     def checked_sub(self, other: "Cents") -> "Cents":
         """Rust `Cents::checked_sub`: never negative."""
-        if other._cents > self._cents:
+        if _cents(other)._cents > self._cents:
             raise ValueError("currency subtraction would be negative")
         return Cents(self._cents - other._cents)
 
@@ -107,17 +125,30 @@ class Cents:
     def __hash__(self) -> int:
         return hash(("Cents", self._cents))
 
-    def __lt__(self, other: "Cents") -> bool:
+    # Ordering against another type returns NotImplemented, so Python raises
+    # TypeError (`Cents(5) < 5`), as for any unorderable pair.
+    def __lt__(self, other: object) -> bool:
+        if not isinstance(other, Cents):
+            return NotImplemented
         return self._cents < other._cents
 
-    def __le__(self, other: "Cents") -> bool:
+    def __le__(self, other: object) -> bool:
+        if not isinstance(other, Cents):
+            return NotImplemented
         return self._cents <= other._cents
 
-    def __gt__(self, other: "Cents") -> bool:
+    def __gt__(self, other: object) -> bool:
+        if not isinstance(other, Cents):
+            return NotImplemented
         return self._cents > other._cents
 
-    def __ge__(self, other: "Cents") -> bool:
+    def __ge__(self, other: object) -> bool:
+        if not isinstance(other, Cents):
+            return NotImplemented
         return self._cents >= other._cents
+
+    def __bool__(self) -> bool:
+        raise TypeError("Cents has no truth value: compare with Cents.ZERO or test .value")
 
     def __repr__(self) -> str:
         return f"Cents({self._cents})"
@@ -130,7 +161,11 @@ Cents.ZERO = Cents(0)
 
 
 class Percentage:
-    """A percentage in whole basis points, 0..=10000. Immutable, hashable, ordered."""
+    """A percentage in whole basis points, 0..=10000. Immutable, hashable, ordered.
+
+    `Percentage(n)` takes *basis points*, like `Percentage.from_basis_points(n)`:
+    `Percentage(50)` is 0.5%. Prefer the named constructors; `from_whole(50)`
+    is 50%."""
 
     __slots__ = ("_basis_points",)
     _basis_points: int
@@ -142,6 +177,9 @@ class Percentage:
         object.__setattr__(self, "_basis_points", exact)
 
     def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("Percentage is immutable")
+
+    def __delattr__(self, name: str) -> None:
         raise AttributeError("Percentage is immutable")
 
     @classmethod
@@ -170,7 +208,7 @@ class Percentage:
         """Rust `Percentage::of`: amount * basis_points // 10000. Like Rust, it
         raises when the intermediate product exceeds 2**64-1, even if the
         quotient would fit."""
-        product = amount.value * self._basis_points
+        product = _cents(amount).value * self._basis_points
         if product > U64_MAX:
             raise ValueError("percentage calculation overflowed")
         return Cents(product // 10_000)
@@ -184,17 +222,28 @@ class Percentage:
     def __hash__(self) -> int:
         return hash(("Percentage", self._basis_points))
 
-    def __lt__(self, other: "Percentage") -> bool:
+    def __lt__(self, other: object) -> bool:
+        if not isinstance(other, Percentage):
+            return NotImplemented
         return self._basis_points < other._basis_points
 
-    def __le__(self, other: "Percentage") -> bool:
+    def __le__(self, other: object) -> bool:
+        if not isinstance(other, Percentage):
+            return NotImplemented
         return self._basis_points <= other._basis_points
 
-    def __gt__(self, other: "Percentage") -> bool:
+    def __gt__(self, other: object) -> bool:
+        if not isinstance(other, Percentage):
+            return NotImplemented
         return self._basis_points > other._basis_points
 
-    def __ge__(self, other: "Percentage") -> bool:
+    def __ge__(self, other: object) -> bool:
+        if not isinstance(other, Percentage):
+            return NotImplemented
         return self._basis_points >= other._basis_points
+
+    def __bool__(self) -> bool:
+        raise TypeError("Percentage has no truth value: test .basis_points")
 
     def __repr__(self) -> str:
         return f"Percentage(basis_points={self._basis_points})"

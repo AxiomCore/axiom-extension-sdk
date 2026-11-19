@@ -13,6 +13,12 @@
 // Arithmetic is integer only. `Percentage.of` truncates towards zero, like
 // Rust's `u64` division. Overflow and negative results throw a `RangeError`
 // whose message equals the Rust `SdkError` message. They never wrap.
+//
+// No implicit conversion: `<`, `+`, template strings, `String()`, `Number()`
+// and `JSON.stringify` throw a `TypeError` instead of comparing or printing
+// a coerced value, and the SDK's `encodeValue` refuses the object instead of
+// encoding an empty record. Use `compare`/`lt`/`le`/`gt`/`ge`/`equals`,
+// `toString`/`asCurrency`, and `encode()` for the wire integer.
 
 const U64_MAX = (1n << 64n) - 1n;
 const U16_MAX = 65_535n;
@@ -32,6 +38,30 @@ function unsigned64(value: unknown, what: string): bigint {
   return exact;
 }
 
+// Only this module can construct instances: the TypeScript-private
+// constructors are still callable at runtime, so they check this token.
+const TOKEN = Symbol("axiom money");
+
+function noCoercion(kind: string, hint: string): never {
+  throw new TypeError(
+    `${kind} cannot be converted to a primitive (${hint}): use .compare()/.lt()/.le()/.gt()/.ge()/.equals() to compare, ` +
+      `.toString() or .asCurrency() for text, and .encode() for the wire integer`,
+  );
+}
+
+// `encodeValue` (index.ts) encodes any other object as a record of its own
+// enumerable properties. Instances keep their state in private fields, so
+// without this guard it would silently produce an empty record. The guard is
+// an own enumerable getter that throws.
+function guardPlainEncoding(target: object, kind: string): void {
+  Object.defineProperty(target, "$axiomMoney", {
+    enumerable: true,
+    get(): never {
+      throw new TypeError(`${kind} is not a plain Axiom value: call .encode() to get the wire integer`);
+    },
+  });
+}
+
 /** Mirrors Rust `u64::decode` / `u16::decode` for an already decoded plain value. */
 function decodeUnsigned(value: unknown, max: bigint): bigint {
   if (typeof value === "bigint" || (typeof value === "number" && Number.isInteger(value))) {
@@ -47,29 +77,36 @@ function decodeUnsigned(value: unknown, max: bigint): bigint {
 
 /** Whole number of cents, `0 ..= 2^64 - 1`. Immutable. */
 export class Cents {
-  static readonly ZERO: Cents = new Cents(0n);
+  static readonly ZERO: Cents = new Cents(TOKEN, 0n);
   readonly #cents: bigint;
 
-  private constructor(cents: bigint) {
+  private constructor(token: symbol, cents: bigint) {
+    if (token !== TOKEN) throw new TypeError("use Cents.new(), Cents.fromDollars() or Cents.decode()");
     this.#cents = cents;
+    guardPlainEncoding(this, "Cents");
     Object.freeze(this);
+  }
+
+  static #check(value: unknown): Cents {
+    if (typeof value !== "object" || value === null || !(#cents in value)) throw new TypeError("expected Cents");
+    return value as Cents;
   }
 
   /** Rust `Cents::new`. Accepts a safe-integer `number` or a `bigint`. */
   static new(value: number | bigint): Cents {
-    return new Cents(unsigned64(value, "Cents value"));
+    return new Cents(TOKEN, unsigned64(value, "Cents value"));
   }
 
   /** Rust `Cents::from_dollars`: whole dollars times 100, checked. */
   static fromDollars(dollars: number | bigint): Cents {
     const cents = unsigned64(dollars, "dollar amount") * 100n;
     if (cents > U64_MAX) throw new RangeError("dollar amount exceeds Cents range");
-    return new Cents(cents);
+    return new Cents(TOKEN, cents);
   }
 
   /** Rust `Cents::decode` for a value decoded by the SDK (`number` or `bigint`). */
   static decode(value: unknown): Cents {
-    return new Cents(decodeUnsigned(value, U64_MAX));
+    return new Cents(TOKEN, decodeUnsigned(value, U64_MAX));
   }
 
   /** The exact amount in cents. */
@@ -91,13 +128,13 @@ export class Cents {
   }
 
   min(other: Cents): Cents {
-    return this.#cents <= other.#cents ? this : other;
+    return this.#cents <= Cents.#check(other).#cents ? this : other;
   }
 
   /** Rust `Cents::checked_sub`: never negative. */
   checkedSub(other: Cents): Cents {
-    if (other.#cents > this.#cents) throw new RangeError("currency subtraction would be negative");
-    return new Cents(this.#cents - other.#cents);
+    if (Cents.#check(other).#cents > this.#cents) throw new RangeError("currency subtraction would be negative");
+    return new Cents(TOKEN, this.#cents - other.#cents);
   }
 
   /** `$<dollars>.<cents>`, for example `$1234.56`. */
@@ -111,25 +148,62 @@ export class Cents {
   }
 
   equals(other: Cents): boolean {
-    return this.#cents === other.#cents;
+    return this.#cents === Cents.#check(other).#cents;
   }
 
   compare(other: Cents): -1 | 0 | 1 {
-    return this.#cents < other.#cents ? -1 : this.#cents > other.#cents ? 1 : 0;
+    const that = Cents.#check(other).#cents;
+    return this.#cents < that ? -1 : this.#cents > that ? 1 : 0;
   }
 
+  lt(other: Cents): boolean {
+    return this.compare(other) < 0;
+  }
+
+  le(other: Cents): boolean {
+    return this.compare(other) <= 0;
+  }
+
+  gt(other: Cents): boolean {
+    return this.compare(other) > 0;
+  }
+
+  ge(other: Cents): boolean {
+    return this.compare(other) >= 0;
+  }
+
+  /** Currency text, for example `$19.99` (explicit calls only; see `[Symbol.toPrimitive]`). */
   toString(): string {
     return this.asCurrency();
   }
+
+  /** Always throws: no implicit number or string conversion (`<`, `+`, `${}`, `Number()`). */
+  [Symbol.toPrimitive](hint: string): never {
+    return noCoercion("Cents", hint);
+  }
+
+  /** Always throws, like `encodeValue`: serialize `encode()` instead. */
+  toJSON(): never {
+    throw new TypeError("Cents cannot be serialized implicitly: call .encode() to get the wire integer");
+  }
 }
+Object.freeze(Cents.prototype);
+Object.freeze(Cents);
 
 /** A percentage in whole basis points, `0 ..= 10000` (0% to 100%). Immutable. */
 export class Percentage {
   readonly #basisPoints: number;
 
-  private constructor(basisPoints: number) {
+  private constructor(token: symbol, basisPoints: number) {
+    if (token !== TOKEN) throw new TypeError("use Percentage.fromWhole(), Percentage.fromBasisPoints() or Percentage.decode()");
     this.#basisPoints = basisPoints;
+    guardPlainEncoding(this, "Percentage");
     Object.freeze(this);
+  }
+
+  static #check(value: unknown): Percentage {
+    if (typeof value !== "object" || value === null || !(#basisPoints in value)) throw new TypeError("expected Percentage");
+    return value as Percentage;
   }
 
   /** Rust `Percentage::from_whole`: 0 to 100 percent. */
@@ -138,7 +212,7 @@ export class Percentage {
       if (typeof value !== "number") throw new TypeError("percentage must be an integer");
       throw new RangeError("percentage must be between 0 and 100");
     }
-    return new Percentage(value * 100);
+    return new Percentage(TOKEN, value * 100);
   }
 
   /** Rust `Percentage::from_basis_points`: 0 to 10000. */
@@ -147,7 +221,7 @@ export class Percentage {
       if (typeof value !== "number") throw new TypeError("basis points must be an integer");
       throw new RangeError("basis points must be between 0 and 10000");
     }
-    return new Percentage(value);
+    return new Percentage(TOKEN, value);
   }
 
   /** Rust `Percentage::decode`: a `u16`, then the basis-point range. */
@@ -165,6 +239,7 @@ export class Percentage {
    * the quotient would fit.
    */
   of(amount: Cents): Cents {
+    if (!(amount instanceof Cents)) throw new TypeError("expected Cents");
     const product = amount.value * BigInt(this.#basisPoints);
     if (product > U64_MAX) throw new RangeError("percentage calculation overflowed");
     return Cents.new(product / 10_000n);
@@ -175,10 +250,44 @@ export class Percentage {
   }
 
   equals(other: Percentage): boolean {
-    return this.#basisPoints === other.#basisPoints;
+    return this.#basisPoints === Percentage.#check(other).#basisPoints;
   }
 
   compare(other: Percentage): -1 | 0 | 1 {
-    return this.#basisPoints < other.#basisPoints ? -1 : this.#basisPoints > other.#basisPoints ? 1 : 0;
+    const that = Percentage.#check(other).#basisPoints;
+    return this.#basisPoints < that ? -1 : this.#basisPoints > that ? 1 : 0;
+  }
+
+  lt(other: Percentage): boolean {
+    return this.compare(other) < 0;
+  }
+
+  le(other: Percentage): boolean {
+    return this.compare(other) <= 0;
+  }
+
+  gt(other: Percentage): boolean {
+    return this.compare(other) > 0;
+  }
+
+  ge(other: Percentage): boolean {
+    return this.compare(other) >= 0;
+  }
+
+  /** Debug text, `Percentage(basis_points=2500)` as in Python; Rust defines no display format. */
+  toString(): string {
+    return `Percentage(basis_points=${this.#basisPoints})`;
+  }
+
+  /** Always throws: no implicit number or string conversion (`<`, `+`, `${}`, `Number()`). */
+  [Symbol.toPrimitive](hint: string): never {
+    return noCoercion("Percentage", hint);
+  }
+
+  /** Always throws, like `encodeValue`: serialize `encode()` instead. */
+  toJSON(): never {
+    throw new TypeError("Percentage cannot be serialized implicitly: call .encode() to get the wire integer");
   }
 }
+Object.freeze(Percentage.prototype);
+Object.freeze(Percentage);
