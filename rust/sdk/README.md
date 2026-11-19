@@ -75,6 +75,41 @@ construction of generated host bindings and capability handles.
 The typed layer lowers to the unchanged `axiom-extension-abi@1.0.0` AXE1 wire
 format. It is an authoring API, not a second runtime protocol.
 
+## Typed tickets
+
+```rust
+use axiom_extension_sdk::{prelude::*, Binding};
+
+const LOOKUP: Operation<u64, String> = Operation::generated(Binding {
+    namespace: "contract:catalog", operation: "query_product", input: "Unsigned", output: "String",
+});
+
+#[derive(Default)]
+struct Guest { name: Option<Ticket<String>> }
+
+impl TypedExtension for Guest {
+    fn invoke(&mut self, _: TypedInvocation) -> Result<ExtensionResponse> {
+        let mut fx = Effects::new();
+        self.name = Some(fx.push(LOOKUP.call(42)));
+        Ok(ExtensionResponse::yield_for(fx))
+    }
+    fn resume(&mut self, resume: ResumeContext) -> Result<ExtensionResponse> {
+        let name: String = resume.get(self.name.take().unwrap())?;
+        Ok(ExtensionResponse::new(name))
+    }
+}
+```
+
+`fx.push(op.call(input))` returns a `Ticket<O>` (`Copy`, no public
+constructor); `resume.get(ticket)` decodes the outcome as `O`. The typed
+adapter records the plan it yielded, so a ticket from another plan or an
+earlier yield step is an `InvalidInput` error, never another call's value.
+`ResumeContext::outcome(i)` is deprecated. The by-value chain
+`Effects::new().call(a).call(b)` still works but returns no tickets; use
+`push`, the spelling shared with TypeScript and Python. (In those managed
+languages the resume rebuilds the plan in a fresh engine; see the root
+README.)
+
 ## Third-party crates
 
 Dependencies are declared per extension in `AxiomDeps.toml`, using an exact

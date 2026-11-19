@@ -37,6 +37,40 @@ Python are independent. A release operator must verify each package in its
 registry and its public archive in AxiomCore Releases before considering that
 component complete.
 
+## Typed tickets
+
+A guest that yields host calls gets a **ticket** for each call and reads the
+call's result in the resume with `get(ticket)`, decoded as the operation's
+output type. The spelling is the same in every language: `push` adds a call
+and returns its ticket, `get` reads it. The plan bytes are identical to a plan
+built without tickets; tickets never reach the wire.
+
+| | Add a call | Yield | Read in the resume |
+|---|---|---|---|
+| Rust | `let t = fx.push(op.call(input));` | `ExtensionResponse::yield_for(fx)` | `resume.get(t)?` |
+| TypeScript | `const t = plan.push(op.call(input));` | `ctx.effects(plan)` | `resume.get(t)` |
+| Python | `t = plan.push(typed_effect(ns, op, input, str))` | `ctx.effects(plan)` | `ctx.get(t)` |
+
+Positional `outcome(i)` still works in all three languages and is
+**deprecated**; use tickets. In TypeScript, `Effects.call(effect)` is a
+deprecated alias of `push` (Rust's `Effects::call` is the by-value chain and
+returns no ticket, and Python sources cannot use a member named `call`).
+
+A ticket from another plan or an earlier yield step is an error, never another
+call's value. Rust keeps the yielded plan in the extension instance, so the
+resume reads the tickets it stored. In TypeScript and Python every exchange runs in a fresh engine, so tickets
+do not survive from the export to the resume. The resume rebuilds the plan it
+answers with `resume.plan()`: the **same calls (namespace, operation and
+input) in the same order**, usually by calling the same function that built
+the yielded plan. The managed host echoes its record of the yielded plan with
+the resume, and `get` rejects a rebuilt plan that differs, naming the first
+differing call (for example `call 0 is catalog.stock, the yielded call 0 was
+catalog.name`). Inputs are compared exactly up to 8 KiB per call and 64 KiB
+per plan; larger inputs are compared by their canonical length. A plan of more
+than about 1,700 calls, or a host that predates the echo, gets only the
+call-count check. When a resume cannot rebuild its plan deterministically, use
+a named continuation, whose state the host carries.
+
 ## Project setup
 
 Extension projects own ordinary package-manager manifests and lockfiles. This

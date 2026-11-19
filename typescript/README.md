@@ -30,6 +30,46 @@ workspace. Use the exact SDK, generated selection and managed toolchain from
 that cohort. These working candidate capabilities do not establish registry
 publication or browser/mobile qualification.
 
+## Typed tickets
+
+```ts
+import { defineExtension, operation, type Effects } from "@axiomcore/extension-sdk";
+
+const name = operation<{ id: number }, string>("catalog", "name");
+const stock = operation<number, boolean>("catalog", "stock");
+// One function builds the plan, for the export and for the resume.
+const lookup = (plan: Effects, id: number) => ({
+  name: plan.push(name.call({ id })),
+  stock: plan.push(stock.call(id)),
+});
+
+export default defineExtension({
+  exports: { run: (ctx) => { const plan = ctx.plan(); lookup(plan, 7); return ctx.effects(plan); } },
+  resume: (resume) => {
+    const t = lookup(resume.plan(), 7);   // same calls, same inputs, same order
+    return resume.complete({ name: resume.get(t.name), stock: resume.get(t.stock) });
+  },
+});
+```
+
+`resume.get(t.name)` is typed `string`; a forged ticket does not type-check and
+is rejected at runtime. `resume.outcome(i)` is deprecated, and so is
+`Effects.call` (use `push`). A later yield step from a resume uses
+`yieldFor(plan)`.
+
+In TypeScript and Python every exchange runs in a fresh engine, so tickets
+do not survive from the export to the resume. The resume rebuilds the plan it
+answers with `resume.plan()`: the **same calls (namespace, operation and
+input) in the same order**, usually by calling the same function that built
+the yielded plan. The managed host echoes its record of the yielded plan with
+the resume, and `get` rejects a rebuilt plan that differs, naming the first
+differing call (for example `call 0 is catalog.stock, the yielded call 0 was
+catalog.name`). Inputs are compared exactly up to 8 KiB per call and 64 KiB
+per plan; larger inputs are compared by their canonical length. A plan of more
+than about 1,700 calls, or a host that predates the echo, gets only the
+call-count check. When a resume cannot rebuild its plan deterministically, use
+a named continuation, whose state the host carries.
+
 ## Portable schema source checks
 
 The portable validation helper has a checked source binding in
