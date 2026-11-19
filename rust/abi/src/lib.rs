@@ -5,16 +5,49 @@ extern crate alloc;
 
 use alloc::{string::String, vec::Vec};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+mod sha256;
 mod value_decode;
 
 pub const ABI_NAME: &str = "axiom-extension-abi";
 pub const ABI_VERSION: AbiVersion = AbiVersion { major: 1, minor: 0 };
 pub const WIRE_MAGIC: [u8; 4] = *b"AXE1";
+/// ABI 1.1: multi-round invocations by deterministic replay (ADR 0001).
+/// Negotiated; [`ABI_VERSION`] stays 1.0 so every 1.0 frame keeps its bytes.
+pub const ABI_VERSION_1_1: AbiVersion = AbiVersion { major: 1, minor: 1 };
+/// Every version this crate speaks, newest first: the offer a 1.1 host makes.
+pub const SUPPORTED_ABI_VERSIONS: [AbiVersion; 2] = [ABI_VERSION_1_1, ABI_VERSION];
+/// Hard ceiling for `budgets.maxRounds`; larger values are rejected, never clamped.
+///
+/// `maxRounds` counts effect rounds (yields), not invokes: `maxRounds = N`
+/// lets a guest yield at most N times and then complete, so a full
+/// invocation runs at most `N + 1` `InvokeRound` exchanges (lead decision,
+/// 19 Nov 2026). The default 1 gives a 1.1 guest exactly the one yield a 1.0
+/// guest has.
+pub const MAX_ROUNDS_CEILING: u16 = 16;
+
+/// Largest round number an invocation with `max_rounds` allowed yields can
+/// reach: `max_rounds + 1` (the completing round is not counted).
+pub const fn last_round(max_rounds: u16) -> u16 {
+    max_rounds.saturating_add(1)
+}
+/// Domain separator of [`round_plan_hash`].
+pub const ROUND_PLAN_HASH_DOMAIN: &[u8] = b"axiom-extension-round-plan/v1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AbiVersion {
     pub major: u16,
     pub minor: u16,
+}
+
+impl AbiVersion {
+    /// The `axiom_extension_abi_version` export value: `major << 16 | minor`.
+    pub const fn packed(self) -> i32 {
+        ((self.major as i32) << 16) | self.minor as i32
+    }
+
+    pub fn is_supported(self) -> bool {
+        SUPPORTED_ABI_VERSIONS.contains(&self)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -136,6 +169,40 @@ pub struct NamedEffect {pub name:String,pub effect:Effect}
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EffectGroup {pub format:String,pub limit:u16,pub mode:EffectGroupMode,pub branches:Vec<NamedEffect>}
+/// ABI 1.1: the plan a guest yields in one round. A sequential plan keeps the
+/// legacy ordered meaning (D9); a group is the explicit concurrent form.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum RoundPlan {
+    Plan(EffectPlan),
+    Group(EffectGroup),
+}
+
+/// SHA-256 of a round plan: `SHA-256(ROUND_PLAN_HASH_DOMAIN || postcard(plan))`.
+pub type PlanHash = [u8; 32];
+
+/// ABI 1.1: one completed round on the host-owned tape. The host builds it
+/// from the plan it executed and the outcomes it produced; a guest never
+/// supplies or edits a record.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RoundRecord {
+    pub plan_hash: PlanHash,
+    pub outcomes: Vec<EffectOutcome>,
+    pub events: Vec<EventBatch>,
+}
+
+/// The ADR 0001 plan hash, over the canonical postcard encoding. Guests
+/// return the hashes of the plans they re-derive during replay; the host
+/// compares them with the tape. This is a determinism check, not a security
+/// boundary: every effect is still authorised when it executes.
+pub fn round_plan_hash(plan: &RoundPlan) -> PlanHash {
+    let mut hasher = sha256::Sha256::new();
+    hasher.update(ROUND_PLAN_HASH_DOMAIN);
+    // Serialising an in-memory value to a Vec cannot fail for these types.
+    let bytes = postcard::to_allocvec(plan).unwrap_or_default();
+    hasher.update(&bytes);
+    hasher.finish()
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EffectOutcome {
     pub index: u32,
@@ -216,6 +283,19 @@ pub enum HostMessage {
     },
     Drain,
     Shutdown,
+    /// ABI 1.1 only (appended; 1.0 peers never see it). Round `round` of the
+    /// invocation: the same `invocation` bytes and request ID in every round,
+    /// plus the tape of the `round - 1` earlier rounds. `max_rounds` is the
+    /// number of yields the guest may make (authority `maxRounds`); rounds
+    /// run from 1 to at most `max_rounds + 1`, and a yield in round
+    /// `max_rounds + 1` is refused by the host (`Exhausted`, guest cancelled).
+    InvokeRound {
+        request_id: RequestId,
+        invocation: Invocation,
+        round: u16,
+        max_rounds: u16,
+        tape: Vec<RoundRecord>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -242,6 +322,21 @@ pub enum GuestMessage {
     Drained,
     Shutdown,
     YieldedGroup {request_id:RequestId,group:EffectGroup},
+    /// ABI 1.1 only: the next plan. `replayed` holds the hash of every plan
+    /// the guest re-derived from the tape, in order (one per tape record).
+    YieldedRound {
+        request_id: RequestId,
+        round: u16,
+        replayed: Vec<PlanHash>,
+        plan: RoundPlan,
+    },
+    /// ABI 1.1 only: the terminal result after replaying the whole tape.
+    CompletedRound {
+        request_id: RequestId,
+        round: u16,
+        replayed: Vec<PlanHash>,
+        result: InvocationResult,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -256,6 +351,15 @@ impl<T> Frame<T> {
         Self {
             magic: WIRE_MAGIC,
             abi: ABI_VERSION,
+            message,
+        }
+    }
+
+    /// A frame stamped with the negotiated version (ABI 1.1 sessions).
+    pub fn with_abi(abi: AbiVersion, message: T) -> Self {
+        Self {
+            magic: WIRE_MAGIC,
+            abi,
             message,
         }
     }
@@ -327,6 +431,54 @@ where
     Ok(frame)
 }
 
+/// [`decode_frame`] for a negotiated session: the frame must carry one of the
+/// `accepted` versions exactly (1.0 sessions pass `[ABI_VERSION]`, which is
+/// what [`decode_frame`] accepts). An empty list accepts nothing.
+pub fn decode_frame_versioned<T>(
+    bytes: &[u8],
+    limits: CodecLimits,
+    accepted: &[AbiVersion],
+) -> Result<Frame<T>, ProtocolError>
+where
+    T: DeserializeOwned + Serialize,
+{
+    let frame: Frame<T> = decode(bytes, limits)?;
+    if frame.magic != WIRE_MAGIC {
+        return Err(ProtocolError::WrongMagic);
+    }
+    if !frame.abi.is_supported() || !accepted.contains(&frame.abi) {
+        return Err(ProtocolError::AbiMismatch);
+    }
+    Ok(frame)
+}
+
+/// [`decode_frame_trusted`] for a negotiated session (see
+/// [`decode_frame_versioned`]).
+pub fn decode_frame_trusted_versioned<T>(
+    bytes: &[u8],
+    limits: CodecLimits,
+    accepted: &[AbiVersion],
+) -> Result<Frame<T>, ProtocolError>
+where
+    T: DeserializeOwned,
+{
+    if bytes.len() > limits.max_bytes {
+        return Err(ProtocolError::Oversize);
+    }
+    let (frame, remainder): (Frame<T>, _) =
+        postcard::take_from_bytes(bytes).map_err(|_| ProtocolError::Malformed)?;
+    if !remainder.is_empty() {
+        return Err(ProtocolError::Malformed);
+    }
+    if frame.magic != WIRE_MAGIC {
+        return Err(ProtocolError::WrongMagic);
+    }
+    if !frame.abi.is_supported() || !accepted.contains(&frame.abi) {
+        return Err(ProtocolError::AbiMismatch);
+    }
+    Ok(frame)
+}
+
 /// Decode a frame from a trusted peer: same size, trailing-data, magic and
 /// version checks as [`decode_frame`], without the canonical re-encoding.
 /// Guests use this for host frames (the host is trusted and canonical by
@@ -360,6 +512,9 @@ enum SessionState {
     Ready,
     Running(RequestId),
     Yielded(RequestId),
+    /// ABI 1.1: the guest yielded a round plan; only `InvokeRound` for the
+    /// next round of the same request, or `Cancel`, may follow.
+    Suspended(RequestId),
     Draining,
     /// The guest acknowledged `Drain`; only `Shutdown` may follow. This is the
     /// guest SDK's rule too, and the only host sequence in use (drain, then
@@ -371,37 +526,105 @@ enum SessionState {
 
 /// Protocol-only lifecycle checker. Engines call this before accepting a guest
 /// response, so duplicate terminal outcomes and post-shutdown use fail closed.
+///
+/// The checker records the host's `Negotiate` offer and the guest's selection.
+/// A 1.0 session accepts exactly the 1.0 messages (`Invoke`/`Resume`,
+/// `Yielded`/`YieldedGroup`/`Completed`); a 1.1 session accepts exactly the
+/// round messages (`InvokeRound`, `YieldedRound`/`CompletedRound`). `Failed`,
+/// `Cancelled`, `Cancel`, `Drain` and `Shutdown` are shared.
 #[derive(Clone, Debug)]
 pub struct Lifecycle {
     state: SessionState,
+    offered: Vec<AbiVersion>,
+    negotiated: Option<AbiVersion>,
+    round: u16,
+    max_rounds: u16,
 }
 
 impl Default for Lifecycle {
     fn default() -> Self {
         Self {
             state: SessionState::New,
+            offered: Vec::new(),
+            negotiated: None,
+            round: 0,
+            max_rounds: 0,
         }
     }
 }
 
 impl Lifecycle {
+    /// The version the guest selected, once negotiation has completed.
+    pub fn negotiated(&self) -> Option<AbiVersion> {
+        self.negotiated
+    }
+
+    fn rounds(&self) -> bool {
+        self.negotiated == Some(ABI_VERSION_1_1)
+    }
+
+    fn legacy(&self) -> bool {
+        self.negotiated == Some(ABI_VERSION)
+    }
+
     pub fn host(&mut self, message: &HostMessage) -> Result<(), ProtocolError> {
         if self.state == SessionState::Stopped {
             return Err(ProtocolError::UseAfterShutdown);
         }
-        self.state = match (self.state, message) {
-            (SessionState::New, HostMessage::Negotiate { .. }) => SessionState::New,
+        let next = match (self.state, message) {
+            (SessionState::New, HostMessage::Negotiate { supported }) => {
+                self.offered = supported.clone();
+                SessionState::New
+            }
             (SessionState::Negotiated, HostMessage::Initialize { .. }) => SessionState::Negotiated,
-            (SessionState::Ready, HostMessage::Invoke { request_id, .. }) => {
+            (SessionState::Ready, HostMessage::Invoke { request_id, .. }) if self.legacy() => {
                 SessionState::Running(*request_id)
             }
+            (
+                SessionState::Ready,
+                HostMessage::InvokeRound {
+                    request_id,
+                    round: 1,
+                    max_rounds,
+                    tape,
+                    ..
+                },
+            ) if self.rounds()
+                && tape.is_empty()
+                && (1..=MAX_ROUNDS_CEILING).contains(max_rounds) =>
+            {
+                self.round = 1;
+                self.max_rounds = *max_rounds;
+                SessionState::Running(*request_id)
+            }
+            (
+                SessionState::Suspended(active),
+                HostMessage::InvokeRound {
+                    request_id,
+                    round,
+                    max_rounds,
+                    tape,
+                    ..
+                },
+            ) if self.rounds()
+                && active == *request_id
+                && *max_rounds == self.max_rounds
+                && *round == self.round.saturating_add(1)
+                && *round <= last_round(self.max_rounds)
+                && tape.len() == usize::from(*round - 1) =>
+            {
+                self.round = *round;
+                SessionState::Running(active)
+            }
             (SessionState::Yielded(active), HostMessage::Resume { request_id, .. })
-                if active == *request_id =>
+                if active == *request_id && self.legacy() =>
             {
                 SessionState::Running(active)
             }
             (
-                SessionState::Running(active) | SessionState::Yielded(active),
+                SessionState::Running(active)
+                | SessionState::Yielded(active)
+                | SessionState::Suspended(active),
                 HostMessage::Cancel { request_id },
             ) if active == *request_id => SessionState::Running(active),
             (SessionState::Ready, HostMessage::Drain) => SessionState::Draining,
@@ -413,6 +636,7 @@ impl Lifecycle {
             }
             _ => return Err(ProtocolError::InvalidTransition),
         };
+        self.state = next;
         Ok(())
     }
 
@@ -420,22 +644,58 @@ impl Lifecycle {
         if self.state == SessionState::Stopped {
             return Err(ProtocolError::UseAfterShutdown);
         }
-        self.state = match (self.state, message) {
+        let expected_replays = usize::from(self.round.saturating_sub(1));
+        let next = match (self.state, message) {
             (SessionState::New, GuestMessage::Negotiated { selected })
-                if *selected == ABI_VERSION =>
+                if selected.is_supported() && self.offered.contains(selected) =>
             {
+                self.negotiated = Some(*selected);
                 SessionState::Negotiated
             }
             (SessionState::Negotiated, GuestMessage::Initialized) => SessionState::Ready,
             (SessionState::Running(active), GuestMessage::Yielded { request_id, .. } | GuestMessage::YieldedGroup {request_id,..})
-                if active == *request_id =>
+                if active == *request_id && self.legacy() =>
             {
                 SessionState::Yielded(active)
             }
             (
                 SessionState::Running(active),
-                GuestMessage::Completed { request_id, .. }
-                | GuestMessage::Failed { request_id, .. }
+                GuestMessage::YieldedRound {
+                    request_id,
+                    round,
+                    replayed,
+                    ..
+                },
+            ) if active == *request_id
+                && self.rounds()
+                && *round == self.round
+                && replayed.len() == expected_replays =>
+            {
+                SessionState::Suspended(active)
+            }
+            (SessionState::Running(active), GuestMessage::Completed { request_id, .. })
+                if active == *request_id && self.legacy() =>
+            {
+                SessionState::Ready
+            }
+            (
+                SessionState::Running(active),
+                GuestMessage::CompletedRound {
+                    request_id,
+                    round,
+                    replayed,
+                    ..
+                },
+            ) if active == *request_id
+                && self.rounds()
+                && *round == self.round
+                && replayed.len() == expected_replays =>
+            {
+                SessionState::Ready
+            }
+            (
+                SessionState::Running(active),
+                GuestMessage::Failed { request_id, .. }
                 | GuestMessage::Cancelled { request_id },
             ) if active == *request_id => SessionState::Ready,
             (SessionState::Draining, GuestMessage::Drained) => SessionState::Drained,
@@ -443,11 +703,17 @@ impl Lifecycle {
             (
                 SessionState::Ready,
                 GuestMessage::Completed { .. }
+                | GuestMessage::CompletedRound { .. }
                 | GuestMessage::Failed { .. }
                 | GuestMessage::Cancelled { .. },
             ) => return Err(ProtocolError::DuplicateTerminal),
             _ => return Err(ProtocolError::InvalidTransition),
         };
+        if next == SessionState::Ready {
+            self.round = 0;
+            self.max_rounds = 0;
+        }
+        self.state = next;
         Ok(())
     }
 }
@@ -644,7 +910,9 @@ mod tests {
         assert_eq!(value.len() % 2, 0);
         value
             .as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| {
                 let text = core::str::from_utf8(pair).unwrap();
                 u8::from_str_radix(text, 16).unwrap()
