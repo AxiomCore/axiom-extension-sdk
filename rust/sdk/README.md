@@ -153,14 +153,20 @@ impl Checkout {
   `cx.emit(..)` add to the final result; `cx.invocation()` gives the input and
   the round-1 snapshots (`UiState::generated(cx.invocation())` as in sync
   exports). The host revision-checks final patches against the round-1
-  snapshots.
+  snapshots. When the input parameter is `Value`, the input is moved into the
+  argument (no copy every round); in such an export read it from the
+  argument: `cx.input()` returns `InvalidInput` and `cx.invocation().input()`
+  sees `Null`. Typed inputs are decoded by reference and stay readable both
+  ways.
 - **ABI version.** An impl with at least one async export makes
   `axiom_extension()` return an `AsyncExtension`; the module then exports ABI
   1.1 (`axiom_extension_abi_version`, a constant read at package time) and
   negotiates 1.1 when the host offers it. Its sync exports keep working
   inside 1.1 sessions. An impl with only sync exports is unchanged: ABI 1.0,
-  identical frames. On a host that offers only 1.0, an async export may yield
-  once (one batched resume) and fails `Exhausted` if it needs more.
+  identical frames, and its module contains no round-handling code (the export
+  macros build the 1.0-only machine). On a host that offers only 1.0, an async
+  export may yield once (one batched resume) and fails `Exhausted` if it needs
+  more.
 - **Rounds.** Each host operation registers in the current round when first
   polled. When nothing else can run, the executor sends **one** plan with
   every pending operation, in registration order: one operation is a plain
@@ -169,7 +175,16 @@ impl Checkout {
   Sequential awaits cost one round each; `join!` / `join_all` cost one round
   for the whole batch. `maxRounds` (authority, default 1, at most 16) bounds
   the number of rounds that yield; one more yield is refused (`Exhausted`) and
-  nothing commits.
+  nothing commits. Request it per extension in `AxiomDeps.toml`:
+
+  ```toml
+  [extensions.checkout.budgets]
+  maxRounds = 3   # the number of sequential await rounds the export needs
+  ```
+
+  Raising it is a reviewed permission increase. A source build warns
+  (`AXIOM_ASYNC_MAX_ROUNDS`) when a module has async exports and requests the
+  default of 1. An export that never yields more than once needs nothing.
 - **Replay.** Every round re-runs the export from the top with the same input.
   Awaits the host already answered resolve immediately from its tape, in
   order; the first unanswered batch becomes the next plan. The SDK reports the
@@ -184,15 +199,20 @@ impl Checkout {
   operations still pending when the export returns are never sent. Awaiting a
   non-host future (a timer, a channel) fails with `InvalidInput`.
 - **Errors.** A failed or denied operation resolves its future with `Err`
-  (use `?`, or handle it and continue). In a `join!` group a domain failure
-  is returned to its branch only; a branch the broker refuses before dispatch
-  (no grant) fails the whole invocation. A panic traps as in sync exports.
+  (use `?`, or handle it and continue). In a `join!` group every branch gets
+  its own outcome: a domain failure or a branch the broker refuses (no grant,
+  revoked; `Denied`) is returned to that branch only and the others get their
+  values (ADR 0001 third clarification). A panic traps as in sync exports.
   Effects run in earlier rounds have happened even if a later round fails;
   only patches and transactions are atomic. Prefer idempotent operations.
 - **Cost.** Replay re-executes the prefix every round, so guest fuel grows
-  roughly with the square of the number of rounds and is cumulative within
-  one invocation (see `planning/extension-sandbox/contracts/x8c-rust-async.md`
-  for measurements).
+  roughly with the square of the number of rounds. Fuel is one budget for
+  the whole invocation, and the host sizes it as `fuel_per_invocation ×
+  (maxRounds + 1)` (ADR 0001 fourth clarification); the deadline and the
+  host-call and byte budgets are not scaled. The SDK hashes each replayed
+  plan once per instance and moves `Value` inputs, so the exit-gate scenario
+  costs about 1.08× the hand-written raw guest (see
+  `planning/extension-sandbox/contracts/x8c-rust-async.md` for measurements).
 
 ## Third-party crates
 
