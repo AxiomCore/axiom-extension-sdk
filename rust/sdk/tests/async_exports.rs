@@ -1098,3 +1098,39 @@ fn a_value_input_is_moved_into_the_argument_and_typed_inputs_are_unchanged() {
     let run = host.invoke("typed_input", n(7), 1);
     assert_eq!(run.output(), &list(&[7, 7, 7, 10]));
 }
+
+/// L-5: the 1.0-only machine (`GuestMachine<_, false>`, what the export
+/// macros build for a module that exports ABI 1.0) never selects 1.1, even
+/// for a rounds-capable extension offered 1.1, and refuses `InvokeRound`
+/// without changing state; ordinary 1.0 invocations still work.
+#[test]
+fn a_machine_without_rounds_never_selects_1_1() {
+    let extension: Box<dyn Extension> = Guest::axiom_extension_for_tests().into();
+    let mut machine = GuestMachine::<Box<dyn Extension>, false>::without_rounds(extension, LIMITS);
+    let mut send = |abi: AbiVersion, message: HostMessage| {
+        let bytes = abi::encode(&Frame::with_abi(abi, message), LIMITS).unwrap();
+        machine
+            .dispatch(&bytes)
+            .map(|reply| abi::decode_frame::<GuestMessage>(&reply, LIMITS).unwrap().message)
+    };
+    assert_eq!(
+        send(ABI_VERSION, HostMessage::Negotiate { supported: vec![ABI_VERSION_1_1, ABI_VERSION] }),
+        Ok(GuestMessage::Negotiated { selected: ABI_VERSION })
+    );
+    assert_eq!(
+        send(ABI_VERSION, HostMessage::Initialize { instance_id: 1, application: "x8c".into(), extension: "async".into() }),
+        Ok(GuestMessage::Initialized)
+    );
+    let round = HostMessage::InvokeRound {
+        request_id: RequestId(1),
+        invocation: Host::invocation("three", Value::Null),
+        round: 1,
+        max_rounds: 3,
+        tape: Vec::new(),
+    };
+    assert!(send(ABI_VERSION, round.clone()).is_err());
+    assert!(send(ABI_VERSION_1_1, round).is_err());
+    // A sync export over 1.0 still completes.
+    let reply = send(ABI_VERSION, HostMessage::Invoke { request_id: RequestId(2), invocation: Host::invocation("sync_pure", n(4)) });
+    assert!(matches!(reply, Ok(GuestMessage::Completed { .. })), "{reply:?}");
+}
