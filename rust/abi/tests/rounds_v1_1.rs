@@ -525,3 +525,98 @@ fn max_rounds_counts_yields_not_invokes() {
         .unwrap();
     }
 }
+
+/// w1-a3 (L1): the guest-side check, as compiled into every 1.1 guest. A
+/// guest that decodes the host's `InvokeRound` frames with this crate and
+/// drives its own `Lifecycle` accepts round N + 1 as the completing round of
+/// an invocation with `max_rounds = N` (N counts yields), and refuses a round
+/// N + 2. The wire field carries N itself. Pinned at N = 1, 2 and 16.
+#[test]
+fn guest_side_lifecycle_accepts_round_n_plus_one_as_the_completing_round() {
+    let limits = CodecLimits::default();
+    // What a guest does with each host frame: decode it (1.1 session) and
+    // check it against its own lifecycle.
+    let receive = |guest: &mut Lifecycle, message: HostMessage| -> Result<(), ProtocolError> {
+        let bytes = encode(&Frame::with_abi(ABI_VERSION_1_1, message), limits).unwrap();
+        let frame =
+            decode_frame_trusted_versioned::<HostMessage>(&bytes, limits, &[ABI_VERSION_1_1])?;
+        assert_eq!(frame.abi, ABI_VERSION_1_1);
+        guest.host(&frame.message)
+    };
+    for n in [1u16, 2, MAX_ROUNDS_CEILING] {
+        assert_eq!(last_round(n), n + 1, "N={n}");
+        // The wire field is N (a postcard varint after the round number).
+        let InvokeRoundBytes { max_rounds_field } = invoke_round_bytes(n);
+        assert_eq!(max_rounds_field, n, "N={n}");
+        // N yields, then round N + 1 completes.
+        let mut guest = session(&SUPPORTED_ABI_VERSIONS, ABI_VERSION_1_1).unwrap();
+        for round in 1..=n {
+            receive(&mut guest, invoke_round(1, round, n, usize::from(round - 1)))
+                .unwrap_or_else(|error| panic!("N={n} round {round}: {error:?}"));
+            guest.guest(&yielded_round(1, round, usize::from(round - 1))).unwrap();
+        }
+        receive(&mut guest, invoke_round(1, n + 1, n, usize::from(n)))
+            .unwrap_or_else(|error| panic!("N={n}: round N+1 must be accepted: {error:?}"));
+        guest.guest(&completed_round(1, n + 1, usize::from(n))).unwrap();
+        // A guest that yields in round N + 1 cannot be sent round N + 2.
+        let mut guest = session(&SUPPORTED_ABI_VERSIONS, ABI_VERSION_1_1).unwrap();
+        for round in 1..=n + 1 {
+            receive(&mut guest, invoke_round(1, round, n, usize::from(round - 1))).unwrap();
+            guest.guest(&yielded_round(1, round, usize::from(round - 1))).unwrap();
+        }
+        assert_eq!(
+            receive(&mut guest, invoke_round(1, n + 2, n, usize::from(n + 1))),
+            Err(ProtocolError::InvalidTransition),
+            "N={n}"
+        );
+    }
+    // N outside 1..=16 is refused by the guest in round 1.
+    for n in [0u16, MAX_ROUNDS_CEILING + 1] {
+        let mut guest = session(&SUPPORTED_ABI_VERSIONS, ABI_VERSION_1_1).unwrap();
+        assert_eq!(
+            receive(&mut guest, invoke_round(1, 1, n, 0)),
+            Err(ProtocolError::InvalidTransition),
+            "N={n}"
+        );
+    }
+}
+
+struct InvokeRoundBytes {
+    max_rounds_field: u16,
+}
+
+/// Decode the `max_rounds` field straight from the encoded round-1 frame of
+/// an empty invocation, independent of the crate's own decoder.
+fn invoke_round_bytes(n: u16) -> InvokeRoundBytes {
+    let message = HostMessage::InvokeRound {
+        request_id: RequestId(1),
+        invocation: Invocation {
+            export: String::new(),
+            input: Value::Null,
+            snapshots: vec![],
+            deadline_unix_ms: 0,
+        },
+        round: 1,
+        max_rounds: n,
+        tape: vec![],
+    };
+    let bytes = encode(&Frame::with_abi(ABI_VERSION_1_1, message), CodecLimits::default()).unwrap();
+    // magic(4) version(1,1) tag(7) id(1) export("") input(Null tag) snapshots(0)
+    // deadline(0) round(1) max_rounds(varint) tape(0)
+    let prefix = [b'A', b'X', b'E', b'1', 1, 1, 7, 1, 0];
+    assert_eq!(&bytes[..prefix.len()], &prefix);
+    let rest = &bytes[prefix.len()..];
+    // Value::Null's tag, no snapshots, deadline 0, round 1.
+    let null_tag = encode(&Value::Null, CodecLimits::default()).unwrap();
+    let after = &rest[null_tag.len()..];
+    assert_eq!(&after[..3], &[0, 0, 1]);
+    let varint = &after[3..after.len() - 1];
+    assert_eq!(*after.last().unwrap(), 0, "empty tape");
+    let mut value = 0u16;
+    for (index, byte) in varint.iter().enumerate() {
+        value |= u16::from(byte & 0x7f) << (7 * index);
+    }
+    InvokeRoundBytes {
+        max_rounds_field: value,
+    }
+}
