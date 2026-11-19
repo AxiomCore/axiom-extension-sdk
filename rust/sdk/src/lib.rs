@@ -21,8 +21,8 @@ pub use primitives::{Cents, DurationMs, Id, Percentage, Revision, TimestampMs};
 pub use typed::{
     boxed_extension, AxiomDecode, AxiomEncode, AxiomType, EffectCall, Effects, ExtensionResponse,
     Operation, RecordDecoder, Result, ResumeContext, SdkError, Store, StoreField, StoreObject,
-    StorePatch, StoreTransaction, Stream, StreamBatch, TypedExtension, TypedInvocation, UiField, UiPatch,
-    UiScope, UiState,
+    StorePatch, StoreTransaction, Stream, StreamBatch, Ticket, TypedExtension, TypedInvocation, UiField,
+    UiPatch, UiScope, UiState,
 };
 
 /// Ordinary extension authors should import this module. It contains the
@@ -32,7 +32,7 @@ pub mod prelude {
         boxed_extension, export, extension, AxiomDecode, AxiomEncode, AxiomType, Cents, DurationMs,
         EffectCall, Effects, ExtensionResponse, Id, Operation, Percentage, Result, ResumeContext,
         Revision, SdkError, Store, StoreField, StoreObject, StorePatch, StoreTransaction, Stream, StreamBatch,
-        TimestampMs, TypedExtension, TypedInvocation, UiField, UiPatch, UiScope, UiState,
+        Ticket, TimestampMs, TypedExtension, TypedInvocation, UiField, UiPatch, UiScope, UiState,
     };
 }
 
@@ -1212,6 +1212,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // the positional `outcome(i)` path must keep working
     fn typed_effects_yield_and_resume_without_raw_guest_messages() {
         struct CallsCatalog;
         impl TypedExtension for CallsCatalog {
