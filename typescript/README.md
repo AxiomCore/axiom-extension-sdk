@@ -68,6 +68,12 @@ export default defineExtension({
   with `Exhausted`. `Promise.all` therefore batches by itself; sequential
   awaits take one round each. The package's `maxEffects` and the authority's
   `maxRounds` (yields) still apply.
+- **Order inside a round.** Operations are ordered by where they were called
+  in the tree of async calls (depth first, in call order), exactly as the Rust
+  SDK's `join!` orders them for the same program: `Promise.all([a(), b()])`
+  puts all of `a`'s operations before `b`'s, however many awaits of helpers or
+  resolved promises come in between. (CPython's `asyncio` task order can
+  differ for a `gather` inside a task; Axiom follows Rust.)
 - **Replay.** Every round runs the export from the top in a fresh engine, with
   the results of earlier rounds answered from the host's tape. Nothing survives
   between rounds (module variables start fresh every round). A round that
@@ -83,18 +89,24 @@ export default defineExtension({
   result is discarded (registered operations are never withdrawn). Operations
   still pending when the export returns are never sent. Awaiting one promise
   twice gives its value twice. `Promise.race`/`Promise.any` are deterministic:
-  all operations of a round finish together and settle in registration order,
-  so the first registered wins, and the others still run.
+  all operations of a round finish together and settle in plan order, so the
+  first in the plan wins, and the others still run.
 - **Errors.** A failed operation rejects with `HostOperationError` (`code`,
   `message`, `retryable`). If it escapes the export, the invocation fails with
   that code; any other exception fails it with `Guest`. Nothing commits.
-- **Build.** An async module is built with the Javy event loop, the async step
-  banner and the static ABI 1.1 marker, and is packaged as
-  `axiom-extension-abi` 1.1.0 (contract `x8d-managed-async.md`). Under the 1.0
-  build an async export refuses to run.
-- **Cost.** Replay re-runs the prefix every round, and the fuel budget and
-  deadline cover all rounds together. A small TypeScript guest uses about
-  2 G of the default 30 G managed fuel and 0.4 s for 16 yields.
+- **Build.** `axiom-build` decides by itself: a module that uses the async API
+  is built with the async runner (`@axiomcore/extension-sdk/runner-async`),
+  async/await lowered to generators, the Javy event loop and the ABI 1.1 step
+  export and marker (`axiom-typescript-managed-abi finish`), and is packaged as
+  `axiom-extension-abi` 1.1.0; a mistake fails the build with an
+  `AXIOM_MANAGED_ASYNC_BUILD` diagnostic. A sync-only module is built exactly
+  as before (byte-identical) and carries none of the async runtime. Under the
+  1.0 build an async export refuses to run (contract `x8d-managed-async.md`).
+- **Cost and limits.** Replay re-runs the prefix every round. The fuel budget
+  is one invocation's fuel per run (`× (maxRounds + 1)`), the deadline covers
+  all rounds together, memory does not grow per round. A small TypeScript
+  guest uses about 2.6 G managed fuel and 0.25 s for 16 yields, which fits
+  the default budgets.
 
 ## Typed tickets
 

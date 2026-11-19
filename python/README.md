@@ -54,9 +54,13 @@ async def apply(cx: AsyncContext, input):
 
 - Coroutines are lazy, as in CPython: `cx.call(effect)` and calling an
   `async def` start nothing until they are awaited or passed to `gather`, so
-  `gather(a, b)` registers `a`'s operations before `b`'s (the Rust `join!`
-  order). Operations started before the export waits form one round: one is a
-  plan, 2 to 32 are one `Collect` group, more than 32 fail with `Exhausted`.
+  `gather(a, b)` registers `a`'s operations before `b`'s. Operations started
+  before the export waits form one round: one is a plan, 2 to 32 are one
+  `Collect` group, more than 32 fail with `Exhausted`. Inside a round they are
+  ordered depth first by where they were started in the call tree, the Rust
+  `join!` order, whatever helpers are awaited in between. (CPython's `asyncio`
+  runs a `gather` inside a task after tasks queued earlier, so its order
+  within a round can differ for such programs; the results are the same.)
 - Supported: `async def` (exports, helpers, methods, closures, recursion),
   `await` of coroutines, `cx.call(...)` and `gather(...)` (also awaited twice),
   `gather(..., return_exceptions=True)`, `try`/`except`/`finally` and `with`
@@ -76,11 +80,11 @@ async def apply(cx: AsyncContext, input):
   Other exceptions fail it with `Guest`.
 - Under CPython (editor, tests) `gather` is `asyncio.gather`, so the same
   program runs under real `asyncio`; axiom-build's async differential suite
-  compares the two.
+  compares the results with asyncio and the plans with a Rust-order executor.
 - **Cost.** Every round re-initialises the Python runtime (about 1.5 G managed
-  fuel and 0.1 s) and each replayed stall needs about 0.7 MiB more memory, so
-  the default budgets (30 G fuel, 1 s, 64 pages) fit one yield. Async Python
-  guests need a larger `maxMemoryPages` (about 64 + 11 per yield) and deadline.
+  fuel and 0.1–0.25 s); memory stays at about 42 pages however many rounds.
+  The fuel budget grows with `maxRounds`; the 1 s default deadline covers all
+  rounds and is the limit: 7 yields fit under the default budgets on box-3.
 
 ## Typed tickets
 
