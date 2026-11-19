@@ -1,6 +1,6 @@
 [package]
 name = "axiom-extension-abi"
-version = "1.0.4"
+version = "1.1.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Engine-neutral Axiom extension ABI v1 wire types (1.0 and the negotiated 1.1 round protocol)"
