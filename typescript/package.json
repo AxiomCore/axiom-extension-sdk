@@ -24,6 +24,10 @@
       "types": "./dist/runner.d.ts",
       "default": "./dist/runner.js"
     },
+    "./runner-async": {
+      "types": "./dist/runner-async.d.ts",
+      "default": "./dist/runner-async.js"
+    },
     "./schema": {
       "types": "./dist/schema.d.ts",
       "default": "./dist/schema.js"

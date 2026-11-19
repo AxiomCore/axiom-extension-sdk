@@ -11,12 +11,27 @@
 //
 // How the job queue's drain is detected (see contract x8d-managed-async.md):
 // the engine's `_start` export runs the bundle and then drains every pending
-// job. The managed kernel calls `_start` again on the same instance; the
-// bundle's first statement (an esbuild banner) sees the step hook installed
-// below and calls it instead of re-running the bundle. Each step therefore
-// begins exactly when the queue is empty. No timers are involved.
+// job. The managed kernel then calls the async build's step export
+// (`axiom_managed_step`) on the same instance, which evaluates only
+// `globalThis.__axiom_managed_step__()`: the step hook installed below. Each
+// step therefore begins exactly when the queue is empty. No timers are
+// involved. (Older builds re-entered `_start` behind an esbuild banner.)
+//
+// Plan order (w2-c2 M-1): the operations of one round are ordered by their
+// position in the tree of promise creations, not by when they registered.
+// The async build lowers `async`/`await` to generators (esbuild
+// `--supported:async-await=false`), so every await continues through
+// `Promise.prototype.then`; during a round `Promise` is a subclass whose
+// constructor opens a child node of the current node (every async function
+// call creates one), and `then` runs its callbacks in the node that was
+// current when `then` was called. An operation's key is the path of the node
+// that called `cx.call` plus its sequence in that node. Sorting a round's
+// operations by key gives a depth-first walk of the async call tree in
+// creation order: the order in which the Rust executor's depth-first poll of
+// `join!` registers them, whatever the number of microtask hops (awaits of
+// pure helpers, resolved promises) in between.
 import type { AxiomValue, Completed, Effect, ExtensionHandler, Invocation, InvocationResult, SecretHandle, TypedEffect } from "./index.js";
-import { PatchBuilder, StateSnapshot, createContext, decodeValue, effectDecoder, encodeValue } from "./index.js";
+import { PatchBuilder, StateSnapshot, canonicalValue, createContext, decodeValue, effectDecoder, encodeValue } from "./index.js";
 
 /** Group format of an ABI 1.1 `Collect` round group (`abi::EFFECT_GROUP_FORMAT`). */
 export const EFFECT_GROUP_FORMAT = "axiom-extension-effect-group/v1";
@@ -24,8 +39,99 @@ export const EFFECT_GROUP_FORMAT = "axiom-extension-effect-group/v1";
 export const MAX_GROUP_BRANCHES = 32;
 /** The `limit` of a round group is `min(n, MAX_GROUP_LIMIT)`. */
 export const MAX_GROUP_LIMIT = 8;
-/** Name of the step hook the esbuild banner of an async build calls. */
+/** Name of the step hook the async build's step export calls. */
 export const STEP_HOOK = "__axiom_managed_step__";
+
+/**
+ * True when this bundle was built with `async`/`await` lowered to generators
+ * (the async build's esbuild step). Only then is the plan order independent
+ * of microtask hops; the async runner refuses async exports otherwise.
+ */
+export const LOWERED_ASYNC: boolean = Object.getPrototypeOf(async function () {}) === Function.prototype;
+
+// ------------------------------------------------------------ plan order
+interface OrderNode { readonly path: readonly number[]; next: number }
+const NativePromise = Promise;
+const nativeThen = NativePromise.prototype.then;
+/** The node whose code is running; undefined outside an async round. */
+let currentNode: OrderNode | undefined;
+
+function childOf(parent: OrderNode): OrderNode {
+  return { path: [...parent.path, parent.next++], next: 0 };
+}
+
+function inNode<A extends unknown[], R>(node: OrderNode | undefined, fn: ((...args: A) => R) | null | undefined): ((...args: A) => R) | null | undefined {
+  if (typeof fn !== "function" || node === undefined) return fn;
+  return (...args: A): R => {
+    const saved = currentNode;
+    currentNode = node;
+    try {
+      return fn(...args);
+    } finally {
+      currentNode = saved;
+    }
+  };
+}
+
+let orderingInstalled = false;
+/**
+ * Install the plan-order hooks (once per engine; every round is a fresh
+ * engine in production). Outside a round (`currentNode` undefined) both hooks
+ * behave exactly like the native ones.
+ */
+function installOrdering(): void {
+  if (orderingInstalled) return;
+  orderingInstalled = true;
+  class OrderedPromise<T> extends NativePromise<T> {
+    constructor(executor: (resolve: (value: T | PromiseLike<T>) => void, reject: (reason?: unknown) => void) => void) {
+      const parent = currentNode;
+      if (parent === undefined || typeof executor !== "function") {
+        super(executor);
+        return;
+      }
+      const node = childOf(parent);
+      super((resolve, reject) => {
+        const saved = currentNode;
+        currentNode = node;
+        try {
+          executor(resolve, reject);
+        } finally {
+          currentNode = saved;
+        }
+      });
+    }
+  }
+  Object.defineProperty(NativePromise.prototype, "then", {
+    value: function then(this: Promise<unknown>, onFulfilled?: unknown, onRejected?: unknown) {
+      const node = currentNode;
+      return nativeThen.call(this, inNode(node, onFulfilled as any) as any, inNode(node, onRejected as any) as any);
+    },
+    writable: true,
+    enumerable: false,
+    configurable: true,
+  });
+  Object.defineProperty(globalThis, "Promise", { value: OrderedPromise, writable: true, enumerable: false, configurable: true });
+}
+
+/** Lexicographic order of two operation keys (a key is never a prefix of another). */
+function compareKeys(a: readonly number[], b: readonly number[]): number {
+  const length = Math.min(a.length, b.length);
+  for (let i = 0; i < length; i++) if (a[i] !== b[i]) return a[i] - b[i];
+  return a.length - b.length;
+}
+
+/**
+ * The canonical text of a round plan. It must stay identical to
+ * `canonical_round_plan` in the TypeScript kernel (`rounds.rs`): the kernel
+ * passes the text of each tape round's plan (`tape_plans`, bounded) so a
+ * re-derived plan that differs fails `Protocol` before any outcome is used.
+ */
+export function canonicalRoundPlan(plan: RoundPlanJson): string {
+  const call = (effect: Effect, name?: string) => `[${name === undefined ? "" : JSON.stringify(name) + ","}${JSON.stringify(effect.namespace)},${JSON.stringify(effect.operation)},${canonicalValue(effect.input)}]`;
+  if ("Plan" in plan) return `{"Plan":[${plan.Plan.effects.map((effect) => call(effect)).join(",")}]}`;
+  const group = plan.Group;
+  return `{"Group":{"format":${JSON.stringify(group.format)},"limit":${group.limit},"mode":${JSON.stringify(group.mode)},"branches":[${group.branches.map((branch) => call(branch.effect, branch.name)).join(",")}]}}`;
+}
 
 /**
  * A failed host operation. Awaiting `cx.call(...)` rejects with this error
@@ -121,6 +227,8 @@ export interface RoundRequest {
   abi: "1.1" | "1.0";
   tape: TapeRecord[];
   yielded_plan?: unknown;
+  /** The canonical text of each tape round's plan, or null above the kernel's bound. */
+  tape_plans?: Array<string | null>;
 }
 
 type RoundPlanJson =
@@ -148,6 +256,8 @@ export function segmentPlan(effects: Effect[]): RoundPlanJson {
 
 interface Registered {
   effect: Effect;
+  /** Position in the async call tree (see the plan-order note at the top). */
+  key: readonly number[];
   resolve(value: unknown): void;
   reject(error: unknown): void;
   decode?: (value: AxiomValue) => unknown;
@@ -175,6 +285,8 @@ class RoundRun {
   private settled: { ok: true; value: unknown } | { ok: false; error: unknown } | undefined;
   private answered = false;
   private readonly completions = new WeakSet<object>();
+  /** The root of this run's async call tree (plan order). */
+  private readonly root: OrderNode = { path: [], next: 0 };
 
   constructor(private readonly request: RoundRequest, private readonly write: (response: RoundResponse) => void) {}
 
@@ -199,16 +311,23 @@ class RoundRun {
   }
 
   start(handler: AsyncHandler, cx: AsyncContext): void {
-    let promise: Promise<unknown>;
+    installOrdering();
+    const saved = currentNode;
+    currentNode = this.root;
     try {
-      promise = Promise.resolve(handler(cx, cx.input));
-    } catch (error) {
-      promise = Promise.reject(error);
+      let promise: Promise<unknown>;
+      try {
+        promise = Promise.resolve(handler(cx, cx.input));
+      } catch (error) {
+        promise = Promise.reject(error);
+      }
+      promise.then(
+        (value) => { if (!this.settled) this.settled = { ok: true, value }; },
+        (error) => { if (!this.settled) this.settled = { ok: false, error }; },
+      );
+    } finally {
+      currentNode = saved;
     }
-    promise.then(
-      (value) => { if (!this.settled) this.settled = { ok: true, value }; },
-      (error) => { if (!this.settled) this.settled = { ok: false, error }; },
-    );
   }
 
   private register(effect: unknown): Promise<unknown> {
@@ -216,7 +335,13 @@ class RoundRun {
     if (this.settled || this.answered) return new Promise(() => {});
     const plain = plainEffect(effect);
     const decode = effectDecoder(effect as object);
-    return new Promise((resolve, reject) => { this.segment.push({ effect: plain, resolve, reject, decode }); });
+    const node = currentNode ?? this.root;
+    const key = [...node.path, node.next++];
+    let entry!: Registered;
+    // The operation's own promise is native: it opens no node.
+    const promise = new NativePromise<unknown>((resolve, reject) => { entry = { effect: plain, key, resolve, reject, decode }; });
+    this.segment.push(entry);
+    return promise;
   }
 
   private answer(response: RoundResponse): void {
@@ -255,7 +380,8 @@ class RoundRun {
       this.answer({ kind: "completedRound", result, replayed });
       return;
     }
-    const segment = this.segment;
+    // Depth-first order of the async call tree (independent of microtask hops).
+    const segment = this.segment.sort((a, b) => compareKeys(a.key, b.key));
     this.segment = [];
     if (segment.length === 0) {
       this.answer({ kind: "failed", error: failure("InvalidInput", "async export is waiting on something that is not a host operation; only `cx.call` promises can be awaited (no timers, channels or other executors)"), replayed });
@@ -277,6 +403,13 @@ class RoundRun {
     // Replay: the kernel hashes every re-derived plan and compares it with
     // the tape; outcomes resolve the segment's operations in index order.
     replayed.push(plan);
+    // L-2: the kernel's text of the tape plan, when it sent one, catches a
+    // divergence here, before this round's outcomes reach the wrong calls.
+    const expected = this.request.tape_plans?.[this.cursor];
+    if (typeof expected === "string" && canonicalRoundPlan(plan) !== expected) {
+      this.answer({ kind: "failed", error: failure("Protocol", `non-deterministic guest: the plan re-derived for effect round ${this.cursor + 1} differs from the tape`), replayed });
+      return;
+    }
     const outcomes = tape[this.cursor].outcomes ?? [];
     this.cursor += 1;
     segment.forEach((registered, index) => {
@@ -315,7 +448,19 @@ export function startAsyncRound(handler: AsyncHandler, request: RoundRequest, wr
   return step;
 }
 
-/** Install the step hook the async build's banner calls on re-entry. */
+/** Install the step hook the async build's step export calls on re-entry. */
 export function installStepHook(step: () => void): void {
   Object.defineProperty(globalThis, STEP_HOOK, { value: step, writable: false, enumerable: false, configurable: true });
+}
+
+/**
+ * The build probe (`probeAsyncBuild`, axiom-typescript-managed-abi finish):
+ * a job installs a step hook that answers in the next engine step. Without
+ * Javy's event loop the engine aborts with the job pending; without the step
+ * export the answer never comes; without the async lowering it names that.
+ */
+export function probeAsyncBuild(write: (response: unknown) => void): void {
+  NativePromise.resolve().then(() => installStepHook(() => write(LOWERED_ASYNC
+    ? { kind: "asyncBuildOk" }
+    : { kind: "failed", error: failure("InvalidInput", "AXIOM_MANAGED_ASYNC_BUILD: the bundle was not built with async/await lowered to generators (esbuild --supported:async-await=false); the plan order of async exports would depend on microtask hops") })));
 }
