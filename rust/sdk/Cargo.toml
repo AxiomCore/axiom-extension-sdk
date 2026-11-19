@@ -10,7 +10,10 @@ keywords = ["axiom", "extensions", "wasm", "sdk"]
 [features]
 default = ["std"]
 std = ["axiom-extension-abi/std"]
+# X9d: `TestHost::from_tape` (dev replay tapes). Test-only; never in a guest.
+replay-tape = ["std", "dep:serde_json"]
 
 [dependencies]
 axiom-extension-abi = { path = "../abi", version = "1.1.0", default-features = false }
 axiom-extension-sdk-derive = { path = "../sdk-derive", version = "0.1.4" }
+serde_json = { version = "1", optional = true }

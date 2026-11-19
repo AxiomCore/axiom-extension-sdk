@@ -35,6 +35,7 @@ PAIRS = [
     ("typescript/src/runner-async.ts", "extensions/typescript/sdk/src/runner-async.ts"),
     ("typescript/src/schema.ts", "extensions/typescript/sdk/src/schema.ts"),
     ("typescript/src/schema-runtime.ts", "extensions/typescript/sdk/src/schema-runtime.ts"),
+    ("typescript/src/replay.ts", "extensions/typescript/sdk/src/replay.ts"),
     ("python/axiom_extension_sdk/__init__.pyi", "extensions/python/sdk/axiom_extension_sdk/__init__.pyi"),
 ]
 
