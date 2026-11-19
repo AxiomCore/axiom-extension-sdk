@@ -31,6 +31,7 @@ PAIRS = [
     ("rust/sdk-derive/src/lib.rs", "extensions/sdk-derive/src/lib.rs"),
     ("typescript/src/index.ts", "extensions/typescript/sdk/src/index.ts"),
     ("typescript/src/runner.ts", "extensions/typescript/sdk/src/runner.ts"),
+    ("typescript/src/async.ts", "extensions/typescript/sdk/src/async.ts"),
     ("typescript/src/schema.ts", "extensions/typescript/sdk/src/schema.ts"),
     ("typescript/src/schema-runtime.ts", "extensions/typescript/sdk/src/schema-runtime.ts"),
     ("python/axiom_extension_sdk/__init__.pyi", "extensions/python/sdk/axiom_extension_sdk/__init__.pyi"),
