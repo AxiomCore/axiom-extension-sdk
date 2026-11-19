@@ -84,7 +84,11 @@ export interface ExtensionContext {
   authenticated_request(namespace:string,operation:string,path:string,body:Uint8Array|readonly number[],secret:SecretHandle):Effect;
   snapshot(resource: string): StateSnapshot;
   patch(resource: string): PatchBuilder;
+  /** Yield an effect plan: either the plan built with {@link Effects} (typed tickets) or raw effects. */
+  effects(plan: Effects): Yielded;
   effects(...effects: Effect[]): Yielded;
+  /** A new effect plan; `plan.call(effect)` returns a typed {@link Ticket}. */
+  plan(): Effects;
   complete(output?: unknown, changes?: Partial<InvocationResult>): Completed;
 }
 
@@ -98,17 +102,131 @@ export interface ResumeContext {
   requestId?: number;
   outcomes: unknown[];
   events: unknown[];
+  /**
+   * Decode the outcome of the host call that issued `ticket`, typed as the
+   * operation's output. A ticket from another plan or yield step throws.
+   */
+  get<O>(ticket: Ticket<O>): O;
+  /** A new effect plan, for rebuilding the yielded plan's tickets in this exchange. */
+  plan(): Effects;
+  /**
+   * Positional outcome access.
+   * @deprecated Use typed tickets: `const t = plan.call(op.call(input))`, then `resume.get(t)`.
+   */
   outcome(index: number): unknown;
   complete(output?: unknown): Completed;
 }
+
+declare const ticketBrand: unique symbol;
+/**
+ * A typed claim on the outcome of one host call in one effect plan, returned
+ * by {@link Effects.call}. Only the SDK can issue one; `index` is the ABI
+ * outcome index (declaration order). `O` is invariant.
+ */
+export interface Ticket<O> {
+  readonly index: number;
+  readonly [ticketBrand]: (value: O) => O;
+}
+
+declare const outputBrand: unique symbol;
+/** An effect whose outcome decodes as `O`. A plain {@link Effect} is a `TypedEffect<unknown>`. */
+export type TypedEffect<O> = Effect & { readonly [outputBrand]?: (value: O) => O };
+
+/** A typed host operation: `op.call(input)` is a {@link TypedEffect} for {@link Effects.call}. */
+export interface Operation<I, O> {
+  readonly namespace: string;
+  readonly operation: string;
+  call(input: I): TypedEffect<O>;
+}
+
+// Guest-local bookkeeping. Nothing here reaches the wire: plan bytes are the
+// effect objects exactly as given, in call order.
+type Decoder = (value: AxiomValue) => unknown;
+const effectDecoders = new WeakMap<object, Decoder>();
+const tickets = new WeakMap<object, { plan: Effects; index: number; decode?: Decoder }>();
+const planEffects = new WeakMap<Effects, { effects: Effect[]; sealed: boolean }>();
+/** The plan most recently yielded in this JavaScript heap, if any. */
+let lastYielded: Effects | undefined;
+
+class IssuedTicket {
+  constructor(readonly index: number) { Object.freeze(this); }
+}
+
+/** Attach an output decoder (and type) to an effect. The effect object itself is unchanged. */
+export function typedEffect<O>(effect: Effect, decode?: (value: AxiomValue) => O): TypedEffect<O> {
+  if (decode) effectDecoders.set(effect, decode);
+  return effect as TypedEffect<O>;
+}
+
+/** Declare a typed host operation. Without a codec the input is `encodeValue`d and the output `decodeValue`d. */
+export function operation<I = unknown, O = unknown>(namespace: string, operation: string,
+  codec: { encode?: (input: I) => AxiomValue; decode?: (value: AxiomValue) => O } = {}): Operation<I, O> {
+  return Object.freeze({ namespace, operation,
+    call(input: I): TypedEffect<O> {
+      return typedEffect<O>({ namespace, operation, input: codec.encode ? codec.encode(input) : encodeValue(input) }, codec.decode);
+    } });
+}
+
+/**
+ * An effect plan built call by call. `plan.call(effect)` returns a typed
+ * {@link Ticket}; yield the plan with `context.effects(plan)` or
+ * {@link yieldFor}. The yielded bytes equal `context.effects(...effects)`.
+ */
+export class Effects {
+  constructor() { planEffects.set(this, { effects: [], sealed: false }); }
+
+  call<O>(effect: TypedEffect<O>): Ticket<O> {
+    const state = planEffects.get(this)!;
+    if (state.sealed) throw new Error("effect plan was already yielded or read; build a new plan");
+    if (effect === null || typeof effect !== "object") throw new Error("effect plan entries must be effects");
+    const ticket = new IssuedTicket(state.effects.length);
+    tickets.set(ticket, { plan: this, index: state.effects.length, decode: effectDecoders.get(effect) });
+    state.effects.push(effect);
+    return ticket as unknown as Ticket<O>;
+  }
+
+  /** Number of host calls in the plan. */
+  get length(): number { return planEffects.get(this)!.effects.length; }
+}
+
+/** Suspend the invocation while the host runs `plan`; continue in `resume`. */
+export function yieldFor(plan: Effects): Yielded {
+  const state = planEffects.get(plan);
+  if (!state) throw new Error("yieldFor expects an Effects plan");
+  state.sealed = true;
+  lastYielded = plan;
+  return { kind: "yielded", plan: { effects: [...state.effects] } };
+}
+
 export function createResumeContext(outcomes: unknown[], events: unknown[], requestId?: number): ResumeContext {
+  // When this heap yielded the plan being resumed, tickets must come from it.
+  // Hosts that run every exchange in a fresh engine keep no such record; then
+  // the first ticket read binds the resume to its plan.
+  const expected = lastYielded;
+  lastYielded = undefined;
+  let bound: Effects | undefined;
+  const read = (index: number): AxiomValue => {
+    if (!Number.isSafeInteger(index) || index < 0 || index >= outcomes.length) throw new Error("host outcome is unavailable");
+    const outcome = outcomes[index] as {index?: number; result?: {Ok?: AxiomValue; Err?: unknown}};
+    if (!outcome || outcome.index !== index || !outcome.result || !("Ok" in outcome.result) || "Err" in outcome.result) throw new Error("host operation denied");
+    return outcome.result.Ok!;
+  };
   return {outcomes, events, requestId,
-    outcome(index) {
-      if (!Number.isSafeInteger(index) || index < 0 || index >= outcomes.length) throw new Error("host outcome is unavailable");
-      const outcome = outcomes[index] as {index?: number; result?: {Ok?: AxiomValue; Err?: unknown}};
-      if (!outcome || outcome.index !== index || !outcome.result || !("Ok" in outcome.result) || "Err" in outcome.result) throw new Error("host operation denied");
-      return decodeValue(outcome.result.Ok!);
+    get<O>(ticket: Ticket<O>): O {
+      const issued = ticket !== null && typeof ticket === "object" ? tickets.get(ticket) : undefined;
+      if (!issued) throw new Error("expected an effect ticket issued by Effects.call");
+      if (expected ? issued.plan !== expected : bound !== undefined && issued.plan !== bound) {
+        throw new Error(expected ? "effect ticket belongs to another effect plan or yield step" : "effect tickets from different effect plans were read in one resume");
+      }
+      bound = issued.plan;
+      const state = planEffects.get(issued.plan)!;
+      state.sealed = true;
+      if (state.effects.length !== outcomes.length) throw new Error(`effect ticket belongs to a plan of ${state.effects.length} call(s), but this resume carries ${outcomes.length} outcome(s)`);
+      const value = read(issued.index);
+      return (issued.decode ? issued.decode(value) : decodeValue(value)) as O;
     },
+    plan() { return new Effects(); },
+    outcome(index) { return decodeValue(read(index)); },
     complete(output = null) {return {kind:"completed",result:{output:encodeValue(output),patches:[],transactions:[],emitted_events:[]}};},
   };
 }
@@ -179,9 +297,12 @@ export function createContext(invocation: Invocation): ExtensionContext {
       if (!snapshot) throw new Error(`cannot patch absent snapshot ${resource}`);
       return new PatchBuilder(resource, snapshot.revision);
     },
-    effects(...effects) {
-      return { kind: "yielded", plan: { effects } };
+    effects(...effects: Array<Effect | Effects>): Yielded {
+      if (effects.length === 1 && effects[0] instanceof Effects) return yieldFor(effects[0]);
+      if (effects.some((effect) => effect instanceof Effects)) throw new Error("yield one Effects plan, or raw effects");
+      return { kind: "yielded", plan: { effects: effects as Effect[] } };
     },
+    plan() { return new Effects(); },
     complete(output = null, changes = {}) {
       return {
         kind: "completed",
