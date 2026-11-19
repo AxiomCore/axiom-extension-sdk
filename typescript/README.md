@@ -30,6 +30,72 @@ workspace. Use the exact SDK, generated selection and managed toolchain from
 that cohort. These working candidate capabilities do not establish registry
 publication or browser/mobile qualification.
 
+## Async exports: rounds, replay, determinism
+
+ABI 1.1 (X8d) lets an export await host operations across several effect
+rounds. Write it as an `async` function; `cx.call(effect)` starts a host
+operation and returns a promise of its typed output.
+
+```ts
+import { defineExtension, extension, operation, type AsyncContext, type Selector } from "@axiomcore/extension-sdk";
+
+const loadUser = operation<{ id: number }, { id: number; tier: string }>("catalog", "user");
+const priceOf = operation<string, number>("catalog", "price");
+const stockOf = operation<number, number>("catalog", "stock");
+const TOTAL = "total" as Selector<number>;
+
+export default defineExtension({
+  exports: {
+    apply: extension.export(async (cx: AsyncContext, input: { id: number }) => {
+      const user = await cx.call(loadUser.call({ id: input.id }));             // round 1
+      const [price, stock] = await Promise.all([                                // round 2: one group
+        cx.call(priceOf.call(user.tier)),
+        cx.call(stockOf.call(user.id)),
+      ]);
+      return cx.complete({ price, stock }, { patches: [cx.patch("ui:cart").set(TOTAL, price * stock).build()] });
+    }),
+  },
+});
+```
+
+- `extension.export(fn)` makes an `async` function an async export; any other
+  function stays a 1.0 handler. `asyncExport(fn)` marks a function that returns
+  a promise without being `async`. Sync and async exports can share a module.
+- **Rounds.** An operation registers when `cx.call` is called. When every job
+  has run and the export is still waiting, the operations registered since the
+  last stop form one round: one operation is a plan, 2 to 32 are one `Collect`
+  group (branches `b0`, `b1`, ...; `limit` is `min(n, 8)`), more than 32 fail
+  with `Exhausted`. `Promise.all` therefore batches by itself; sequential
+  awaits take one round each. The package's `maxEffects` and the authority's
+  `maxRounds` (yields) still apply.
+- **Replay.** Every round runs the export from the top in a fresh engine, with
+  the results of earlier rounds answered from the host's tape. Nothing survives
+  between rounds (module variables start fresh every round). A round that
+  re-derives a different plan than the tape fails with `Protocol`
+  ("non-deterministic guest") and nothing commits.
+- **Determinism.** Do not let anything but host results decide which
+  operations you call: not `cx.round()`, not `Date.now()` (always 0) or
+  `Math.random()` (a fixed sequence). The engine has no timers, `WeakRef`,
+  `FinalizationRegistry` or `performance`; awaiting anything that never
+  settles fails the invocation with `InvalidInput`. Time and randomness come
+  from host operations, which are on the tape.
+- **Awkward cases.** A promise you never await still runs with its round; its
+  result is discarded (registered operations are never withdrawn). Operations
+  still pending when the export returns are never sent. Awaiting one promise
+  twice gives its value twice. `Promise.race`/`Promise.any` are deterministic:
+  all operations of a round finish together and settle in registration order,
+  so the first registered wins, and the others still run.
+- **Errors.** A failed operation rejects with `HostOperationError` (`code`,
+  `message`, `retryable`). If it escapes the export, the invocation fails with
+  that code; any other exception fails it with `Guest`. Nothing commits.
+- **Build.** An async module is built with the Javy event loop, the async step
+  banner and the static ABI 1.1 marker, and is packaged as
+  `axiom-extension-abi` 1.1.0 (contract `x8d-managed-async.md`). Under the 1.0
+  build an async export refuses to run.
+- **Cost.** Replay re-runs the prefix every round, and the fuel budget and
+  deadline cover all rounds together. A small TypeScript guest uses about
+  2 G of the default 30 G managed fuel and 0.4 s for 16 yields.
+
 ## Typed tickets
 
 ```ts

@@ -31,6 +31,57 @@ workspace. Candidate source support does not imply a published package version
 or browser/mobile qualification; use the exact generated interface and managed
 toolchain selected by the CLI.
 
+## Async exports: rounds, replay, determinism
+
+ABI 1.1 (X8d) lets an export await host operations across several effect
+rounds. `asyncio` is not available in the AOT profile; `gather` comes from the
+SDK.
+
+```python
+from axiom_extension_sdk import AsyncContext, HostOperationError, extension, gather, typed_effect
+
+def user_of(id): return typed_effect("catalog", "user", {"Unsigned": id}, dict)
+def price_of(tier): return typed_effect("catalog", "price", {"String": tier}, int)
+def stock_of(id): return typed_effect("catalog", "stock", {"Unsigned": id}, int)
+
+@extension.export
+async def apply(cx: AsyncContext, input):
+    user = await cx.call(user_of(input["id"]))                            # round 1
+    price, stock = await gather(cx.call(price_of(user["tier"])), cx.call(stock_of(user["id"])))  # round 2: one group
+    return cx.complete({"price": price, "stock": stock},
+                       patches=[cx.patch("ui:cart").set("total", price * stock).build()])
+```
+
+- Coroutines are lazy, as in CPython: `cx.call(effect)` and calling an
+  `async def` start nothing until they are awaited or passed to `gather`, so
+  `gather(a, b)` registers `a`'s operations before `b`'s (the Rust `join!`
+  order). Operations started before the export waits form one round: one is a
+  plan, 2 to 32 are one `Collect` group, more than 32 fail with `Exhausted`.
+- Supported: `async def` (exports, helpers, methods, closures, recursion),
+  `await` of coroutines, `cx.call(...)` and `gather(...)` (also awaited twice),
+  `gather(..., return_exceptions=True)`, `try`/`except`/`finally` and `with`
+  around awaits, awaits in `for`/`while`/`if`/`match`, conditional expressions
+  and list/set/dict comprehensions (evaluated in order). Rejected at compile
+  time with a diagnostic: `async for`, `async with`, asynchronous
+  comprehensions, `await` in generator expressions, asynchronous generators,
+  `await` outside `async def`, an `async def` resume. See
+  `axiom-build/python/PROFILE-LIMITATIONS.md`.
+- **Replay and determinism** are as for TypeScript: every round runs the
+  export from the top in a fresh engine with earlier results from the host's
+  tape; a re-derived plan that differs is `Protocol` and nothing commits.
+  Module globals start fresh every round; `time` and `random` are
+  deterministic; do not let `cx.round()` decide which operations run.
+- **Errors.** A failed operation raises `HostOperationError` (`code`,
+  `retryable`); escaping the export it fails the invocation with that code.
+  Other exceptions fail it with `Guest`.
+- Under CPython (editor, tests) `gather` is `asyncio.gather`, so the same
+  program runs under real `asyncio`; axiom-build's async differential suite
+  compares the two.
+- **Cost.** Every round re-initialises the Python runtime (about 1.5 G managed
+  fuel and 0.1 s) and each replayed stall needs about 0.7 MiB more memory, so
+  the default budgets (30 G fuel, 1 s, 64 pages) fit one yield. Async Python
+  guests need a larger `maxMemoryPages` (about 64 + 11 per yield) and deadline.
+
 ## Typed tickets
 
 ```python

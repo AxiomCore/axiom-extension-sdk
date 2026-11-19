@@ -1,4 +1,9 @@
 export { Cents, Percentage } from "./money.js";
+export {
+  EFFECT_GROUP_FORMAT, HostOperationError, MAX_GROUP_BRANCHES, asyncExport, asyncHandlerOf, extension, segmentPlan,
+  type AsyncContext, type AsyncExport, type AsyncHandler,
+} from "./async.js";
+import type { AsyncExport } from "./async.js";
 
 export type AxiomValue =
   | "Null"
@@ -96,7 +101,8 @@ export interface ExtensionContext {
 
 export type ExtensionHandler = (context: ExtensionContext) => ExtensionResponse;
 export interface ExtensionDefinition {
-  exports: Record<string, ExtensionHandler>;
+  /** 1.0 handlers, and async exports (`asyncExport`, ABI 1.1 rounds). */
+  exports: Record<string, ExtensionHandler | AsyncExport>;
   resume?: (context: ResumeContext) => ExtensionResponse;
 }
 
@@ -161,6 +167,11 @@ let invocationGeneration = 0;
 
 class IssuedTicket {
   constructor(readonly index: number) { Object.freeze(this); }
+}
+
+/** The output decoder attached to `effect` by {@link typedEffect} or {@link operation}, if any. */
+export function effectDecoder(effect: object): ((value: AxiomValue) => unknown) | undefined {
+  return effect !== null && typeof effect === "object" ? effectDecoders.get(effect) : undefined;
 }
 
 /** Attach an output decoder (and type) to an effect. The effect object itself is unchanged. */
