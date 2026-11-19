@@ -151,9 +151,11 @@ export interface Operation<I, O> {
 type Decoder = (value: AxiomValue) => unknown;
 const effectDecoders = new WeakMap<object, Decoder>();
 const tickets = new WeakMap<object, { plan: Effects; index: number; decode?: Decoder }>();
-const planEffects = new WeakMap<Effects, { effects: Effect[]; sealed: boolean }>();
+const planEffects = new WeakMap<Effects, { effects: Effect[]; sealed: boolean; yieldedIn?: number }>();
 /** The plan most recently yielded in this JavaScript heap, if any. */
 let lastYielded: Effects | undefined;
+/** Counts invocations started in this heap; a yielded plan records its invocation. */
+let invocationGeneration = 0;
 
 class IssuedTicket {
   constructor(readonly index: number) { Object.freeze(this); }
@@ -210,6 +212,7 @@ export function yieldFor(plan: Effects): Yielded {
   const state = planEffects.get(plan);
   if (!state) throw new Error("yieldFor expects an Effects plan");
   state.sealed = true;
+  state.yieldedIn = invocationGeneration;
   lastYielded = plan;
   return { kind: "yielded", plan: { effects: [...state.effects] } };
 }
@@ -318,6 +321,8 @@ export function createResumeContext(outcomes: unknown[], events: unknown[], requ
       if (!issued) throw new Error("expected an effect ticket issued by Effects.call");
       if (bound !== undefined && issued.plan !== bound) throw new Error("effect tickets from different effect plans were read in one resume");
       const state = planEffects.get(issued.plan)!;
+      // A plan yielded by an earlier invocation in this heap never answers this one.
+      if (state.yieldedIn !== undefined && state.yieldedIn !== invocationGeneration) throw new Error("effect ticket belongs to another effect plan or yield step");
       if (bound === undefined) {
         if (expected && issued.plan !== expected) {
           if (!rebuilt.has(issued.plan)) throw new Error("effect ticket belongs to another effect plan or yield step");
@@ -394,6 +399,7 @@ export function createContext(invocation: Invocation): ExtensionContext {
   // A new invocation: a plan yielded by an earlier, abandoned request must not
   // be taken for the plan this request's resume answers.
   lastYielded = undefined;
+  invocationGeneration += 1;
   const snapshots = new Map(invocation.snapshots.map((item) => [item.resource, item]));
   return {
     invocation,

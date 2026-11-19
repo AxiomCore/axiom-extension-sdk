@@ -155,10 +155,14 @@ test('stale heap: an abandoned request\'s plan never answers a later raw-effects
   c = context();
   c.effects(name.call(2));
   let r = createResumeContext([ok(0, { String: 'B-result' })], [], 2);
-  // P's ticket is not B's plan: with no record left in the heap this is the
-  // fresh-engine path, bound to P; a host record rejects the mismatch.
+  // P was yielded by an earlier invocation: rejected even without a host record.
+  assert.throws(() => r.get(stale), /another effect plan or yield step/);
+  // Also with the host record of B's plan present.
   r = createResumeContext([ok(0, { String: 'B-result' })], [], 2, [call('catalog', 'name', '{"Unsigned":"2"}')]);
-  assert.throws(() => r.get(stale), /call 0 \(catalog\.name\) has a different input/);
+  assert.throws(() => r.get(stale), /another effect plan or yield step/);
+  // A fresh rebuild of P's call (not B's) fails on the host record.
+  const wrong = r.plan().push(name.call(1));
+  assert.throws(() => r.get(wrong), /call 0 \(catalog\.name\) has a different input/);
   // 2. A correct rebuild of B's raw plan is accepted (was falsely rejected).
   c = context();
   const q = c.plan();
