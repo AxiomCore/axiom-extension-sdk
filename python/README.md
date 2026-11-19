@@ -53,8 +53,15 @@ async def apply(cx: AsyncContext, input):
 ```
 
 - Coroutines are lazy, as in CPython: `cx.call(effect)` and calling an
-  `async def` start nothing until they are awaited or passed to `gather`, so
-  `gather(a, b)` registers `a`'s operations before `b`'s. Operations started
+  `async def` start nothing until they are awaited. `gather` is lazy too (as
+  Rust's `join!`): its arguments start, in argument order, when the gather is
+  awaited, so `gather(a, b)` registers `a`'s operations before `b`'s, also
+  when `b` is itself a `gather` (CPython would schedule the inner gather's
+  children first). `gather(...)` is fail-fast like Rust `try_join!` (the first
+  exception propagates and the other children are dropped: an operation they
+  already registered still runs, they register nothing more);
+  `gather(..., return_exceptions=True)` waits for every child like Rust
+  `join!` (CPython keeps running the other tasks of a failed gather). Operations started
   before the export waits form one round: one is a plan, 2 to 32 are one
   `Collect` group, more than 32 fail with `Exhausted`. Inside a round they are
   ordered depth first by where they were started in the call tree, the Rust
