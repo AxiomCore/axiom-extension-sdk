@@ -66,9 +66,20 @@ test('a plan rebuilt in the resume is accepted only with the yielded shape', () 
   ctx.effects(yielded);
   const resume = createResumeContext([ok(0, { String: 'n' }), ok(1, { Bool: true })], [], 1);
   const same = resume.plan();
-  const name = same.call(getName.call(0));
-  same.call(inStock.call(0));
+  const name = same.call(getName.call(1));
+  same.call(inStock.call(1));
   assert.equal(resume.get(name), 'n');
+  // The rebuild must repeat the inputs too (w1-f1, M1/L3).
+  const ctx2 = context();
+  const y2 = ctx2.plan();
+  y2.call(getName.call(1));
+  y2.call(inStock.call(1));
+  ctx2.effects(y2);
+  const other = createResumeContext([ok(0, { String: 'n' }), ok(1, { Bool: true })], [], 1);
+  const changed = other.plan();
+  const changedName = changed.call(getName.call(0));
+  changed.call(inStock.call(1));
+  assert.throws(() => other.get(changedName), /call 0 \(catalog\.name\) has a different input/);
   const again = ctx.plan();
   again.call(getName.call(1));
   again.call(inStock.call(1));
@@ -77,7 +88,7 @@ test('a plan rebuilt in the resume is accepted only with the yielded shape', () 
   const swapped = next.plan();
   const first = swapped.call(inStock.call(0));
   swapped.call(getName.call(0));
-  assert.throws(() => next.get(first), /calls different operations/);
+  assert.throws(() => next.get(first), /rebuilt effect plan differs from the yielded plan: call 0 is catalog\.stock, the yielded call 0 was catalog\.name/);
 });
 
 test('in a fresh engine the resume rebuilds the plan and cannot mix plans', () => {

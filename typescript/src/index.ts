@@ -87,7 +87,7 @@ export interface ExtensionContext {
   /** Yield an effect plan: either the plan built with {@link Effects} (typed tickets) or raw effects. */
   effects(plan: Effects): Yielded;
   effects(...effects: Effect[]): Yielded;
-  /** A new effect plan; `plan.call(effect)` returns a typed {@link Ticket}. */
+  /** A new effect plan; `plan.push(effect)` returns a typed {@link Ticket}. */
   plan(): Effects;
   complete(output?: unknown, changes?: Partial<InvocationResult>): Completed;
 }
@@ -109,14 +109,16 @@ export interface ResumeContext {
   get<O>(ticket: Ticket<O>): O;
   /**
    * A new effect plan for rebuilding the yielded plan's tickets in this
-   * exchange (managed hosts run every exchange in a fresh engine). When this
-   * heap still knows the yielded plan, the rebuilt plan must call the same
-   * operations in the same order.
+   * exchange (managed hosts run every exchange in a fresh engine). The rebuilt
+   * plan must make exactly the yielded calls (namespace, operation and input)
+   * in the same order: `get` checks it against the host's record of the
+   * yielded plan, or against this heap's own record, and throws naming the
+   * first call that differs.
    */
   plan(): Effects;
   /**
    * Positional outcome access.
-   * @deprecated Use typed tickets: `const t = plan.call(op.call(input))`, then `resume.get(t)`.
+   * @deprecated Use typed tickets: `const t = plan.push(op.call(input))`, then `resume.get(t)`.
    */
   outcome(index: number): unknown;
   complete(output?: unknown): Completed;
@@ -125,7 +127,7 @@ export interface ResumeContext {
 declare const ticketBrand: unique symbol;
 /**
  * A typed claim on the outcome of one host call in one effect plan, returned
- * by {@link Effects.call}. Only the SDK can issue one; `index` is the ABI
+ * by {@link Effects.push}. Only the SDK can issue one; `index` is the ABI
  * outcome index (declaration order). `O` is invariant.
  */
 export interface Ticket<O> {
@@ -137,7 +139,7 @@ declare const outputBrand: unique symbol;
 /** An effect whose outcome decodes as `O`. A plain {@link Effect} is a `TypedEffect<unknown>`. */
 export type TypedEffect<O> = Effect & { readonly [outputBrand]?: (value: O) => O };
 
-/** A typed host operation: `op.call(input)` is a {@link TypedEffect} for {@link Effects.call}. */
+/** A typed host operation: `op.call(input)` is a {@link TypedEffect} for {@link Effects.push}. */
 export interface Operation<I, O> {
   readonly namespace: string;
   readonly operation: string;
@@ -173,19 +175,22 @@ export function operation<I = unknown, O = unknown>(namespace: string, operation
 }
 
 /**
- * An effect plan built call by call. `plan.call(effect)` returns a typed
+ * An effect plan built call by call. `plan.push(effect)` returns a typed
  * {@link Ticket}; yield the plan with `context.effects(plan)` or
  * {@link yieldFor}. The yielded bytes equal `context.effects(...effects)`.
  */
 export class Effects {
   constructor() { planEffects.set(this, { effects: [], sealed: false }); }
 
+  /**
+   * Same as {@link Effects.push}.
+   * @deprecated Use `plan.push(effect)`, the spelling shared by TypeScript,
+   * Python and Rust (Rust's `Effects::call` is the by-value chain and returns
+   * no ticket; Python sources cannot use a member named `call`).
+   */
   call<O>(effect: TypedEffect<O>): Ticket<O> { return this.push(effect); }
 
-  /**
-   * Same as {@link Effects.call}. Python sources use `plan.push(effect)`: the
-   * AOT host bridge never exposes a member named `call`.
-   */
+  /** Add a host call to the plan; the returned ticket reads its typed outcome in the resume. */
   push<O>(effect: TypedEffect<O>): Ticket<O> {
     const state = planEffects.get(this)!;
     if (state.sealed) throw new Error("effect plan was already yielded or read; build a new plan");
@@ -209,13 +214,94 @@ export function yieldFor(plan: Effects): Yielded {
   return { kind: "yielded", plan: { effects: [...state.effects] } };
 }
 
-const shape = (plan: Effects): string => JSON.stringify(planEffects.get(plan)!.effects.map((effect) => [effect.namespace, effect.operation]));
+/**
+ * One yielded host call as the managed host echoes it on resume (host-internal
+ * bridge JSON, not the extension ABI). `input` is the input's canonical text,
+ * present while it fits the host's inline budget; `input_length` is that
+ * text's length, always present.
+ */
+export interface YieldedCall {
+  namespace: string;
+  operation: string;
+  input_length: number;
+  input?: string;
+}
 
-export function createResumeContext(outcomes: unknown[], events: unknown[], requestId?: number): ResumeContext {
+/**
+ * The canonical text of an ABI value. It must stay identical to
+ * `canonical_value` in the TypeScript kernel (`axiom-extension-typescript-kernel`):
+ * fixed key order, every integer as an exact decimal string, JSON string escaping.
+ */
+function canonicalValue(value: AxiomValue): string {
+  if (value === "Null") return "\"Null\"";
+  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "undefined";
+  const v = value as Record<string, any>;
+  if ("Bool" in v) return `{"Bool":${v.Bool === true}}`;
+  if ("Signed" in v) return `{"Signed":${JSON.stringify(String(v.Signed))}}`;
+  if ("Unsigned" in v) return `{"Unsigned":${JSON.stringify(String(v.Unsigned))}}`;
+  if ("String" in v) return `{"String":${JSON.stringify(String(v.String))}}`;
+  if ("Bytes" in v) return `{"Bytes":[${Array.from(v.Bytes as ArrayLike<number>, (byte) => String(byte)).join(",")}]}`;
+  if ("List" in v) return `{"List":[${(v.List as AxiomValue[]).map(canonicalValue).join(",")}]}`;
+  if ("Record" in v) return `{"Record":[${(v.Record as Array<{ name: string; value: AxiomValue }>).map((field) => `{"name":${JSON.stringify(String(field.name))},"value":${canonicalValue(field.value)}}`).join(",")}]}`;
+  if ("Variant" in v) {
+    const variant = v.Variant as { case: string; value: AxiomValue | null };
+    return `{"Variant":{"case":${JSON.stringify(String(variant.case))},"value":${variant.value == null ? "null" : canonicalValue(variant.value)}}}`;
+  }
+  if ("Handle" in v) {
+    const handle = v.Handle as { id: number | string; generation: number; kind: string };
+    return `{"Handle":{"id":${JSON.stringify(String(handle.id))},"generation":${String(handle.generation)},"kind":${JSON.stringify(String(handle.kind))}}}`;
+  }
+  return JSON.stringify(value) ?? "undefined";
+}
+
+const callName = (call: { namespace: string; operation: string }): string => `${call.namespace}.${call.operation}`;
+
+/** A description of the first call where `effects` differs from the host's record, or undefined when they match. */
+function differsFromYielded(effects: Effect[], yielded: YieldedCall[]): string | undefined {
+  if (effects.length !== yielded.length) return `the rebuilt plan has ${effects.length} call(s), the yielded plan had ${yielded.length}`;
+  for (let i = 0; i < effects.length; i++) {
+    const effect = effects[i];
+    const expected = yielded[i];
+    if (effect.namespace !== expected.namespace || effect.operation !== expected.operation)
+      return `call ${i} is ${callName(effect)}, the yielded call ${i} was ${callName(expected)}`;
+    const text = canonicalValue(effect.input);
+    if (text.length !== expected.input_length || (expected.input !== undefined && text !== expected.input))
+      return `call ${i} (${callName(effect)}) has a different input than the yielded call ${i}`;
+  }
+  return undefined;
+}
+
+/** The first call where two plans in this heap differ (namespace, operation or input), or undefined. */
+function differsFromPlan(effects: Effect[], yielded: Effect[]): string | undefined {
+  if (effects.length !== yielded.length) return `the rebuilt plan has ${effects.length} call(s), the yielded plan had ${yielded.length}`;
+  for (let i = 0; i < effects.length; i++) {
+    if (effects[i].namespace !== yielded[i].namespace || effects[i].operation !== yielded[i].operation)
+      return `call ${i} is ${callName(effects[i])}, the yielded call ${i} was ${callName(yielded[i])}`;
+    if (canonicalValue(effects[i].input) !== canonicalValue(yielded[i].input))
+      return `call ${i} (${callName(effects[i])}) has a different input than the yielded call ${i}`;
+  }
+  return undefined;
+}
+
+const validYieldedPlan = (plan: unknown): plan is YieldedCall[] => Array.isArray(plan) && plan.every((call) =>
+  call !== null && typeof call === "object" && typeof call.namespace === "string" && typeof call.operation === "string"
+  && Number.isSafeInteger(call.input_length) && call.input_length >= 0
+  && (call.input === undefined || (typeof call.input === "string" && call.input.length === call.input_length)));
+
+/**
+ * The resume context for one exchange. `yieldedPlan` is the managed host's
+ * record of the yielded plan (host-internal bridge field `yielded_plan`); when
+ * present, the plan whose tickets are read must make exactly those calls.
+ * Without it (an older host) only the call count is checked.
+ */
+export function createResumeContext(outcomes: unknown[], events: unknown[], requestId?: number, yieldedPlan?: unknown): ResumeContext {
   // When this heap yielded the plan being resumed, tickets must come from it
-  // or from a plan rebuilt with `resume.plan()` that calls the same operations.
-  // Hosts that run every exchange in a fresh engine keep no such record; then
+  // or from a plan rebuilt with `resume.plan()` that makes the same calls.
+  // Hosts that run every exchange in a fresh engine keep no such record in
+  // the heap; they echo the yielded plan instead (`yieldedPlan`). Either way
   // the first ticket read binds the resume to its plan.
+  if (yieldedPlan !== undefined && yieldedPlan !== null && !validYieldedPlan(yieldedPlan)) throw new Error("malformed yielded plan record from the managed host");
+  const hostRecord = yieldedPlan == null ? undefined : yieldedPlan;
   const expected = lastYielded;
   lastYielded = undefined;
   const rebuilt = new WeakSet<Effects>();
@@ -231,12 +317,19 @@ export function createResumeContext(outcomes: unknown[], events: unknown[], requ
       const issued = ticket !== null && typeof ticket === "object" ? tickets.get(ticket) : undefined;
       if (!issued) throw new Error("expected an effect ticket issued by Effects.call");
       if (bound !== undefined && issued.plan !== bound) throw new Error("effect tickets from different effect plans were read in one resume");
-      if (expected && issued.plan !== expected) {
-        if (!rebuilt.has(issued.plan)) throw new Error("effect ticket belongs to another effect plan or yield step");
-        if (shape(issued.plan) !== shape(expected)) throw new Error("rebuilt effect plan calls different operations than the yielded plan");
+      const state = planEffects.get(issued.plan)!;
+      if (bound === undefined) {
+        if (expected && issued.plan !== expected) {
+          if (!rebuilt.has(issued.plan)) throw new Error("effect ticket belongs to another effect plan or yield step");
+          const difference = differsFromPlan(state.effects, planEffects.get(expected)!.effects);
+          if (difference) throw new Error(`rebuilt effect plan differs from the yielded plan: ${difference}`);
+        }
+        if (hostRecord) {
+          const difference = differsFromYielded(state.effects, hostRecord);
+          if (difference) throw new Error(`rebuilt effect plan differs from the yielded plan: ${difference}`);
+        }
       }
       bound = issued.plan;
-      const state = planEffects.get(issued.plan)!;
       state.sealed = true;
       if (state.effects.length !== outcomes.length) throw new Error(`effect ticket belongs to a plan of ${state.effects.length} call(s), but this resume carries ${outcomes.length} outcome(s)`);
       const value = read(issued.index);
@@ -298,6 +391,9 @@ export class PatchBuilder {
 }
 
 export function createContext(invocation: Invocation): ExtensionContext {
+  // A new invocation: a plan yielded by an earlier, abandoned request must not
+  // be taken for the plan this request's resume answers.
+  lastYielded = undefined;
   const snapshots = new Map(invocation.snapshots.map((item) => [item.resource, item]));
   return {
     invocation,
@@ -317,6 +413,7 @@ export function createContext(invocation: Invocation): ExtensionContext {
     effects(...effects: Array<Effect | Effects>): Yielded {
       if (effects.length === 1 && effects[0] instanceof Effects) return yieldFor(effects[0]);
       if (effects.some((effect) => effect instanceof Effects)) throw new Error("yield one Effects plan, or raw effects");
+      lastYielded = undefined;
       return { kind: "yielded", plan: { effects: effects as Effect[] } };
     },
     plan() { return new Effects(); },
