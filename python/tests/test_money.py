@@ -146,6 +146,14 @@ class NoImplicitConversion(unittest.TestCase):
         self.assertEqual(Percentage(50).of(Cents(10_000)), Cents(50))
         self.assertEqual(Percentage.from_whole(50).of(Cents(10_000)), Cents(5_000))
 
+    def test_package_root_reexports_the_money_names(self) -> None:
+        import axiom_extension_sdk
+
+        self.assertIs(axiom_extension_sdk.Cents, Cents)
+        self.assertIs(axiom_extension_sdk.Percentage, Percentage)
+        stub = (ROOT / "python" / "axiom_extension_sdk" / "__init__.pyi").read_text(encoding="utf-8")
+        self.assertIn("from .money import Cents as Cents, Percentage as Percentage", stub)
+
 
 if __name__ == "__main__":
     unittest.main()

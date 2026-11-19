@@ -6,6 +6,8 @@ building or running an extension. The host supplies the real context.
 
 from typing import Any, Callable, Generic, Mapping, Protocol, TypedDict, TypeVar, overload
 
+from .money import Cents, Percentage
+
 T = TypeVar("T", bound=Callable[..., object])
 ValueT = TypeVar("ValueT")
 O = TypeVar("O")

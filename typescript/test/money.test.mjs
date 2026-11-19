@@ -131,3 +131,16 @@ test("instances, classes and prototypes are frozen; constructors are module-priv
   assert.throws(() => Percentage.fromWhole(5).of(5), { name: "TypeError", message: "expected Cents" });
   assert.throws(() => Percentage.fromWhole(5).compare(evil), { name: "TypeError", message: "expected Percentage" });
 });
+
+test("Cents and Percentage are exported from the package root and the ./money subpath", async () => {
+  const root = await import("../dist/index.js");
+  assert.equal(root.Cents, Cents);
+  assert.equal(root.Percentage, Percentage);
+  const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+  assert.deepEqual(pkg.exports["./money"], { types: "./dist/money.d.ts", default: "./dist/money.js" });
+  // Self-reference through the package name resolves the subpath exactly as a consumer would.
+  const sub = await import("@axiomcore/extension-sdk/money");
+  assert.equal(sub.Cents, Cents);
+  const viaName = await import("@axiomcore/extension-sdk");
+  assert.equal(viaName.Percentage, Percentage);
+});
