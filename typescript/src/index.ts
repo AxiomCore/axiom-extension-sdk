@@ -248,7 +248,7 @@ export interface YieldedCall {
  * `canonical_value` in the TypeScript kernel (`axiom-extension-typescript-kernel`):
  * fixed key order, every integer as an exact decimal string, JSON string escaping.
  */
-function canonicalValue(value: AxiomValue): string {
+export function canonicalValue(value: AxiomValue): string {
   if (value === "Null") return "\"Null\"";
   if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "undefined";
   const v = value as Record<string, any>;
