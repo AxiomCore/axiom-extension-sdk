@@ -59,7 +59,8 @@ use abi::{
 };
 use alloc::{boxed::Box, format, string::String, vec::Vec};
 use core::{
-    cell::RefCell,
+    any::Any,
+    cell::{Cell, RefCell},
     future::Future,
     marker::PhantomData,
     pin::Pin,
@@ -111,15 +112,25 @@ struct RunState {
 /// (input and round-1 snapshots) and the final patches.
 pub struct Cx {
     invocation: TypedInvocation,
+    /// The export input, held outside `invocation` when the export's input
+    /// parameter is `Value` ([`AsyncExports::input_moves`]): it is moved into
+    /// the argument instead of being cloned, once per round.
+    moved_input: RefCell<Option<Value>>,
+    /// The export input was moved into the export's `Value` argument.
+    input_taken: Cell<bool>,
     round: u16,
     max_rounds: u16,
     state: RefCell<RunState>,
 }
 
 impl Cx {
-    fn new(request: RoundInvocation) -> Self {
+    fn new(request: RoundInvocation, move_input: bool) -> Self {
+        let mut invocation = request.invocation;
+        let moved_input = move_input.then(|| core::mem::replace(&mut invocation.input, Value::Null));
         Self {
-            invocation: TypedInvocation::new(request.request_id, request.invocation),
+            invocation: TypedInvocation::new(request.request_id, invocation),
+            moved_input: RefCell::new(moved_input),
+            input_taken: Cell::new(false),
             round: request.round,
             max_rounds: request.max_rounds,
             state: RefCell::new(RunState {
@@ -149,13 +160,49 @@ impl Cx {
 
     /// The invocation: export name, input and the round-1 snapshots (use it
     /// with `UiState::generated` / `Store::generated` as in sync exports).
+    ///
+    /// In an export whose input parameter is `Value`, the input is moved into
+    /// that argument (no per-round copy), so `invocation().input()` sees
+    /// `Null` there; read the argument instead.
     pub fn invocation(&self) -> &TypedInvocation {
         &self.invocation
     }
 
     /// The export input decoded as `T`.
+    ///
+    /// In an export whose input parameter is `Value`, the input was moved
+    /// into that argument and this returns `InvalidInput`; read the argument.
     pub fn input<T: AxiomDecode>(&self) -> Result<T> {
+        if let Some(value) = self.moved_input.borrow().as_ref() {
+            return T::decode(value);
+        }
+        if self.input_taken.get() {
+            return Err(SdkError::invalid_input(
+                "the export input was moved into the export's `Value` argument; read it from the argument",
+            ));
+        }
         self.invocation.input()
+    }
+
+    /// The export's input argument (used by `#[extension]` for exports whose
+    /// input parameter is `Value`): moved, not cloned, when it was held aside
+    /// for this export; otherwise decoded as usual.
+    #[doc(hidden)]
+    pub fn __export_input<T: AxiomDecode + 'static>(&self) -> Result<T> {
+        let Some(value) = self.moved_input.borrow_mut().take() else {
+            return self.input();
+        };
+        self.input_taken.set(true);
+        let mut slot = Some(value);
+        if let Some(moved) = (&mut slot as &mut dyn Any).downcast_mut::<Option<T>>() {
+            if let Some(moved) = moved.take() {
+                return Ok(moved);
+            }
+        }
+        match slot {
+            Some(value) => T::decode(&value),
+            None => Err(SdkError::invalid_input("the export input is missing")),
+        }
     }
 
     /// The 1-based invoke number of this run. It changes from round to round:
@@ -423,7 +470,90 @@ pub fn run_round<S>(request: RoundInvocation, start: S) -> RoundStep
 where
     S: for<'cx> FnOnce(&'cx Cx) -> Option<LocalBoxFuture<'cx, Result<Value>>>,
 {
-    let cx = Cx::new(request);
+    run_round_with(request, false, &mut PlanMemo::default(), start)
+}
+
+/// Plan hashes of one invocation, kept by the warm instance between rounds
+/// (H-1). Entry `k` is the plan of effect round `k + 1` as first replayed,
+/// with `round_plan_hash` of it (the plan is moved in, not copied). A later
+/// replayed plan that is equal to entry `k` reuses its hash instead of
+/// hashing it again, so each plan is hashed once per instance instead of
+/// once per later round (N hashes for N yields instead of N(N+1)/2).
+///
+/// This is memoisation of a pure function: the hash used is always the hash
+/// of the plan the guest re-derived, so every replay check (a different
+/// plan, an altered tape hash, a reordered tape) gives exactly the result it
+/// gives without the memo. It is not continuation state: an empty memo (a
+/// fresh instance, another invocation) just hashes.
+#[derive(Default)]
+pub(crate) struct PlanMemo {
+    request_id: Option<RequestId>,
+    plans: Vec<(RoundPlan, PlanHash)>,
+}
+
+impl PlanMemo {
+    /// Keep the entries only for `request_id` and only for the tape the host
+    /// sent (a fresh invocation or a shorter tape starts over).
+    fn begin(&mut self, request_id: RequestId, tape_len: usize) {
+        if self.request_id != Some(request_id) {
+            self.request_id = Some(request_id);
+            self.plans.clear();
+        }
+        self.plans.truncate(tape_len);
+    }
+
+    /// `round_plan_hash(plan)` for tape position `k`.
+    fn hash(&mut self, k: usize, plan: RoundPlan) -> PlanHash {
+        if let Some((known, hash)) = self.plans.get(k) {
+            if *known == plan {
+                return *hash;
+            }
+        }
+        let hash = abi::round_plan_hash(&plan);
+        // Only a contiguous prefix is kept, so entry `k` follows entry `k - 1`.
+        if self.plans.len() >= k {
+            self.plans.truncate(k);
+            self.plans.push((plan, hash));
+        }
+        hash
+    }
+
+    fn clear(&mut self) {
+        self.request_id = None;
+        self.plans.clear();
+    }
+}
+
+/// [`run_round`], holding the input aside when `move_input` is set so the
+/// export's `Value` argument takes it without a copy
+/// ([`AsyncExports::input_moves`]), and reusing plan hashes from `memo`.
+fn run_round_with<S>(
+    request: RoundInvocation,
+    move_input: bool,
+    memo: &mut PlanMemo,
+    start: S,
+) -> RoundStep
+where
+    S: for<'cx> FnOnce(&'cx Cx) -> Option<LocalBoxFuture<'cx, Result<Value>>>,
+{
+    memo.begin(request.request_id, request.tape.len());
+    let step = run_round_memo(request, move_input, memo, start);
+    if !matches!(step, RoundStep::Yielded { .. }) {
+        memo.clear();
+    }
+    step
+}
+
+fn run_round_memo<S>(
+    request: RoundInvocation,
+    move_input: bool,
+    memo: &mut PlanMemo,
+    start: S,
+) -> RoundStep
+where
+    S: for<'cx> FnOnce(&'cx Cx) -> Option<LocalBoxFuture<'cx, Result<Value>>>,
+{
+    let cx = Cx::new(request, move_input);
     let Some(mut future) = start(&cx) else {
         return RoundStep::Failed(error(
             ErrorCode::InvalidInput,
@@ -458,8 +588,8 @@ where
             let replayed = core::mem::take(&mut state.replayed);
             return RoundStep::Yielded { replayed, plan };
         }
-        let hash = abi::round_plan_hash(&plan);
         let k = state.cursor;
+        let hash = memo.hash(k, plan);
         if state.tape[k].plan_hash != hash {
             return RoundStep::Failed(error(
                 ErrorCode::Protocol,
@@ -533,6 +663,15 @@ pub trait AsyncExports {
         cx: &'cx Cx,
         export: &str,
     ) -> Option<LocalBoxFuture<'cx, Result<Value>>>;
+
+    /// True when async export `export` takes its input as `Value`: the
+    /// executor then moves the input into the argument instead of cloning it
+    /// every round (H-1). Defaults to false (the input is decoded by
+    /// reference, as before).
+    fn input_moves(export: &str) -> bool {
+        let _ = export;
+        false
+    }
 }
 
 /// The factory value of an extension with async exports. A module whose
@@ -546,6 +685,7 @@ impl AsyncExtension {
             sync: crate::boxed_extension(extension),
             sync_rounds: None,
             legacy: None,
+            memo: PlanMemo::default(),
             marker: PhantomData,
         }))
     }
@@ -626,6 +766,8 @@ struct RoundsAdapter<T> {
     sync_rounds: Option<(RequestId, Vec<PlanHash>)>,
     /// An async export on a host that negotiated ABI 1.0 (one yield).
     legacy: Option<Legacy>,
+    /// Plan hashes of the async invocation in progress ([`PlanMemo`]).
+    memo: PlanMemo,
     marker: PhantomData<fn() -> T>,
 }
 
@@ -634,8 +776,11 @@ impl<T: AsyncExports> RoundsAdapter<T> {
         T::ASYNC_EXPORTS.contains(&export)
     }
 
-    fn run(request: RoundInvocation) -> RoundStep {
-        run_round(request, |cx| T::dispatch_async(cx, cx.invocation.export()))
+    fn run(&mut self, request: RoundInvocation) -> RoundStep {
+        let move_input = T::input_moves(&request.invocation.export);
+        run_round_with(request, move_input, &mut self.memo, |cx| {
+            T::dispatch_async(cx, cx.invocation.export())
+        })
     }
 
     fn sync_message(&mut self, request_id: RequestId, round: u16, message: GuestMessage) -> GuestMessage {
@@ -694,7 +839,7 @@ impl<T: AsyncExports> Extension for RoundsAdapter<T> {
         let round = request.round;
         if Self::is_async(&request.invocation.export) {
             self.sync_rounds = None;
-            return match Self::run(request) {
+            return match self.run(request) {
                 RoundStep::Completed { replayed, result } => GuestMessage::CompletedRound {
                     request_id,
                     round,
@@ -754,7 +899,7 @@ impl<T: AsyncExports> Extension for RoundsAdapter<T> {
             max_rounds: 1,
             tape: Vec::new(),
         };
-        match Self::run(request) {
+        match self.run(request) {
             RoundStep::Completed { result, .. } => GuestMessage::Completed { request_id, result },
             RoundStep::Yielded { plan, .. } => {
                 self.legacy = Some(Legacy {
@@ -797,7 +942,7 @@ impl<T: AsyncExports> Extension for RoundsAdapter<T> {
                 events,
             }],
         };
-        match Self::run(request) {
+        match self.run(request) {
             RoundStep::Completed { result, .. } => GuestMessage::Completed { request_id, result },
             RoundStep::Yielded { .. } => failed(
                 request_id,
@@ -813,12 +958,14 @@ impl<T: AsyncExports> Extension for RoundsAdapter<T> {
     fn cancel(&mut self, request_id: RequestId) -> core::result::Result<(), ExtensionError> {
         self.legacy = None;
         self.sync_rounds = None;
+        self.memo.clear();
         self.sync.cancel(request_id)
     }
 
     fn shutdown(&mut self) {
         self.legacy = None;
         self.sync_rounds = None;
+        self.memo.clear();
         self.sync.shutdown()
     }
 }
