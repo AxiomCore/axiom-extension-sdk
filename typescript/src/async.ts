@@ -50,14 +50,95 @@ export const STEP_HOOK = "__axiom_managed_step__";
 export const LOWERED_ASYNC: boolean = Object.getPrototypeOf(async function () {}) === Function.prototype;
 
 // ------------------------------------------------------------ plan order
-interface OrderNode { readonly path: readonly number[]; next: number }
+// (w2-c3) Registration follows the Rust executor's first-poll rule.
+//  - A node of the async call tree is the promise of one async function call
+//    (esbuild's `__async` helper) or any other promise made during a round.
+//    Its code runs in that node, but the node gets its place in the tree only
+//    when the promise is first awaited, combined or returned (it is "touched"):
+//    that is the moment the Rust future would be polled first. Until then its
+//    operations wait ("parked") and join the round in which the node is
+//    reached from the root.
+//  - `cx.call` creates a lazy operation: it registers when first touched
+//    (awaited, `then`, combined by a touched `Promise.all`/`gather`, or
+//    returned from an async function), at the next sequence number of the
+//    touching node.
+//  - `Promise.all` / `allSettled` / `race` / `any` during a round are lazy
+//    combinators: touching one touches its children in argument order (the
+//    Rust `join!` poll order), so nesting order never depends on argument
+//    evaluation order.
+//  - A fail-fast `Promise.all` that rejects abandons its children at the next
+//    stall (Rust `try_join!` drops them): operations they registered stay
+//    registered (never withdrawn); operations they would start later are never
+//    registered.
+interface OrderNode {
+  /** Set when the node is attached (touched); the root has none. */
+  parent: OrderNode | undefined;
+  /** Position among the parent's children and operations. */
+  seq: number;
+  attached: boolean;
+  abandoned: boolean;
+  readonly root: boolean;
+  /** Next sequence number for children and operations touched in this node. */
+  next: number;
+  /** `touchClock` at the latest touch of this node's promise. */
+  lastTouch: number;
+}
 const NativePromise = Promise;
 const nativeThen = NativePromise.prototype.then;
 /** The node whose code is running; undefined outside an async round. */
 let currentNode: OrderNode | undefined;
+/** The run of the current round (one per engine in production). */
+let activeRun: RoundRun | undefined;
 
-function childOf(parent: OrderNode): OrderNode {
-  return { path: [...parent.path, parent.next++], next: 0 };
+const newNode = (root = false): OrderNode => ({ parent: undefined, seq: 0, attached: root, abandoned: false, root, next: 0, lastTouch: 0 });
+/** Counts touches of nodes, to tell a re-await after a rejection. */
+let touchClock = 0;
+/** The node of each promise made during a round. */
+const nodeOf = new WeakMap<object, OrderNode>();
+/** Lazy values (operations, combinators) and what touching them does. */
+interface Lazy { touched: boolean; touch(at: OrderNode | undefined): void; children?: unknown[] }
+const lazyOf = new WeakMap<object, Lazy>();
+
+type Reach = "reachable" | "parked" | "abandoned";
+function reach(node: OrderNode): Reach {
+  for (let n: OrderNode | undefined = node; n !== undefined; n = n.parent) {
+    if (n.abandoned) return "abandoned";
+    if (n.root) return "reachable";
+  }
+  return "parked";
+}
+
+function pathOf(node: OrderNode): number[] {
+  const path: number[] = [];
+  for (let n: OrderNode | undefined = node; n !== undefined && !n.root; n = n.parent) path.push(n.seq);
+  return path.reverse();
+}
+
+/** First touch of `value` at node `at` (the first poll of a Rust future). */
+function touch(value: unknown, at: OrderNode | undefined): void {
+  if (value === null || (typeof value !== "object" && typeof value !== "function")) return;
+  const lazy = lazyOf.get(value);
+  if (lazy !== undefined) {
+    if (!lazy.touched) {
+      lazy.touched = true;
+      lazy.touch(at);
+    }
+    return;
+  }
+  const node = nodeOf.get(value);
+  if (node === undefined || at === undefined) return;
+  node.lastTouch = ++touchClock;
+  if (node.attached) {
+    // Awaiting a branch a fail-fast combinator dropped: Rust cannot (the
+    // branch was moved into `try_join!`); refused at the stall.
+    if (node.abandoned && reach(at) !== "abandoned" && activeRun) activeRun.reusedAbandoned = true;
+    return;
+  }
+  // Never attach a node below itself (a promise cycle; it deadlocks anyway).
+  for (let n: OrderNode | undefined = at; n !== undefined; n = n.parent) if (n === node) return;
+  node.attached = true;
+  node.parent = at;
+  node.seq = at.next++;
 }
 
 function inNode<A extends unknown[], R>(node: OrderNode | undefined, fn: ((...args: A) => R) | null | undefined): ((...args: A) => R) | null | undefined {
@@ -73,37 +154,135 @@ function inNode<A extends unknown[], R>(node: OrderNode | undefined, fn: ((...ar
   };
 }
 
+/** Subscribe to `item` without touching it (combinator wiring). */
+function observe(item: unknown, onFulfilled: (value: unknown) => void, onRejected: (reason: unknown) => void): void {
+  if (item instanceof NativePromise) {
+    nativeThen.call(item, onFulfilled, onRejected);
+  } else {
+    nativeThen.call(NativePromise.resolve(item), onFulfilled, onRejected);
+  }
+}
+
+type CombinatorKind = "all" | "allSettled" | "race" | "any";
+declare const AggregateError: new (errors: unknown[], message?: string) => Error;
+
+/** A lazy `Promise.all` / `allSettled` / `race` / `any` made during a round. */
+function lazyCombinator(kind: CombinatorKind, iterable: Iterable<unknown>): Promise<unknown> {
+  const items = Array.from(iterable);
+  const run = activeRun;
+  let resolve!: (value: unknown) => void;
+  let reject!: (reason: unknown) => void;
+  const out = new NativePromise<unknown>((res, rej) => { resolve = res; reject = rej; });
+  lazyOf.set(out, { touched: false, children: items, touch: (at) => { for (const item of items) touch(item, at); } });
+  const values: unknown[] = new Array(items.length);
+  let left = items.length;
+  let done = false;
+  const finish = (ok: boolean, value: unknown) => {
+    if (done) return;
+    done = true;
+    if (ok) resolve(value);
+    else reject(value);
+  };
+  if (left === 0) {
+    if (kind === "any") finish(false, new AggregateError([], "All promises were rejected"));
+    else if (kind !== "race") finish(true, []);
+    return out;
+  }
+  items.forEach((item, index) => {
+    observe(
+      item,
+      (value) => {
+        if (kind === "race" || kind === "any") return finish(true, value);
+        values[index] = kind === "allSettled" ? { status: "fulfilled", value } : value;
+        if (--left === 0) finish(true, values);
+      },
+      (reason) => {
+        if (kind === "race") return finish(false, reason);
+        if (kind === "all") {
+          if (!done && run) run.abandonAtStall(items, touchClock);
+          return finish(false, reason);
+        }
+        values[index] = kind === "allSettled" ? { status: "rejected", reason } : reason;
+        if (--left === 0) finish(kind === "allSettled", kind === "any" ? new AggregateError(values, "All promises were rejected") : values);
+      },
+    );
+  });
+  return out;
+}
+
+/** True when one of `items` was awaited again after the combinator rejected at `clock`. */
+function retouched(items: unknown[], clock: number): boolean {
+  return items.some((item) => {
+    if (item === null || (typeof item !== "object" && typeof item !== "function")) return false;
+    const node = nodeOf.get(item);
+    if (node !== undefined && node.lastTouch > clock) return true;
+    const children = lazyOf.get(item)?.children;
+    return children !== undefined && retouched(children, clock);
+  });
+}
+
+/** Mark the subtrees of `items` abandoned (a fail-fast combinator dropped them). */
+function abandon(items: unknown[]): void {
+  for (const item of items) {
+    if (item === null || (typeof item !== "object" && typeof item !== "function")) continue;
+    const node = nodeOf.get(item);
+    if (node !== undefined) node.abandoned = true;
+    const children = lazyOf.get(item)?.children;
+    if (children !== undefined) abandon(children);
+  }
+}
+
 let orderingInstalled = false;
 /**
  * Install the plan-order hooks (once per engine; every round is a fresh
- * engine in production). Outside a round (`currentNode` undefined) both hooks
- * behave exactly like the native ones.
+ * engine in production). Outside a round (`currentNode` undefined) every hook
+ * behaves exactly like the native one.
  */
 function installOrdering(): void {
   if (orderingInstalled) return;
   orderingInstalled = true;
   class OrderedPromise<T> extends NativePromise<T> {
     constructor(executor: (resolve: (value: T | PromiseLike<T>) => void, reject: (reason?: unknown) => void) => void) {
-      const parent = currentNode;
-      if (parent === undefined || typeof executor !== "function") {
+      if (currentNode === undefined || typeof executor !== "function") {
         super(executor);
         return;
       }
-      const node = childOf(parent);
+      const node = newNode();
       super((resolve, reject) => {
         const saved = currentNode;
         currentNode = node;
         try {
-          executor(resolve, reject);
+          // Resolving with a lazy value or another promise touches it here
+          // (an async function returning `cx.call(...)` polls it).
+          executor((value) => { touch(value, node); resolve(value); }, reject);
         } finally {
           currentNode = saved;
         }
       });
+      nodeOf.set(this, node);
+    }
+    static resolve(value?: unknown): Promise<any> {
+      // Every lowered `await` goes through `Promise.resolve(value).then(...)`.
+      if (currentNode !== undefined) touch(value, currentNode);
+      return super.resolve(value);
+    }
+    static all(iterable: Iterable<unknown>): Promise<any> {
+      return currentNode === undefined ? super.all(iterable) : lazyCombinator("all", iterable);
+    }
+    static allSettled(iterable: Iterable<unknown>): Promise<any> {
+      return currentNode === undefined ? super.allSettled(iterable) : lazyCombinator("allSettled", iterable);
+    }
+    static race(iterable: Iterable<unknown>): Promise<any> {
+      return currentNode === undefined ? super.race(iterable) : lazyCombinator("race", iterable);
+    }
+    static any(iterable: Iterable<unknown>): Promise<any> {
+      return currentNode === undefined ? (NativePromise as any).any.call(this, iterable) : lazyCombinator("any", iterable);
     }
   }
   Object.defineProperty(NativePromise.prototype, "then", {
     value: function then(this: Promise<unknown>, onFulfilled?: unknown, onRejected?: unknown) {
       const node = currentNode;
+      touch(this, node);
       return nativeThen.call(this, inNode(node, onFulfilled as any) as any, inNode(node, onRejected as any) as any);
     },
     writable: true,
@@ -186,7 +365,7 @@ const asyncHandlers = new WeakMap<object, AsyncHandler<any>>();
 export function asyncExport<I = unknown>(handler: AsyncHandler<I>): AsyncExport {
   if (typeof handler !== "function") throw new TypeError("asyncExport expects a function");
   const refuse = (): never => {
-    throw new Error("async export needs an ABI 1.1 managed build (Javy event loop and the async step banner); this module was invoked through the ABI 1.0 bridge");
+    throw new Error("async export needs an ABI 1.1 managed build (the async build adds the step export and the async-exports section); this module was invoked through the ABI 1.0 bridge");
   };
   asyncHandlers.set(refuse, handler);
   return refuse as unknown as AsyncExport;
@@ -256,7 +435,10 @@ export function segmentPlan(effects: Effect[]): RoundPlanJson {
 
 interface Registered {
   effect: Effect;
-  /** Position in the async call tree (see the plan-order note at the top). */
+  /** The node that touched the operation, and its sequence number there. */
+  owner: OrderNode;
+  seq: number;
+  /** Position in the async call tree, computed at the stall that plans it. */
   key: readonly number[];
   resolve(value: unknown): void;
   reject(error: unknown): void;
@@ -279,14 +461,19 @@ function plainEffect(effect: unknown): Effect {
 
 /** One run of an async export in this engine (one round). */
 class RoundRun {
-  private segment: Registered[] = [];
+  /** Touched operations not planned yet (parked ones wait for their node). */
+  private pending: Registered[] = [];
+  /** Children of fail-fast combinators that rejected since the last stall, with the touch clock at the rejection. */
+  private toAbandon: Array<{ items: unknown[]; clock: number }> = [];
+  /** Set when a branch a fail-fast combinator dropped is awaited again. */
+  reusedAbandoned = false;
   private cursor = 0;
   private readonly replayed: RoundPlanJson[] = [];
   private settled: { ok: true; value: unknown } | { ok: false; error: unknown } | undefined;
   private answered = false;
   private readonly completions = new WeakSet<object>();
   /** The root of this run's async call tree (plan order). */
-  private readonly root: OrderNode = { path: [], next: 0 };
+  private readonly root: OrderNode = newNode(true);
   /** Set when an operation started outside the async call tree (see `register`). */
   private outsideTree = false;
 
@@ -314,6 +501,7 @@ class RoundRun {
 
   start(handler: AsyncHandler, cx: AsyncContext): void {
     installOrdering();
+    activeRun = this;
     const saved = currentNode;
     currentNode = this.root;
     try {
@@ -332,23 +520,41 @@ class RoundRun {
     }
   }
 
+  /** Mark the children of a rejected fail-fast combinator for the next stall. */
+  abandonAtStall(items: unknown[], clock: number): void {
+    this.toAbandon.push({ items, clock });
+  }
+
   private register(effect: unknown): Promise<unknown> {
-    // Operations started after the export returned are never planned or sent.
-    if (this.settled || this.answered) return new Promise(() => {});
     const plain = plainEffect(effect);
     const decode = effectDecoder(effect as object);
-    // In a lowered (async) build all guest code runs inside the call tree;
-    // only a custom thenable's `then`, called by the engine itself, runs
-    // outside it. Such an operation has no defined place in the plan, so the
-    // round fails at its stall (a deterministic error, not an arbitrary
-    // order). Unlowered (node tests) everything runs under the root.
-    if (currentNode === undefined && LOWERED_ASYNC) this.outsideTree = true;
-    const node = currentNode ?? this.root;
-    const key = [...node.path, node.next++];
-    let entry!: Registered;
+    let resolve!: (value: unknown) => void;
+    let reject!: (reason: unknown) => void;
     // The operation's own promise is native: it opens no node.
-    const promise = new NativePromise<unknown>((resolve, reject) => { entry = { effect: plain, key, resolve, reject, decode }; });
-    this.segment.push(entry);
+    const promise = new NativePromise<unknown>((res, rej) => { resolve = res; reject = rej; });
+    const touchAt = (at: OrderNode | undefined) => {
+      // Operations started after the export returned are never planned or sent.
+      if (this.settled || this.answered) return;
+      // In a lowered (async) build all guest code runs inside the call tree;
+      // only a custom thenable's `then`, called by the engine itself, runs
+      // outside it. Such an operation has no defined place in the plan, so
+      // the round fails at its stall (a deterministic error, not an arbitrary
+      // order).
+      if (at === undefined) {
+        this.outsideTree = true;
+        at = this.root;
+      }
+      // A branch dropped by a fail-fast combinator registers nothing more.
+      if (reach(at) === "abandoned") return;
+      this.pending.push({ effect: plain, owner: at, seq: at.next++, key: [], resolve, reject, decode });
+    };
+    if (!LOWERED_ASYNC) {
+      // Unlowered (node tests): native awaits bypass the hooks, so every
+      // operation registers when it is created, under the root.
+      touchAt(currentNode ?? this.root);
+    } else {
+      lazyOf.set(promise, { touched: false, touch: touchAt });
+    }
     return promise;
   }
 
@@ -372,7 +578,7 @@ class RoundRun {
     const replayed = this.replayed;
     if (this.settled) {
       // Operations still pending when the export returned are never sent.
-      this.segment = [];
+      this.pending = [];
       if (this.cursor !== tape.length) {
         this.answer({ kind: "failed", error: failure("Protocol", `non-deterministic guest: the export completed after replaying ${this.cursor} of ${tape.length} effect rounds`), replayed });
         return;
@@ -392,9 +598,31 @@ class RoundRun {
       this.answer({ kind: "failed", error: failure("InvalidInput", "a host operation was started outside the async call tree (for example from a custom thenable's `then`, which the engine calls itself); its place in the round's plan is not defined. Start host operations from async functions or promise callbacks"), replayed });
       return;
     }
-    // Depth-first order of the async call tree (independent of microtask hops).
-    const segment = this.segment.sort((a, b) => compareKeys(a.key, b.key));
-    this.segment = [];
+    if (this.toAbandon.some(({ items, clock }) => retouched(items, clock))) this.reusedAbandoned = true;
+    if (this.reusedAbandoned) {
+      this.answer({ kind: "failed", error: failure("InvalidInput", "a promise that a fail-fast Promise.all / gather dropped after a sibling failed was awaited again; its later host operations are never registered (as with Rust try_join!, which drops its children). Use Promise.allSettled / gather(..., return_exceptions=True) (Rust join!) to keep every branch"), replayed });
+      return;
+    }
+    // The operations whose node is reached from the root, in the depth-first
+    // order of the async call tree (independent of microtask hops); parked
+    // ones wait for their node, abandoned ones are dropped.
+    const segment: Registered[] = [];
+    const parked: Registered[] = [];
+    for (const registered of this.pending) {
+      const state = reach(registered.owner);
+      if (state === "reachable") {
+        registered.key = [...pathOf(registered.owner), registered.seq];
+        segment.push(registered);
+      } else if (state === "parked") {
+        parked.push(registered);
+      }
+    }
+    this.pending = parked;
+    segment.sort((a, b) => compareKeys(a.key, b.key));
+    // Children of fail-fast combinators that rejected are dropped now: what
+    // they registered before this stall stays registered.
+    for (const { items } of this.toAbandon) abandon(items);
+    this.toAbandon = [];
     if (segment.length === 0) {
       this.answer({ kind: "failed", error: failure("InvalidInput", "async export is waiting on something that is not a host operation; only `cx.call` promises can be awaited (no timers, channels or other executors)"), replayed });
       return;

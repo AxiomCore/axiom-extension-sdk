@@ -61,19 +61,30 @@ export default defineExtension({
 - `extension.export(fn)` makes an `async` function an async export; any other
   function stays a 1.0 handler. `asyncExport(fn)` marks a function that returns
   a promise without being `async`. Sync and async exports can share a module.
-- **Rounds.** An operation registers when `cx.call` is called. When every job
-  has run and the export is still waiting, the operations registered since the
-  last stop form one round: one operation is a plan, 2 to 32 are one `Collect`
+- **Rounds.** An operation registers when it is first awaited (or passed to
+  a `Promise.all` that is awaited, or returned from an async function): the
+  Rust SDK's "first poll" rule, so `const p = cx.call(a); await cx.call(b);
+  await p;` takes two rounds in TypeScript, Rust and Python alike. An async
+  function's operations likewise wait until its promise is awaited. When
+  every job has run and the export is still waiting, the operations
+  registered since the last stop form one round: one operation is a plan, 2 to 32 are one `Collect`
   group (branches `b0`, `b1`, ...; `limit` is `min(n, 8)`), more than 32 fail
   with `Exhausted`. `Promise.all` therefore batches by itself; sequential
   awaits take one round each. The package's `maxEffects` and the authority's
   `maxRounds` (yields) still apply.
-- **Order inside a round.** Operations are ordered by where they were called
-  in the tree of async calls (depth first, in call order), exactly as the Rust
-  SDK's `join!` orders them for the same program: `Promise.all([a(), b()])`
-  puts all of `a`'s operations before `b`'s, however many awaits of helpers or
-  resolved promises come in between. (CPython's `asyncio` task order can
-  differ for a `gather` inside a task; Axiom follows Rust.)
+- **Order inside a round.** Operations are ordered by where they were awaited
+  in the tree of async calls (depth first, in argument order), exactly as the
+  Rust SDK's `join!` orders them for the same program: `Promise.all([a(), b()])`
+  puts all of `a`'s operations before `b`'s, at any nesting depth and however
+  many awaits of helpers or resolved promises come in between. (CPython's
+  `asyncio` task order can differ for a `gather` inside a task; Axiom follows
+  Rust.)
+- **Fail-fast or wait for all.** `Promise.all` is fail-fast like Rust
+  `try_join!`: when a branch fails it rejects, and the other branches are
+  dropped (an operation they already registered still runs; they register
+  nothing more, and awaiting a dropped branch again fails with
+  `InvalidInput`). `Promise.allSettled` waits for every branch like Rust
+  `join!`. Python: `gather(...)` / `gather(..., return_exceptions=True)`.
 - **Replay.** Every round runs the export from the top in a fresh engine, with
   the results of earlier rounds answered from the host's tape. Nothing survives
   between rounds (module variables start fresh every round). A round that
@@ -85,9 +96,11 @@ export default defineExtension({
   `FinalizationRegistry` or `performance`; awaiting anything that never
   settles fails the invocation with `InvalidInput`. Time and randomness come
   from host operations, which are on the tape.
-- **Awkward cases.** A promise you never await still runs with its round; its
-  result is discarded (registered operations are never withdrawn). Operations
-  still pending when the export returns are never sent. Awaiting one promise
+- **Awkward cases.** An operation you never await is never sent (Rust's
+  unpolled future); one you touched (`.then`, `.catch`, a combinator) and then
+  abandoned still runs with its round and its result is discarded
+  (registered operations are never withdrawn). Operations still pending when
+  the export returns are never sent. Awaiting one promise
   twice gives its value twice. `Promise.race`/`Promise.any` are deterministic:
   all operations of a round finish together and settle in plan order, so the
   first in the plan wins, and the others still run.

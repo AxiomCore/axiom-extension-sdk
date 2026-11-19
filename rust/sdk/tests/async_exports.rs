@@ -13,8 +13,10 @@ use axiom_extension_sdk::{
         ABI_VERSION_1_1,
     },
     async_rt::{factory_abi_version, segment_plan, FactoryOutput, MAX_GROUP_BRANCHES},
+    async_rt::try_join_all,
     join, join_all,
     prelude::*,
+    try_join,
     raw::GuestMachine,
     AsyncExtension, Binding, Extension,
 };
@@ -122,6 +124,45 @@ impl Guest {
                 value: n(u64::from(cx.round())),
             },
         ]))
+    }
+
+    /// w2-c3: fail-fast `try_join!` (TS `Promise.all`, Python `gather`).
+    #[export]
+    async fn try_join_ok(cx: &Cx, _input: Value) -> Result<Vec<u64>> {
+        let (a, b) = try_join!(cx.call(LOAD.call(n(1))), cx.call(PRICE.call(n(2)))).await?;
+        Ok(vec![a, b])
+    }
+
+    #[export]
+    async fn try_join_fails_fast(cx: &Cx, _input: Value) -> Result<Vec<u64>> {
+        let chain = async {
+            let x = cx.call(LOAD.call(n(1))).await?;
+            let y = cx.call(LOAD.call(n(x))).await?;
+            cx.call(LOAD.call(n(y))).await
+        };
+        let (a, b) = try_join!(cx.call(FAIL.call(n(1))), chain).await?;
+        Ok(vec![a, b])
+    }
+
+    /// The error is caught: the dropped branch's operation registered in the
+    /// failing pass still runs with the next round; its third never registers.
+    #[export]
+    async fn try_join_caught(cx: &Cx, _input: Value) -> Result<Vec<u64>> {
+        let chain = async {
+            let x = cx.call(LOAD.call(n(1))).await?;
+            let y = cx.call(LOAD.call(n(x))).await?;
+            cx.call(LOAD.call(n(y))).await
+        };
+        let failed = try_join!(cx.call(FAIL.call(n(1))), chain).await.is_err();
+        let p = cx.call(PRICE.call(n(7))).await?;
+        Ok(vec![u64::from(failed), p])
+    }
+
+    #[export]
+    async fn try_join_all_fails_fast(cx: &Cx, _input: Value) -> Result<Vec<u64>> {
+        let ok = try_join_all((1..=3).map(|i| cx.call(LOAD.call(n(i))))).await?;
+        let failed = try_join_all([cx.call(PRICE.call(n(4))), cx.call(FAIL.call(n(5)))]).await;
+        Ok(ok.into_iter().chain([u64::from(failed.is_err())]).collect())
     }
 
     #[export]
@@ -642,7 +683,7 @@ fn factory_abi_version_is_1_1_only_for_async_extensions() {
     }
     assert_eq!(factory_abi_version(&|| Box::new(Raw)), ABI_VERSION.packed());
     assert_eq!(<AsyncExtension as FactoryOutput>::ABI, ABI_VERSION_1_1);
-    assert_eq!(AXIOM_EXTENSION_EXPORTS.len(), 28);
+    assert_eq!(AXIOM_EXTENSION_EXPORTS.len(), 32);
     assert!(AXIOM_EXTENSION_EXPORTS.windows(2).all(|w| w[0] < w[1]));
 }
 
@@ -1164,4 +1205,38 @@ fn a_machine_without_rounds_never_selects_1_1() {
     // A sync export over 1.0 still completes.
     let reply = send(ABI_VERSION, HostMessage::Invoke { request_id: RequestId(2), invocation: Host::invocation("sync_pure", n(4)) });
     assert!(matches!(reply, Ok(GuestMessage::Completed { .. })), "{reply:?}");
+}
+
+#[test]
+fn try_join_is_fail_fast_and_never_withdraws_registered_operations() {
+    let mut host = guest();
+    let run = host.invoke("try_join_ok", Value::Null, 1);
+    assert_eq!(run.plans, vec![plan_of(&[("load", 1), ("price", 2)])]);
+    assert_eq!(run.output(), &list(&[10, 20]));
+
+    // Fails in the pass after round 1: no third round (join! would wait).
+    let run = host.invoke("try_join_fails_fast", Value::Null, 4);
+    assert_eq!(run.invokes, 2);
+    assert_eq!(run.plans, vec![plan_of(&[("fail", 1), ("load", 1)])]);
+    assert_eq!(run.error().code, ErrorCode::Host);
+
+    // Caught: round 2 carries the dropped branch's operation registered in
+    // the failing pass (never withdrawn) and the export's next one; the
+    // branch's third operation is never registered.
+    let calls_before = host.calls.len();
+    let run = host.invoke("try_join_caught", Value::Null, 4);
+    assert_eq!(run.invokes, 3);
+    assert_eq!(
+        run.plans,
+        vec![plan_of(&[("fail", 1), ("load", 1)]), plan_of(&[("load", 10), ("price", 7)])]
+    );
+    assert_eq!(run.output(), &list(&[1, 20]));
+    assert_eq!(host.calls.len() - calls_before, 4);
+
+    let run = host.invoke("try_join_all_fails_fast", Value::Null, 4);
+    assert_eq!(
+        run.plans,
+        vec![plan_of(&[("load", 1), ("load", 2), ("load", 3)]), plan_of(&[("price", 4), ("fail", 5)])]
+    );
+    assert_eq!(run.output(), &list(&[10, 10, 10, 1]));
 }
