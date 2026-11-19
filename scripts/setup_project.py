@@ -16,8 +16,30 @@ import re
 import subprocess
 import tomllib
 
-SDK_VERSION = "0.1.0"
 PACKAGE = "@axiomcore/extension-sdk"
+SDK_CHECKOUT = Path(__file__).resolve().parents[1]
+
+
+def sdk_version(checkout: Path = SDK_CHECKOUT) -> str:
+    """The SDK release this script belongs to: the one version every language
+    package of this checkout declares (the single source; never hard-coded)."""
+    versions = {
+        "rust": tomllib.loads((checkout / "rust/sdk/Cargo.toml").read_text())["package"]["version"],
+        "typescript": json.loads((checkout / "typescript/package.json").read_text())["version"],
+        "python": tomllib.loads((checkout / "python/pyproject.toml").read_text())["project"]["version"],
+    }
+    if len(set(versions.values())) != 1:
+        raise RuntimeError(f"SDK checkout {checkout} declares different package versions: {versions}")
+    return versions["rust"]
+
+
+SDK_VERSION = sdk_version()
+# Why a Python project also needs the TypeScript SDK package (w1-p D4).
+PYTHON_NEEDS_TYPESCRIPT_SDK = (
+    "the Python AOT profile compiles the extension to JavaScript and runs it on the "
+    f"TypeScript extension runtime, so a Python extension project also needs {PACKAGE} "
+    "(the runtime bridge, not a second authoring SDK)"
+)
 
 
 def run(*args: str, cwd: Path) -> str:
@@ -229,7 +251,7 @@ def python(project: Path, alias: str, sdk: Path | None, extension: dict,
         )
     document = tomllib.loads(manifest.read_text())
     if not any(item.startswith("axiom-extension-sdk") for item in document.get("project", {}).get("dependencies", [])):
-        raise RuntimeError("pyproject.toml exists but does not declare axiom-extension-sdk==0.1.0")
+        raise RuntimeError(f"pyproject.toml exists but does not declare axiom-extension-sdk=={SDK_VERSION}")
     command = ["uv", "sync", "--project", str(project)]
     if (project / "uv.lock").is_file():
         command.append("--locked")
@@ -240,6 +262,10 @@ def python(project: Path, alias: str, sdk: Path | None, extension: dict,
     write_if_missing(project / "pyrightconfig.json", json.dumps({
         "venvPath": ".", "venv": ".venv", "extraPaths": ["."],
     }, indent=2) + "\n")
+    if not (project / "node_modules" / PACKAGE / "package.json").is_file():
+        print(f"note: building needs {PACKAGE}@{SDK_VERSION} in node_modules: {PYTHON_NEEDS_TYPESCRIPT_SDK}; "
+              f"install it with `npm install --save-exact --ignore-scripts "
+              f"{(sdk / 'typescript') if sdk else f'{PACKAGE}@{SDK_VERSION}'}`")
 
 
 def main() -> None:
