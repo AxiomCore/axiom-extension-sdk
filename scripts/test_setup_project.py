@@ -58,5 +58,34 @@ class BoundaryTests(unittest.TestCase):
         ))
 
 
+class VersionTests(unittest.TestCase):
+    """w1-p D4: the SDK version comes from the checkout, not a literal."""
+
+    def test_version_is_the_checkouts_single_version(self):
+        root = Path(__file__).resolve().parents[1]
+        cargo = (root / "rust/sdk/Cargo.toml").read_text()
+        self.assertIn(f'version = "{module.SDK_VERSION}"', cargo)
+        self.assertEqual(module.sdk_version(root), module.SDK_VERSION)
+        source = Path(__file__).with_name("setup_project.py").read_text()
+        self.assertNotRegex(source, r'"0\.1\.[0-9]+"')
+
+    def test_mismatched_package_versions_are_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "rust/sdk").mkdir(parents=True)
+            (root / "typescript").mkdir()
+            (root / "python").mkdir()
+            (root / "rust/sdk/Cargo.toml").write_text('[package]\nname = "axiom-extension-sdk"\nversion = "9.9.9"\n')
+            (root / "typescript/package.json").write_text('{"version": "9.9.9"}')
+            (root / "python/pyproject.toml").write_text('[project]\nname = "axiom-extension-sdk"\nversion = "9.9.8"\n')
+            with self.assertRaisesRegex(RuntimeError, "different package versions"):
+                module.sdk_version(root)
+            (root / "python/pyproject.toml").write_text('[project]\nname = "axiom-extension-sdk"\nversion = "9.9.9"\n')
+            self.assertEqual(module.sdk_version(root), "9.9.9")
+
+    def test_python_note_explains_the_typescript_runtime(self):
+        self.assertIn("TypeScript extension runtime", module.PYTHON_NEEDS_TYPESCRIPT_SDK)
+
+
 if __name__ == "__main__":
     unittest.main()
