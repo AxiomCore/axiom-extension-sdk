@@ -2,7 +2,7 @@
 reportUnnecessaryTypeIgnoreComment, so every ignore below must be needed)."""
 from typing import Any
 
-from axiom_extension_sdk import Context, ResumeContext, Ticket, TypedEffect
+from axiom_extension_sdk import Context, ResumeContext, Ticket, TypedEffect, typed_effect
 
 
 def build(ctx: Context) -> tuple[Ticket[str], Ticket[bool], Ticket[Any]]:
@@ -27,3 +27,14 @@ def read(ctx: ResumeContext, name: Ticket[str], stock: Ticket[bool]) -> str:
     ctx.get(0)  # pyright: ignore[reportArgumentType]
     del wrong, swapped
     return f"{text}{available}{index}"
+
+
+def helper(ctx: Context) -> tuple[Ticket[str], Ticket[list[int]]]:
+    # typed_effect infers the effect's output type: no TypedEffect[O] annotation.
+    plan = ctx.plan()
+    name = plan.push(typed_effect("catalog", "name", {"Unsigned": 1}, str))
+    ids = plan.push(typed_effect("catalog", "ids", "Null", list[int]))
+    wrong: Ticket[int] = plan.push(typed_effect("catalog", "name", "Null", str))  # pyright: ignore[reportAssignmentType]
+    del wrong
+    ctx.effects(plan)
+    return name, ids

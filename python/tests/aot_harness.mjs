@@ -30,11 +30,32 @@ function exchange(context, code, value) {
   return JSON.parse(vm.runInContext(`(() => { try { return JSON.stringify({ ok: ${code} }); } catch (e) { return JSON.stringify({ err: String(e && e.message || e) }); } })()`, context, { timeout: 20000 }));
 }
 const invoke = (context, item) => exchange(context, `__EXT.exports[${JSON.stringify(item.export)}](__SDK.createContext(JSON.parse(__ARG)))`, { export: item.export, input: item.input, snapshots: [], deadline_unix_ms: 0 });
-const resume = (context) => exchange(context, "__EXT.resume(__SDK.createResumeContext(JSON.parse(__ARG), [], 1))", cases.outcomes);
+const resume = (context, record) => exchange(context, `__EXT.resume(__SDK.createResumeContext(JSON.parse(__ARG).outcomes, [], 1, JSON.parse(__ARG).record))`, { outcomes: cases.outcomes, record });
+
+// The managed kernel's record of a yielded plan (the bridge's `yielded_plan`):
+// per call namespace, operation and the input's canonical text and length
+// (same format as the kernel's `canonical_value`).
+function canonical(v) {
+  if (v === "Null") return '"Null"';
+  if ("Bool" in v) return `{"Bool":${v.Bool === true}}`;
+  if ("Signed" in v) return `{"Signed":${JSON.stringify(String(v.Signed))}}`;
+  if ("Unsigned" in v) return `{"Unsigned":${JSON.stringify(String(v.Unsigned))}}`;
+  if ("String" in v) return `{"String":${JSON.stringify(v.String)}}`;
+  if ("Bytes" in v) return `{"Bytes":[${v.Bytes.join(",")}]}`;
+  if ("List" in v) return `{"List":[${v.List.map(canonical).join(",")}]}`;
+  if ("Record" in v) return `{"Record":[${v.Record.map((f) => `{"name":${JSON.stringify(f.name)},"value":${canonical(f.value)}}`).join(",")}]}`;
+  throw new Error("harness: unsupported value");
+}
+const record = (plan) => plan.effects.map((e) => { const input = canonical(e.input); return { namespace: e.namespace, operation: e.operation, input_length: input.length, input }; });
 
 const result = { fresh: {}, persistent: {} };
 for (const item of cases.invoke) result.fresh[item.export] = invoke(realm(), item);
 result.fresh.resume = resume(realm());
+// Fresh realm with the kernel's yielded-plan record, as the current host sends it.
+const yieldedPlan = result.fresh[cases.invoke[0].export].ok.plan;
+result.echo = { resume: resume(realm(), record(yieldedPlan)) };
+// A record of a different plan (calls swapped) is rejected, naming the call.
+result.echo.swapped = resume(realm(), record({ effects: [...yieldedPlan.effects].reverse() }));
 const persistent = realm();
 result.persistent[cases.invoke[0].export] = invoke(persistent, cases.invoke[0]);
 result.persistent.resume = resume(persistent);

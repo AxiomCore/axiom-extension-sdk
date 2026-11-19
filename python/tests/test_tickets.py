@@ -46,6 +46,12 @@ class ShimSurface(unittest.TestCase):
             for member in members:
                 self.assertTrue(hasattr(protocol, member), f"{protocol.__name__}.{member}")
 
+    def test_typed_effect_returns_the_plain_effect(self) -> None:
+        effect = sdk.typed_effect("catalog", "name", {"Unsigned": 1}, str)
+        self.assertEqual(effect, {"namespace": "catalog", "operation": "name", "input": {"Unsigned": 1}})
+        self.assertIn("def typed_effect(namespace: str, operation: str, input: Any, output: type[O]) -> TypedEffect[O]",
+                      (PYTHON_ROOT / "axiom_extension_sdk" / "__init__.pyi").read_text())
+
     def test_positional_outcome_is_kept_and_documented_deprecated(self) -> None:
         doc = sdk.ResumeContext.outcome.__doc__ or ""
         self.assertIn("Deprecated", doc)
@@ -113,7 +119,10 @@ class AotPath(unittest.TestCase):
         expected = {"index": {"Unsigned": 1}, "legacy": {"String": "Linen"},
                     "mixed": {"String": "effect tickets from different effect plans were read in one resume"},
                     "name": {"String": "Linen"}, "stock": {"Bool": True}}
-        for mode in (fresh, persistent):
+        echo = result["echo"]
+        self.assertIn("err", echo["swapped"], echo["swapped"])
+        self.assertIn("rebuilt effect plan differs from the yielded plan: call 0 is catalog.name, the yielded call 0 was catalog.stock", echo["swapped"]["err"])
+        for mode in (fresh, persistent, echo):
             self.assertIn("ok", mode["resume"], mode["resume"])
             output = {field["name"]: field["value"] for field in mode["resume"]["ok"]["result"]["output"]["Record"]}
             self.assertEqual(output, expected)

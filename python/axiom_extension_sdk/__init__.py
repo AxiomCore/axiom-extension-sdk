@@ -39,13 +39,23 @@ class TypedEffect(TypedDict, Generic[O]):
     input: Any
 
 
+def typed_effect(namespace: str, operation: str, input: Any, output: "type[O]") -> TypedEffect[O]:
+    """An effect whose outcome decodes as ``output``; ``plan.push`` of it gives
+    a ``Ticket[output]``. Returns the plain effect dict (``input`` in wire
+    form, as for a hand-written effect); ``output`` is used for typing only."""
+    del output
+    return {"namespace": namespace, "operation": operation, "input": input}
+
+
 class Ticket(Generic[O]):
     """A typed claim on the outcome of one host call in one effect plan.
 
     Issued only by ``Effects.push`` (the host's plan object); ``index`` is the
-    ABI outcome index. Read it with ``ResumeContext.get``. In the AOT profile
-    these names exist for annotations only: import them under
-    ``if TYPE_CHECKING:``.
+    ABI outcome index. Read it with ``ResumeContext.get``. A resume rebuilds
+    the yielded plan with the same calls (namespace, operation and input) in
+    the same order; ``get`` checks that against the host's record of the
+    yielded plan. In the AOT profile these names import at runtime too (for
+    annotations only; they cannot be instantiated).
     """
 
     @property

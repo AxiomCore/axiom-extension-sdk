@@ -30,12 +30,14 @@ def raw(ctx: "Context"):
 
 @extension.resume
 def resume(ctx: "ResumeContext"):
+    # The rebuild repeats the yielded calls exactly, inputs included (the
+    # test invokes `run` with 7): `get` checks it against the yielded plan.
     fx = ctx.plan()
-    name, stock = lookup(fx, 0)
+    name, stock = lookup(fx, 7)
     result = {"name": ctx.get(name), "stock": ctx.get(stock), "legacy": ctx.outcome(0), "index": stock.index}
     try:
         other = ctx.plan()
-        foreign, _ = lookup(other, 0)
+        foreign, _ = lookup(other, 7)
         ctx.get(foreign)
         result["mixed"] = "accepted"
     except Exception as error:
