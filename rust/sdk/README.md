@@ -179,7 +179,11 @@ impl Checkout {
   plan, several are a `Collect` group (branches `b0`, `b1`, …; all results
   returned, no fail-fast; at most 32 branches and the package's `maxEffects`).
   Sequential awaits cost one round each; `join!` / `join_all` cost one round
-  for the whole batch. `maxRounds` (authority, default 1, at most 16) bounds
+  for the whole batch. `try_join!` / `async_rt::try_join_all` are the
+  fail-fast forms (TypeScript `Promise.all`, Python `gather`): after a poll
+  pass in which a child failed they return the first error in argument order
+  and drop the others (operations already registered still run); `join!` is
+  TypeScript `Promise.allSettled` / Python `gather(..., return_exceptions=True)`. `maxRounds` (authority, default 1, at most 16) bounds
   the number of rounds that yield; one more yield is refused (`Exhausted`) and
   nothing commits. Request it per extension in `AxiomDeps.toml`:
 

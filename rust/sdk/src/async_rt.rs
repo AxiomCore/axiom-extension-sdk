@@ -426,6 +426,111 @@ impl<F: Future> Future for JoinAll<F> {
     }
 }
 
+// ------------------------------------------------------- fail-fast joining
+
+impl<T, E, F: Future<Output = core::result::Result<T, E>>> MaybeDone<F> {
+    /// True when the child finished with an error ([`try_join!`](crate::try_join)).
+    pub fn is_err(&self) -> bool {
+        matches!(self, Self::Done(Err(_)))
+    }
+
+    /// The error of a child that finished with one.
+    pub fn take_err(&mut self) -> E {
+        match core::mem::replace(self, Self::Gone) {
+            Self::Done(Err(error)) => error,
+            _ => unreachable!("try_join error taken from a child without one"),
+        }
+    }
+
+    /// The value of a child that finished successfully.
+    pub fn take_ok(&mut self) -> T {
+        match core::mem::replace(self, Self::Gone) {
+            Self::Done(Ok(value)) => value,
+            _ => unreachable!("try_join value taken before completion"),
+        }
+    }
+}
+
+/// Fail-fast [`join!`]: the counterpart of TypeScript `Promise.all` and Python
+/// `gather(...)` without `return_exceptions` (contract x8c §3.6). Every pass
+/// polls the children that are still pending, in argument order (so their
+/// host operations register exactly as with [`join!`]); after a pass in which
+/// a child finished with `Err`, it returns the error of the first such child
+/// in argument order and drops the others. Operations a dropped child already
+/// registered stay registered and run with their round (never withdrawn); it
+/// registers nothing more. Returns a future of `Result<(T1, T2, ...), E>`:
+///
+/// ```ignore
+/// let (price, stock) = try_join!(cx.call(PRICE.call(id)), cx.call(STOCK.call(id))).await?;
+/// ```
+#[macro_export]
+macro_rules! try_join {
+    ($($future:expr),+ $(,)?) => {
+        $crate::__try_join_impl!([] $($future,)+)
+    };
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __try_join_impl {
+    // Each recursion step introduces a fresh hygienic `child` binding.
+    ([$($done:tt)*] $head:expr, $($rest:expr,)*) => {
+        $crate::__try_join_impl!([$($done)* ($head, child)] $($rest,)*)
+    };
+    ([$(($future:expr, $child:ident))+]) => {{
+        $(let mut $child = $crate::async_rt::MaybeDone::new($future);)+
+        ::core::future::poll_fn(move |context| {
+            let mut ready = true;
+            $(ready &= $child.poll_step(context);)+
+            $(if $child.is_err() {
+                return ::core::task::Poll::Ready(::core::result::Result::Err($child.take_err()));
+            })+
+            if ready {
+                ::core::task::Poll::Ready(::core::result::Result::Ok(($($child.take_ok(),)+)))
+            } else {
+                ::core::task::Poll::Pending
+            }
+        })
+    }};
+}
+
+/// Fail-fast [`join_all`] (TypeScript `Promise.all` over an array, Python
+/// `gather(*items)`): every pass polls the pending children in iterator
+/// order; after a pass in which one finished with `Err`, the first such error
+/// in iterator order is returned and the others are dropped.
+pub fn try_join_all<T, E, F: Future<Output = core::result::Result<T, E>>>(futures: impl IntoIterator<Item = F>) -> TryJoinAll<F> {
+    TryJoinAll {
+        children: futures.into_iter().map(MaybeDone::new).collect(),
+    }
+}
+
+/// Future returned by [`try_join_all`].
+pub struct TryJoinAll<F: Future> {
+    children: Vec<MaybeDone<F>>,
+}
+
+impl<T, E, F: Future<Output = core::result::Result<T, E>>> Future for TryJoinAll<F> {
+    type Output = core::result::Result<Vec<T>, E>;
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let mut ready = true;
+        for child in &mut this.children {
+            ready &= child.poll_step(context);
+        }
+        if let Some(failed) = this.children.iter_mut().find(|child| child.is_err()) {
+            let error = failed.take_err();
+            this.children.clear();
+            return Poll::Ready(Err(error));
+        }
+        if ready {
+            Poll::Ready(Ok(this.children.iter_mut().map(MaybeDone::take_ok).collect()))
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
 // ----------------------------------------------------------------- executor
 
 /// Result of one run of an async export.
