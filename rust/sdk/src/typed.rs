@@ -503,8 +503,27 @@ impl ExtensionResponse {
         }
     }
 
+    /// Suspend this invocation while the host runs a group built with
+    /// [`EffectGroup::push`]; its tickets read the branches in the resume.
+    /// The yielded bytes equal [`ExtensionResponse::yield_group`] of the same
+    /// raw group.
+    pub fn yield_effect_group(group: EffectGroup) -> Self {
+        let plan = PlanMark(Some(group.record()));
+        Self {
+            output: Value::Null,
+            patches: Vec::new(),
+            transactions: Vec::new(),
+            events: Vec::new(),
+            effects: None,
+            group: Some(group.build()),
+            plan,
+        }
+    }
+
     /// A finite host-owned group. Hosts without the explicit capability reject.
     /// Branch names/indexes retain declaration order; this adds no grants.
+    /// Outcomes of a raw group can only be read positionally; prefer
+    /// [`ExtensionResponse::yield_effect_group`], which issues typed tickets.
     pub fn yield_group(group: abi::EffectGroup) -> Self {
         Self {
             output: Value::Null,
@@ -1105,6 +1124,72 @@ impl Effects {
     }
 }
 
+/// A finite host-owned effect group built branch by branch, with a typed
+/// ticket per branch (X7a tickets for groups). Yield it with
+/// [`ExtensionResponse::yield_effect_group`]; read each branch in the resume
+/// with [`ResumeContext::get`]. Outcome indexes are declaration order, so a
+/// ticket reads its branch even when branches finish out of order. The group
+/// bytes are identical to the raw `abi::EffectGroup` passed to
+/// [`ExtensionResponse::yield_group`]; hosts without the group capability
+/// reject it, and building one adds no grants.
+pub struct EffectGroup {
+    mode: abi::EffectGroupMode,
+    limit: u16,
+    branches: Vec<abi::NamedEffect>,
+    plan: u64,
+}
+
+impl EffectGroup {
+    /// An empty group running at most `limit` branches at once.
+    pub fn new(mode: abi::EffectGroupMode, limit: u16) -> Self {
+        Self {
+            mode,
+            limit,
+            branches: Vec::new(),
+            plan: NEXT_PLAN.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+
+    /// Append a named branch and return the typed ticket for its outcome.
+    pub fn push<O>(&mut self, name: impl Into<String>, call: EffectCall<O>) -> Ticket<O> {
+        let index = u32::try_from(self.branches.len()).unwrap_or(u32::MAX);
+        self.branches.push(abi::NamedEffect {
+            name: name.into(),
+            effect: call.into_effect(),
+        });
+        Ticket {
+            plan: self.plan,
+            index,
+            marker: PhantomData,
+        }
+    }
+
+    /// Number of branches in the group.
+    pub fn len(&self) -> usize {
+        self.branches.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.branches.is_empty()
+    }
+
+    fn record(&self) -> PlanRecord {
+        PlanRecord {
+            plan: self.plan,
+            len: u32::try_from(self.branches.len()).unwrap_or(u32::MAX),
+        }
+    }
+
+    fn build(self) -> abi::EffectGroup {
+        abi::EffectGroup {
+            format: abi::EFFECT_GROUP_FORMAT.into(),
+            limit: self.limit,
+            mode: self.mode,
+            branches: self.branches,
+        }
+    }
+}
+
 /// A handle-bound ordered decoder. Progress commits only after the whole batch
 /// validates, so malformed values cannot consume sequence numbers.
 pub struct Stream<T> {
@@ -1568,6 +1653,73 @@ mod ticket_tests {
         assert_eq!(effects.len(), 2);
         let mut other = Effects::new();
         assert_ne!(other.push(lookup().call(1)), a);
+    }
+
+    #[test]
+    fn group_tickets_read_branches_in_declaration_order_with_raw_group_bytes() {
+        let limits = CodecLimits { max_bytes: 65_536 };
+        #[derive(Default)]
+        struct Grouped {
+            pending: Option<(Ticket<String>, Ticket<String>)>,
+            last: Option<Ticket<String>>,
+            stale: Option<Ticket<String>>,
+        }
+        impl TypedExtension for Grouped {
+            fn invoke(&mut self, invocation: TypedInvocation) -> Result<ExtensionResponse> {
+                let mut group = EffectGroup::new(abi::EffectGroupMode::FailFast, 2);
+                assert!(group.is_empty());
+                let a = group.push("a", lookup().call(1));
+                let b = group.push("b", lookup().call(2));
+                assert_eq!((a.index(), b.index(), group.len()), (0, 1, 2));
+                if invocation.export() == "stale" {
+                    self.stale = self.last;
+                }
+                self.last = Some(a);
+                self.pending = Some((a, b));
+                Ok(ExtensionResponse::yield_effect_group(group))
+            }
+            fn resume(&mut self, resume: ResumeContext) -> Result<ExtensionResponse> {
+                if let Some(stale) = self.stale.take() {
+                    return resume.get(stale).map(ExtensionResponse::new);
+                }
+                let (a, b) = self.pending.take().unwrap();
+                Ok(ExtensionResponse::new(alloc::format!("{}/{}", resume.get(a)?, resume.get(b)?)))
+            }
+        }
+        // Same bytes as the raw group the m2 fixture used to build by hand.
+        let raw = ExtensionResponse::yield_group(abi::EffectGroup {
+            format: abi::EFFECT_GROUP_FORMAT.into(),
+            limit: 2,
+            mode: abi::EffectGroupMode::FailFast,
+            branches: ["a", "b"]
+                .into_iter()
+                .zip([1u64, 2])
+                .map(|(name, input)| abi::NamedEffect { name: name.into(), effect: lookup().call(input).into_effect() })
+                .collect(),
+        });
+        let mut extension = boxed_extension(Grouped::default());
+        let yielded = extension.invoke(id(1), invocation("load"));
+        assert_eq!(
+            abi::encode(&Frame::new(yielded), limits).unwrap(),
+            abi::encode(&Frame::new(raw.into_message(id(1))), limits).unwrap()
+        );
+        // Outcomes arrive out of order; tickets still read their own branch.
+        let outcomes = alloc::vec![
+            EffectOutcome { index: 1, result: Ok(Value::String("B".into())) },
+            EffectOutcome { index: 0, result: Ok(Value::String("A".into())) },
+        ];
+        match extension.resume(id(1), outcomes.clone(), Vec::new()) {
+            GuestMessage::Completed { result, .. } => assert_eq!(result.output, Value::String("A/B".into())),
+            other => panic!("expected completion, got {other:?}"),
+        }
+        // A ticket from the previous group (an earlier yield step) is rejected.
+        extension.invoke(id(2), invocation("load"));
+        extension.resume(id(2), outcomes.clone(), Vec::new());
+        extension.invoke(id(3), invocation("stale"));
+        match extension.resume(id(3), outcomes, Vec::new()) {
+            GuestMessage::Failed { error, .. } => assert!(error.message.contains("another effect plan"), "{}", error.message),
+            other => panic!("expected the stale ticket to fail, got {other:?}"),
+        }
     }
 
     #[test]

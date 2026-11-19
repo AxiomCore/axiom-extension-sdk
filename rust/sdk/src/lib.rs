@@ -19,7 +19,7 @@ pub use axiom_extension_abi as abi;
 pub use axiom_extension_sdk_derive::{export, extension, AxiomType};
 pub use primitives::{Cents, DurationMs, Id, Percentage, Revision, TimestampMs};
 pub use typed::{
-    boxed_extension, AxiomDecode, AxiomEncode, AxiomType, EffectCall, Effects, ExtensionResponse,
+    boxed_extension, AxiomDecode, AxiomEncode, AxiomType, EffectCall, EffectGroup, Effects, ExtensionResponse,
     Operation, RecordDecoder, Result, ResumeContext, SdkError, Store, StoreField, StoreObject,
     StorePatch, StoreTransaction, Stream, StreamBatch, Ticket, TypedExtension, TypedInvocation, UiField,
     UiPatch, UiScope, UiState,
