@@ -153,13 +153,11 @@ impl Checkout {
   `cx.emit(..)` add to the final result; `cx.invocation()` gives the input and
   the round-1 snapshots (`UiState::generated(cx.invocation())` as in sync
   exports). The host revision-checks final patches against the round-1
-  snapshots. When the input parameter is `Value` and the export uses its
-  context only for `cx.call`, `cx.round`, `cx.max_rounds`, `cx.patch`,
-  `cx.transaction` or `cx.emit`, the input is moved into the argument (no copy
-  every round). Any other use of the context (`cx.input()`,
-  `cx.invocation()`, passing `cx` to a helper) keeps the input copied, so
-  `cx.input()` and `cx.invocation().input()` always see it. Typed inputs are
-  decoded by reference and stay readable both ways.
+  snapshots. When the input parameter is `Value`, the input is moved into the
+  argument (no copy of the value every round); `cx.input()` and
+  `cx.invocation().input()` still see it (they decode it again from the
+  round's frame, only when called). Typed inputs are decoded by reference and
+  stay readable both ways.
 - **Sites (X9c).** Generated binding items are `#[track_caller]`; with the
   site table the build embeds, every `cx.call(..)`, typed ticket and group
   ticket carries the site of its binding call, and an ABI 1.1 yield is sent as

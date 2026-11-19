@@ -185,10 +185,7 @@ fn expand_extension(mut implementation: ItemImpl) -> syn::Result<proc_macro2::To
             async_exports.push(AsyncExport {
                 name: export_name,
                 method: method.sig.ident.clone(),
-                // W2A-1: move only when the body cannot read the input
-                // through the context, so `cx.input()` and
-                // `cx.invocation().input()` keep working everywhere.
-                value_input: value_input_type(&method.sig).filter(|_| context_cannot_reach_input(method)),
+                value_input: value_input_type(&method.sig),
             });
             continue;
         }
@@ -266,11 +263,9 @@ struct AsyncExport {
     name: LitStr,
     method: syn::Ident,
     /// The input parameter's type when it is spelled `Value` (any path ending
-    /// in `Value`) and the body cannot reach the input through its context
-    /// ([`context_cannot_reach_input`]): the executor moves the input into the
-    /// argument instead of cloning it every round. Whether it really is
-    /// `abi::Value` is checked with `TypeId` in the generated code; other
-    /// types decode as before.
+    /// in `Value`): the executor moves the input into the argument instead of
+    /// cloning it every round. Whether it really is `abi::Value` is checked
+    /// with `TypeId` in the generated code; other types decode as before.
     value_input: Option<syn::Type>,
 }
 
@@ -290,55 +285,6 @@ fn value_input_type(signature: &syn::Signature) -> Option<syn::Type> {
         }
         _ => None,
     }
-}
-
-/// Methods of `Cx` that cannot read the export input. A body that uses its
-/// context only as `cx.<one of these>` cannot see the input except through
-/// its argument, so the input can be moved into the argument (H-1).
-const INPUT_FREE_CONTEXT_METHODS: &[&str] =
-    &["call", "round", "max_rounds", "patch", "transaction", "emit", "__input_moved"];
-
-/// W2A-1: true when the async export's body cannot reach the input through
-/// its context parameter: every use of the parameter's name is
-/// `name.<method>` with an input-free method ([`INPUT_FREE_CONTEXT_METHODS`]),
-/// or the parameter is `_`. Any other use (`cx.input()`, `cx.invocation()`,
-/// passing `cx` to a function or macro, a closure, a rebinding, a field or
-/// item of the same name) keeps the input copied, exactly as before H-1.
-/// Conservative: a false answer only costs the per-round copy.
-fn context_cannot_reach_input(method: &syn::ImplItemFn) -> bool {
-    let Some(syn::FnArg::Typed(argument)) = method.sig.inputs.first() else {
-        return false;
-    };
-    let name = match &*argument.pat {
-        syn::Pat::Wild(_) => return true,
-        syn::Pat::Ident(ident) if ident.by_ref.is_none() && ident.subpat.is_none() => ident.ident.to_string(),
-        _ => return false,
-    };
-    fn only_input_free_uses(stream: proc_macro2::TokenStream, name: &str) -> bool {
-        let tokens: Vec<proc_macro2::TokenTree> = stream.into_iter().collect();
-        for (index, token) in tokens.iter().enumerate() {
-            match token {
-                proc_macro2::TokenTree::Group(group) => {
-                    if !only_input_free_uses(group.stream(), name) {
-                        return false;
-                    }
-                }
-                proc_macro2::TokenTree::Ident(ident) if *ident == name => {
-                    let dot = matches!(tokens.get(index + 1), Some(proc_macro2::TokenTree::Punct(p)) if p.as_char() == '.');
-                    let method = match tokens.get(index + 2) {
-                        Some(proc_macro2::TokenTree::Ident(method)) => method.to_string(),
-                        _ => return false,
-                    };
-                    if !dot || !INPUT_FREE_CONTEXT_METHODS.contains(&method.as_str()) {
-                        return false;
-                    }
-                }
-                _ => {}
-            }
-        }
-        true
-    }
-    only_input_free_uses(quote::ToTokens::to_token_stream(&method.block), &name)
 }
 
 /// `async fn name(cx: &Cx, input: In) -> Result<Out>`: no receiver, a

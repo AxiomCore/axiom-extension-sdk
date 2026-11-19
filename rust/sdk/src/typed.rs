@@ -324,6 +324,9 @@ fn value_kind(value: &Value) -> &'static str {
 pub struct TypedInvocation {
     request_id: RequestId,
     invocation: Invocation,
+    /// W2A-1: the input was moved into an async export's `Value` argument;
+    /// [`TypedInvocation::input`] decodes it again from the round's frame.
+    input_moved: bool,
 }
 
 impl TypedInvocation {
@@ -331,7 +334,13 @@ impl TypedInvocation {
         Self {
             request_id,
             invocation,
+            input_moved: false,
         }
+    }
+
+    /// The input was moved out of this invocation (async executor, H-1).
+    pub(crate) fn mark_input_moved(&mut self) {
+        self.input_moved = true;
     }
 
     pub fn request_id(&self) -> RequestId {
@@ -354,6 +363,16 @@ impl TypedInvocation {
     }
 
     pub fn input<T: AxiomDecode>(&self) -> Result<T> {
+        if self.input_moved {
+            // W2A-1: the input went to the export's `Value` argument; read it
+            // again from the round's frame (only when it is asked for).
+            return match crate::round_frame::input() {
+                Some(input) => T::decode(&input),
+                None => Err(SdkError::invalid_input(
+                    "the export input was moved into the export's `Value` argument; read it from the argument",
+                )),
+            };
+        }
         T::decode(&self.invocation.input)
     }
 

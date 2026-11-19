@@ -204,8 +204,9 @@ impl Guest {
         Ok(a + b + c)
     }
 
-    /// A `Value` input with `cx.input()` and `cx.invocation()` also used
-    /// (W2A-1): the input is copied, as before H-1, so all three see it.
+    /// A `Value` input with `cx.input()` and `cx.invocation().input()` also
+    /// used (W2A-1): the input is still moved into the argument, and the
+    /// context decodes it again from the round's frame, so all three see it.
     #[export]
     async fn value_input(cx: &Cx, input: Value) -> Result<Value> {
         let again = cx.input::<Value>()?;
@@ -228,7 +229,7 @@ impl Guest {
     }
 
     /// The context handed to a helper that reads the input (W2A-1): the
-    /// input is copied, so the helper sees it.
+    /// helper sees it.
     #[export]
     async fn value_input_in_helper(cx: &Cx, input: Value) -> Result<Value> {
         fn read(cx: &Cx) -> Result<Value> {
@@ -1095,10 +1096,10 @@ fn memo_less_rounds_give_the_same_replies_as_the_warm_adapter() {
 }
 
 /// H-1: an export whose input parameter is `Value` takes the input by move
-/// (no per-round copy) when its context cannot read the input. W2A-1: an
-/// export that also reads the input through `cx.input()`,
-/// `cx.invocation().input()` or a helper given `cx` gets it everywhere, as
-/// before H-1 (the input is copied). Typed inputs are unchanged.
+/// (no per-round copy of the value). W2A-1: an export that also reads the
+/// input through `cx.input()`, `cx.invocation().input()` or a helper given
+/// `cx` gets it everywhere, as before H-1 (decoded again from the round's
+/// frame when asked). Typed inputs are unchanged.
 #[test]
 fn a_value_input_is_moved_into_the_argument_and_typed_inputs_are_unchanged() {
     let mut host = guest();
@@ -1110,7 +1111,7 @@ fn a_value_input_is_moved_into_the_argument_and_typed_inputs_are_unchanged() {
     assert_eq!(items[1], n(10));
     assert_eq!(items[2], input, "cx.input() sees the input (W2A-1)");
     assert_eq!(items[3], input, "cx.invocation().input() sees the input (W2A-1)");
-    assert_eq!(items[4], Value::Bool(false), "an export reading cx.input() copies the input");
+    assert_eq!(items[4], Value::Bool(true), "the input is still moved into the argument");
     // The plan used the input in round 1 and replayed it in round 2.
     assert_eq!(run.plans, vec![RoundPlan::Plan(EffectPlan { effects: vec![effect("load", input.clone())] })]);
 
