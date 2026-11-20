@@ -3,6 +3,8 @@
 // build keeps the ABI 1.0 runner and none of the async runtime (w2-c2 L-5).
 import { createResumeContext, createContext, type ExtensionDefinition, type ExtensionResponse } from "./index.js";
 import { LOWERED_ASYNC, asyncHandlerOf, installStepHook, probeAsyncBuild, startAsyncRound, type AsyncHandler, type RoundRequest, type RoundResponse } from "./async.js";
+/** The async build's realm prelude installs the plan-order hooks before it freezes the intrinsics. */
+export { installOrderingHooks } from "./async.js";
 
 declare const Javy: {
   IO: {
