@@ -828,6 +828,8 @@ mod replay {
                 return Err(bad("tape failed its integrity check (content changed after recording)"));
             }
             let header = field(&tape, "header")?;
+            // Current recorders refuse instead of redacting (x9d §3, w3-bc3):
+            // only a tape of an earlier dev recorder says `replayable: false`.
             if header.get("replayable").and_then(Json::as_bool) != Some(true) {
                 return Err(bad("tape has redacted values and cannot be replayed byte-exactly"));
             }
