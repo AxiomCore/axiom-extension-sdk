@@ -84,8 +84,10 @@ def load_tape(data: bytes | str, expect_extension: str | None = None) -> dict[st
     Refused: over the size cap, not JSON, nesting deeper than
     ``MAX_TAPE_DEPTH``, a duplicate object key (the digest covers the parsed
     content, so bytes that could parse to two meanings are not accepted),
-    another format or version, a failed integrity digest, a redacted tape,
-    and (with ``expect_extension``) a tape of another extension.
+    another format or version, a failed integrity digest, a redacted tape
+    (``replayable: false``; only earlier dev recorders wrote these, the
+    current recorder refuses instead of redacting, x9d §3), and (with
+    ``expect_extension``) a tape of another extension.
     """
     raw = data.encode("utf-8") if isinstance(data, str) else data
     if len(raw) > MAX_TAPE_FILE_BYTES:

@@ -265,6 +265,8 @@ export function verifyTape(tape: Json): ReplayTapeDocument {
   if (integrity.algorithm !== "sha256" || integrity.digest !== sha256Hex(new TextEncoder().encode(canonicalJson(content)))) {
     fail("tape failed its integrity check (content changed after recording)");
   }
+  // Current recorders refuse instead of redacting (x9d §3, w3-bc3): only a tape
+  // of an earlier dev recorder says `replayable: false`.
   if (tape.header?.replayable !== true) fail("tape has redacted values and cannot be replayed byte-exactly");
   return tape as ReplayTapeDocument;
 }
