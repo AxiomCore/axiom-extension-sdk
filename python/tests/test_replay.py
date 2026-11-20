@@ -49,6 +49,35 @@ class TapeLoader(unittest.TestCase):
     def test_canonical_json_matches_the_recorder(self) -> None:
         self.assertEqual(replay.canonical_json({"b": [1, {"d": "x", "c": None}], "a": "é\n"}), '{"a":"é\\n","b":[1,{"c":null,"d":"x"}]}')
 
+    def test_duplicate_keys_depth_and_identity(self) -> None:
+        """w3-bc2 (w3-vbc findings 10, 12, 6)."""
+        text = tape("py_rounds-run").decode()
+        with self.assertRaisesRegex(replay.TapeError, "duplicate key `abi`"):
+            replay.load_tape(text.replace('"abi": ', '"abi": "1.1",\n  "abi": ', 1))
+        deep = "[" * 100_000 + "]" * 100_000
+        with self.assertRaisesRegex(replay.TapeError, "nesting deeper than 128"):
+            replay.load_tape(deep)
+        # Brackets inside strings do not count.
+        self.assertEqual(replay._depth(b'{"a": "[[[[[[", "b": [1]}'), 2)
+        with self.assertRaisesRegex(replay.TapeError, "not JSON"):
+            replay.load_tape(text + " {}")
+        loaded = replay.load_tape(text + "\n\n")
+        extension = loaded["identity"]["extension"]
+        self.assertEqual(replay.load_tape(text, expect_extension=extension)["format"], replay.FORMAT)
+        with self.assertRaisesRegex(replay.TapeError, "AXIOM_EXTENSION_REPLAY_IDENTITY"):
+            replay.load_tape(text, expect_extension="someone.else")
+
+    def test_integers_above_2_53_are_exact(self) -> None:
+        document = json.loads(tape("py_rounds-run"))
+        document.pop("integrity")
+        document["invocation"]["input"] = {"Unsigned": 2**64 - 1}
+        import hashlib
+
+        digest = hashlib.sha256(replay.canonical_json(document).encode()).hexdigest()
+        document["integrity"] = {"algorithm": "sha256", "digest": digest}
+        loaded = replay.load_tape(json.dumps(document))
+        self.assertEqual(loaded["invocation"]["input"]["Unsigned"], 2**64 - 1)
+
 
 if __name__ == "__main__":
     unittest.main()
