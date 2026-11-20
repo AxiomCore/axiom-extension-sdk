@@ -35,6 +35,7 @@ PAIRS = [
     ("typescript/src/runner-async.ts", "extensions/typescript/sdk/src/runner-async.ts"),
     ("typescript/src/schema.ts", "extensions/typescript/sdk/src/schema.ts"),
     ("typescript/src/schema-runtime.ts", "extensions/typescript/sdk/src/schema-runtime.ts"),
+    ("typescript/src/replay.ts", "extensions/typescript/sdk/src/replay.ts"),
     ("python/axiom_extension_sdk/__init__.pyi", "extensions/python/sdk/axiom_extension_sdk/__init__.pyi"),
 ]
 
@@ -75,6 +76,7 @@ CANONICAL_ONLY = {
     "typescript/src/selected.ts": "selected-profile runtime is consumed from the published package only",
     "python/axiom_extension_sdk/__init__.py": "runtime mirror ships typing stubs only",
     "python/axiom_extension_sdk/py.typed": "runtime mirror ships typing stubs only",
+    "python/axiom_extension_sdk/replay.py": "X9d test helper (replays tapes against compiled modules); runtime mirror ships typing stubs only",
 }
 
 # Byte copies of canonical SDK files that other repositories embed. The

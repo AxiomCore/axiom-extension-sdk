@@ -190,6 +190,15 @@ pub struct RoundRecord {
     pub events: Vec<EventBatch>,
 }
 
+/// SHA-256 of `data`, with this crate's dependency-free implementation (the
+/// one behind [`round_plan_hash`]). Used by the SDK's dev replay-tape reader
+/// (X9d) for the tape's integrity digest; it adds no dependency to guests.
+pub fn sha256_digest(data: &[u8]) -> [u8; 32] {
+    let mut hasher = sha256::Sha256::new();
+    hasher.update(data);
+    hasher.finish()
+}
+
 /// The ADR 0001 plan hash, over the canonical postcard encoding. Guests
 /// return the hashes of the plans they re-derive during replay; the host
 /// compares them with the tape. This is a determinism check, not a security

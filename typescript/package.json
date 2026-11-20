@@ -20,6 +20,10 @@
       "types": "./dist/money.d.ts",
       "default": "./dist/money.js"
     },
+    "./replay": {
+      "types": "./dist/replay.d.ts",
+      "default": "./dist/replay.js"
+    },
     "./runner": {
       "types": "./dist/runner.d.ts",
       "default": "./dist/runner.js"
