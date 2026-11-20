@@ -436,6 +436,11 @@ fn export_name(attribute: &Attribute, method: &syn::Ident) -> syn::Result<LitStr
                 if !meta.path.is_ident("name") {
                     return Err(meta.error("supported export option: name = \"...\""));
                 }
+                if result.is_some() {
+                    // w2-d4: a repeated `name` used to keep the last one silently; the
+                    // X9a analyser follows the macro (last wins) but a reader takes the first.
+                    return Err(meta.error("duplicate export option `name`"));
+                }
                 let expression: Expr = meta.value()?.parse()?;
                 let Expr::Lit(ExprLit {
                     lit: Lit::Str(name),
@@ -470,4 +475,34 @@ fn valid_export_name(name: LitStr) -> syn::Result<LitStr> {
         ));
     }
     Ok(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn name_of(attribute: Attribute) -> syn::Result<String> {
+        let method: syn::Ident = syn::parse_quote!(run);
+        export_name(&attribute, &method).map(|name| name.value())
+    }
+
+    #[test]
+    fn an_export_takes_one_name() {
+        assert_eq!(name_of(syn::parse_quote!(#[export])).unwrap(), "run");
+        assert_eq!(name_of(syn::parse_quote!(#[export("quote")])).unwrap(), "quote");
+        assert_eq!(name_of(syn::parse_quote!(#[export(name = "quote")])).unwrap(), "quote");
+    }
+
+    #[test]
+    fn a_repeated_export_name_is_refused() {
+        // w2-d4 / w2-i: `name` given twice used to keep the last one silently.
+        for attribute in [
+            syn::parse_quote!(#[export(name = "a", name = "b")]),
+            syn::parse_quote!(#[export(name = "a", name = "a")]),
+            syn::parse_quote!(#[export(name = "a", name = "b", name = "c")]),
+        ] {
+            let error = name_of(attribute).unwrap_err();
+            assert!(error.to_string().contains("duplicate export option `name`"), "{error}");
+        }
+    }
 }

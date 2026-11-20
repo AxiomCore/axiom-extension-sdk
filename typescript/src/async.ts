@@ -237,7 +237,17 @@ let orderingInstalled = false;
  * Install the plan-order hooks (once per engine; every round is a fresh
  * engine in production). Outside a round (`currentNode` undefined) every hook
  * behaves exactly like the native one.
+ *
+ * Realm freeze (X9a w2-d4 proposal, applied by w2-i): the async build's realm
+ * prelude calls this (as `installOrderingHooks`) *before* it freezes `Promise`,
+ * `Promise.prototype` and the other intrinsics and before any guest code
+ * runs; `RoundRun.start` then finds the hooks installed and redefines nothing
+ * (a redefinition would fail on the frozen intrinsics).
  */
+export function installOrderingHooks(): void {
+  installOrdering();
+}
+
 function installOrdering(): void {
   if (orderingInstalled) return;
   orderingInstalled = true;
@@ -318,11 +328,15 @@ export function canonicalRoundPlan(plan: RoundPlanJson): string {
  * escape fails the invocation with the same `code` (the Rust SDK's `?`).
  */
 export class HostOperationError extends Error {
+  // A class field *defines* the own property: an assignment (`this.name = …`)
+  // throws in strict code once `Error.prototype.name` is frozen (the override
+  // mistake). The realm freeze leaves Error prototypes writable, so this is
+  // defence in depth for guests that freeze them.
+  override readonly name = "HostOperationError";
   readonly code: string;
   readonly retryable: boolean;
   constructor(code: string, message: string, retryable = false) {
     super(message);
-    this.name = "HostOperationError";
     this.code = code;
     this.retryable = retryable;
   }
