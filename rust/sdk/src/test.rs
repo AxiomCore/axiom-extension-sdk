@@ -629,6 +629,7 @@ mod replay {
         max_rounds: u16,
         application: String,
         extension: String,
+        module_sha256: Option<String>,
         invocation: Invocation,
         rounds: Vec<Round>,
         status: String,
@@ -654,6 +655,50 @@ mod replay {
 
     fn differs(message: impl core::fmt::Display) -> SdkError {
         SdkError::new(ErrorCode::Protocol, format!("AXIOM_EXTENSION_REPLAY_DIFFERS: {message}"))
+    }
+
+    /// Fail on a duplicate object key anywhere in `bytes` (already known to
+    /// be valid JSON).
+    fn no_duplicate_keys(bytes: &[u8]) -> core::result::Result<(), String> {
+        let mut stack: Vec<Option<std::collections::BTreeSet<String>>> = Vec::new();
+        let mut last = b' ';
+        let mut index = 0;
+        while index < bytes.len() {
+            let byte = bytes[index];
+            match byte {
+                b'{' => stack.push(Some(Default::default())),
+                b'[' => stack.push(None),
+                b'}' | b']' => {
+                    stack.pop();
+                }
+                b'"' => {
+                    let start = index;
+                    index += 1;
+                    while index < bytes.len() && bytes[index] != b'"' {
+                        if bytes[index] == b'\\' {
+                            index += 1;
+                        }
+                        index += 1;
+                    }
+                    let key_position = matches!(last, b'{' | b',');
+                    if let Some(Some(keys)) = stack.last_mut() {
+                        if key_position {
+                            let key: String = serde_json::from_slice(&bytes[start..=index.min(bytes.len() - 1)])
+                                .map_err(|error| format!("malformed key: {error}"))?;
+                            if !keys.insert(key.clone()) {
+                                return Err(format!("malformed tape: duplicate key `{key}`"));
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            if !byte.is_ascii_whitespace() {
+                last = bytes[index.min(bytes.len() - 1)];
+            }
+            index += 1;
+        }
+        Ok(())
     }
 
     fn canonical(value: &Json, out: &mut String) {
@@ -761,6 +806,9 @@ mod replay {
                 return Err(bad(format!("tape is {} bytes, over the {MAX_TAPE_FILE_BYTES}-byte limit", bytes.len())));
             }
             let mut tape: Json = serde_json::from_slice(bytes).map_err(|error| bad(format!("not JSON: {error}")))?;
+            // The digest covers the parsed content: refuse bytes that parse
+            // to two meanings (a duplicate key; serde_json keeps the last).
+            no_duplicate_keys(bytes).map_err(bad)?;
             if tape.get("format").and_then(Json::as_str) != Some("axiom-extension-replay-tape") {
                 return Err(bad("not an axiom-extension-replay-tape document"));
             }
@@ -837,6 +885,7 @@ mod replay {
                 max_rounds,
                 application: text(identity, "application")?,
                 extension: text(identity, "extension")?,
+                module_sha256: identity.get("moduleSha256").and_then(Json::as_str).map(str::to_string),
                 invocation,
                 rounds,
                 status: text(terminal, "status")?,
@@ -853,6 +902,26 @@ mod replay {
 
         pub fn export(&self) -> &str {
             &self.invocation.export
+        }
+
+        /// The recording's identity: application, extension and module
+        /// SHA-256 (when the recording host knew it).
+        pub fn identity(&self) -> (&str, &str, Option<&str>) {
+            (&self.application, &self.extension, self.module_sha256.as_deref())
+        }
+
+        /// Refuse a tape recorded for another extension (the in-process
+        /// replay has no package identity of its own; the caller names the
+        /// extension it replays). The negotiated ABI is checked by
+        /// [`TapeReplay::replay`] itself.
+        pub fn expect_extension(self, extension: &str) -> Result<Self> {
+            if self.extension != extension {
+                return Err(SdkError::invalid_input(format!(
+                    "AXIOM_EXTENSION_REPLAY_IDENTITY: the tape was recorded for extension `{}`, not `{extension}`",
+                    self.extension
+                )));
+            }
+            Ok(self)
         }
 
         /// Replay against `extension`. `Ok` means identical; a difference is

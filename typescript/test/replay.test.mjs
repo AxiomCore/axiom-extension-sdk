@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { readFileSync } from "node:fs";
 import { defineExtension, extension, operation } from "../dist/index.js";
-import { parseTape, replayTape, ReplayDifference, canonicalJson, sha256Hex } from "../dist/replay.js";
+import { parseTape, replayTape, ReplayDifference, canonicalJson, sha256Hex, parseExactJson, verifyTape, ExactInteger } from "../dist/replay.js";
 
 const catalog = (name) => operation("catalog", name);
 const LOAD = catalog("load");
@@ -67,4 +67,65 @@ test("tampered, foreign and redacted tapes are refused", () => {
   const doc = JSON.parse(text);
   doc.header.replayable = false;
   assert.throws(() => parseTape(JSON.stringify(doc)), /integrity check|redacted/);
+});
+
+// w3-bc2 (w3-vbc finding 10): exact integers, already-parsed objects verified
+// like text, duplicate keys, trailing content, depth, identity.
+const reseal = (doc) => {
+  const { integrity, ...content } = doc;
+  return { ...content, integrity: { algorithm: "sha256", digest: sha256Hex(new TextEncoder().encode(canonicalJson(content))) } };
+};
+// `this[key]` is the value before its toJSON ran.
+const exactText = (doc) => JSON.stringify(doc, function (key, value) { const raw = this[key]; return raw instanceof ExactInteger ? `@@${raw.text}@@` : value; }, 2).replace(/"@@(-?[0-9]+)@@"/g, "$1");
+
+test("integers above 2^53 are read exactly and handed to the guest as exact strings", () => {
+  const doc = parseExactJson(tape("ts_rounds-sync_yield"));
+  doc.invocation.input = { Unsigned: new ExactInteger("9007199254740993") };
+  const text = exactText(reseal(doc));
+  assert.match(text, /"Unsigned": 9007199254740993\b/);
+  const parsed = parseTape(text);
+  assert.ok(parsed.invocation.input.Unsigned instanceof ExactInteger);
+  assert.equal(parsed.invocation.input.Unsigned.text, "9007199254740993");
+  // A JSON.parse result has rounded it: refused rather than mis-verified.
+  assert.throws(() => verifyTape(JSON.parse(text)), /outside the exact range/);
+  assert.equal(parseExactJson("18446744073709551615").text, "18446744073709551615");
+  assert.equal(parseExactJson("-9223372036854775808").text, "-9223372036854775808");
+  assert.equal(parseExactJson("9007199254740991"), 9007199254740991);
+});
+
+test("an already-parsed tape is verified exactly like text", async () => {
+  const text = tape("ts_rounds-sync_yield");
+  assert.equal((await replayTape(same, JSON.parse(text))).yields, 1);
+  const tampered = JSON.parse(text);
+  tampered.invocation.input = { Unsigned: 999 };
+  await assert.rejects(replayTape(same, tampered), /integrity check/);
+  const future = JSON.parse(text);
+  future.version = 2;
+  await assert.rejects(replayTape(same, future), /unsupported tape version/);
+  const redacted = reseal(JSON.parse(text));
+  redacted.header.replayable = false;
+  await assert.rejects(replayTape(same, reseal(redacted)), /redacted/);
+});
+
+test("duplicate keys, trailing content and deep nesting are refused", () => {
+  const text = tape("ts_rounds-sync_yield");
+  assert.throws(() => parseTape(text.replace('"abi": ', '"abi": "1.1",\n  "abi": ')), /duplicate key `abi`/);
+  assert.throws(() => parseTape(`${text} {}`), /trailing content/);
+  assert.throws(() => parseExactJson(`${"[".repeat(200)}${"]".repeat(200)}`), /nesting deeper than 128/);
+  assert.equal(parseTape(`${text}\n\n`).format, "axiom-extension-replay-tape");
+  // `__proto__` is data, never the prototype.
+  const odd = parseExactJson('{"__proto__": {"polluted": true}}');
+  assert.equal(Object.getPrototypeOf(odd), Object.prototype);
+  assert.equal({}.polluted, undefined);
+});
+
+test("a replay can require the recording's identity", async () => {
+  const text = tape("ts_rounds-sync_yield");
+  const doc = parseTape(text);
+  await assert.rejects(replayTape(same, text, { expect: { extension: "someone.else" } }), /AXIOM_EXTENSION_REPLAY_IDENTITY/);
+  assert.equal((await replayTape(same, text, { expect: { extension: doc.identity.extension, application: doc.identity.application } })).yields, 1);
+  if (doc.identity.moduleSha256) {
+    await assert.rejects(replayTape(same, text, { expect: { moduleSha256: "f".repeat(64) } }), /different build/);
+    assert.equal((await replayTape(same, text, { expect: { moduleSha256: "f".repeat(64), allowIdentityMismatch: true } })).yields, 1);
+  }
 });

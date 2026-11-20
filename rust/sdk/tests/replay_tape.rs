@@ -124,3 +124,33 @@ fn tampered_tapes_fail_the_integrity_check() {
     assert!(error.message.contains("integrity check"), "{}", error.message);
     assert!(TestHost::from_tape(b"{}").unwrap_err().message.contains("not an axiom-extension-replay-tape"));
 }
+
+/// w3-bc2 (w3-vbc finding 12): bytes that parse to two meanings are refused
+/// (a duplicate key would otherwise pass the digest, which covers the parsed
+/// content), and trailing content is refused.
+#[test]
+fn duplicate_keys_and_trailing_content_are_refused() {
+    let text = String::from_utf8(tape("vac_rust_w2a-run")).unwrap();
+    // Duplicate the `abi` member (same value, so the digest still matches).
+    let duplicated = text.replacen("\"abi\": ", "\"abi\": \"1.1\",\n  \"abi\": ", 1);
+    assert_ne!(duplicated, text);
+    let error = TestHost::from_tape(duplicated.as_bytes()).unwrap_err();
+    assert!(error.message.contains("duplicate key `abi`"), "{}", error.message);
+    let trailing = format!("{text} {{}}");
+    assert!(TestHost::from_tape(trailing.as_bytes()).is_err());
+    // Whitespace alone does not change the meaning and is accepted.
+    assert!(TestHost::from_tape(format!("{text}\n\n").as_bytes()).is_ok());
+}
+
+/// w3-bc2 (finding 6): the in-process replayer refuses a tape of another
+/// extension when the caller names the one it replays.
+#[test]
+fn a_tape_of_another_extension_is_refused_by_name() {
+    let replay = TestHost::from_tape(&tape("vac_rust_w2a-run")).unwrap();
+    let (application, extension, _module) = replay.identity();
+    let extension = extension.to_string();
+    assert!(!application.is_empty() && !extension.is_empty());
+    let error = replay.clone().expect_extension("someone.else").unwrap_err();
+    assert!(error.message.starts_with("AXIOM_EXTENSION_REPLAY_IDENTITY"), "{}", error.message);
+    assert!(replay.expect_extension(&extension).unwrap().replay(same::extension()).is_ok());
+}

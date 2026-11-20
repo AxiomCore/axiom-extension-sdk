@@ -52,12 +52,140 @@ export class ReplayDifference extends Error {
   }
 }
 
+/**
+ * An integer outside JavaScript's exact range (|n| > 2^53 - 1), kept as its
+ * decimal text so the tape digest and the replay see the exact value. The
+ * replay hands it to the guest as an exact decimal string, as the managed
+ * kernel does for every integer outside that range.
+ */
+export class ExactInteger {
+  constructor(readonly text: string) {}
+  toJSON(): string {
+    return this.text;
+  }
+}
+
+/** Nesting deeper than this is refused (the Rust reader's limit). */
+export const MAX_TAPE_DEPTH = 128;
+
 /** Canonical JSON: keys sorted, no whitespace (the tape digest's input). */
 export function canonicalJson(value: Json): string {
+  if (value instanceof ExactInteger) return value.text;
+  if (typeof value === "bigint") return value.toString();
   if (value === null || typeof value !== "object") return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
   const keys = Object.keys(value).sort();
   return `{${keys.map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+}
+
+/**
+ * Parse JSON exactly: integers outside the exact range become
+ * `ExactInteger`, a duplicate object key, trailing content and nesting deeper
+ * than `MAX_TAPE_DEPTH` are refused (the digest covers the parsed content, so
+ * a document that could parse to two meanings is not accepted).
+ */
+export function parseExactJson(text: string): Json {
+  let at = 0;
+  const error = (message: string): never => fail(`not JSON: ${message} at offset ${at}`);
+  const space = () => {
+    while (at < text.length && " \t\n\r".includes(text[at])) at++;
+  };
+  const value = (depth: number): Json => {
+    if (depth > MAX_TAPE_DEPTH) fail(`nesting deeper than ${MAX_TAPE_DEPTH}`);
+    space();
+    const c = text[at];
+    if (c === "{") {
+      at++;
+      const out: Record<string, Json> = {};
+      const seen = new Set<string>();
+      space();
+      if (text[at] === "}") {
+        at++;
+        return out;
+      }
+      for (;;) {
+        space();
+        if (text[at] !== "\"") error("expected a key");
+        const key = string();
+        if (seen.has(key)) fail(`malformed tape: duplicate key \`${key}\``);
+        seen.add(key);
+        space();
+        if (text[at] !== ":") error("expected `:`");
+        at++;
+        // defineProperty: a `__proto__` key is data, never the prototype.
+        Object.defineProperty(out, key, { value: value(depth + 1), enumerable: true, writable: true, configurable: true });
+        space();
+        if (text[at] === ",") {
+          at++;
+          continue;
+        }
+        if (text[at] === "}") {
+          at++;
+          return out;
+        }
+        error("expected `,` or `}`");
+      }
+    }
+    if (c === "[") {
+      at++;
+      const out: Json[] = [];
+      space();
+      if (text[at] === "]") {
+        at++;
+        return out;
+      }
+      for (;;) {
+        out.push(value(depth + 1));
+        space();
+        if (text[at] === ",") {
+          at++;
+          continue;
+        }
+        if (text[at] === "]") {
+          at++;
+          return out;
+        }
+        error("expected `,` or `]`");
+      }
+    }
+    if (c === "\"") return string();
+    for (const [word, result] of [["true", true], ["false", false], ["null", null]] as const) {
+      if (text.startsWith(word, at)) {
+        at += word.length;
+        return result;
+      }
+    }
+    const match = /^-?(?:0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?/.exec(text.slice(at, at + 400));
+    if (!match) error("unexpected character");
+    at += match![0].length;
+    const number = Number(match![0]);
+    if (match![1] === undefined && match![2] === undefined && !Number.isSafeInteger(number)) return new ExactInteger(match![0]);
+    return number;
+  };
+  const string = (): string => {
+    const start = at;
+    at++;
+    while (at < text.length && text[at] !== "\"") at += text[at] === "\\" ? 2 : 1;
+    if (at >= text.length) error("unterminated string");
+    at++;
+    return JSON.parse(text.slice(start, at));
+  };
+  const result = value(0);
+  space();
+  if (at !== text.length) error("trailing content");
+  return result;
+}
+
+/** The tape with every `ExactInteger` as the exact decimal string the guest sees. */
+function bridged(value: Json): Json {
+  if (value instanceof ExactInteger) return value.text;
+  if (Array.isArray(value)) return value.map(bridged);
+  if (value !== null && typeof value === "object") {
+    const out: Record<string, Json> = {};
+    for (const key of Object.keys(value)) out[key] = bridged(value[key]);
+    return out;
+  }
+  return value;
 }
 
 const K = new Uint32Array([
@@ -110,14 +238,28 @@ function fail(message: string): never {
 export function parseTape(text: string): ReplayTapeDocument {
   const bytes = new TextEncoder().encode(text);
   if (bytes.length > MAX_TAPE_FILE_BYTES) fail(`tape is ${bytes.length} bytes, over the ${MAX_TAPE_FILE_BYTES}-byte limit`);
-  let tape: Json;
-  try {
-    tape = JSON.parse(text);
-  } catch (error) {
-    fail(`not JSON: ${error instanceof Error ? error.message : String(error)}`);
-  }
-  if (tape?.format !== "axiom-extension-replay-tape") fail("not an axiom-extension-replay-tape document");
+  return verifyTape(parseExactJson(text));
+}
+
+/** Integers JSON.parse already rounded cannot be verified or replayed exactly. */
+function inexact(value: Json): boolean {
+  if (typeof value === "number") return Number.isInteger(value) && !Number.isSafeInteger(value);
+  if (Array.isArray(value)) return value.some(inexact);
+  if (value !== null && typeof value === "object" && !(value instanceof ExactInteger)) return Object.values(value).some(inexact);
+  return false;
+}
+
+/**
+ * Verify an already-parsed tape the way `parseTape` verifies text: format,
+ * version, integrity, replayable. An object holding an integer outside the
+ * exact range as a plain number (JSON.parse rounded it) is refused: pass the
+ * tape text, or parse it with `parseExactJson`.
+ */
+export function verifyTape(tape: Json): ReplayTapeDocument {
+  if (tape === null || typeof tape !== "object" || Array.isArray(tape)) fail("not an axiom-extension-replay-tape document");
+  if (tape.format !== "axiom-extension-replay-tape") fail("not an axiom-extension-replay-tape document");
   if (tape.version !== 1) fail("unsupported tape version (this reader knows version 1)");
+  if (inexact(tape)) fail("the tape holds an integer outside the exact range as a rounded number; pass the tape text (parseTape) instead of a JSON.parse result");
   const { integrity, ...content } = tape;
   if (!integrity) fail("tape has no integrity digest");
   if (integrity.algorithm !== "sha256" || integrity.digest !== sha256Hex(new TextEncoder().encode(canonicalJson(content)))) {
@@ -125,6 +267,35 @@ export function parseTape(text: string): ReplayTapeDocument {
   }
   if (tape.header?.replayable !== true) fail("tape has redacted values and cannot be replayed byte-exactly");
   return tape as ReplayTapeDocument;
+}
+
+/** Identity a replay can check (contract x9d, "Replay identity"). */
+export interface ReplayExpectation {
+  /** The extension the caller replays (the tape's `identity.extension`). */
+  extension?: string;
+  /** The application (the tape's `identity.application`). */
+  application?: string;
+  /** The module under test, when known: a different module is a different build. */
+  moduleSha256?: string;
+  /** Replay against a different build of the same extension (module differs). */
+  allowIdentityMismatch?: boolean;
+}
+
+function checkIdentity(doc: ReplayTapeDocument, expect: ReplayExpectation | undefined): void {
+  if (!expect) return;
+  const refuse = (message: string): never => {
+    throw new Error(`AXIOM_EXTENSION_REPLAY_IDENTITY: ${message}`);
+  };
+  if (expect.extension !== undefined && doc.identity.extension !== expect.extension) {
+    refuse(`the tape was recorded for extension \`${doc.identity.extension}\`, not \`${expect.extension}\``);
+  }
+  if (expect.application !== undefined && doc.identity.application !== expect.application) {
+    refuse(`the tape was recorded by application \`${doc.identity.application}\`, not \`${expect.application}\``);
+  }
+  const recorded = doc.identity.moduleSha256;
+  if (expect.moduleSha256 !== undefined && recorded !== undefined && recorded !== expect.moduleSha256 && !expect.allowIdentityMismatch) {
+    refuse(`the tape was recorded by module ${recorded}, not ${expect.moduleSha256}; set allowIdentityMismatch to replay against a different build`);
+  }
 }
 
 function call(effect: Json, branch?: string): string {
@@ -171,8 +342,16 @@ async function runOne(extension: ExtensionDefinition, request: RoundRequest, opt
 }
 
 /** Replay `tape` against `extension`; throws `ReplayDifference` on a difference. */
-export async function replayTape(extension: ExtensionDefinition, tape: ReplayTapeDocument | string, options: AsyncRunnerOptions = {}): Promise<ReplayReport> {
-  const doc = typeof tape === "string" ? parseTape(tape) : tape;
+export async function replayTape(
+  extension: ExtensionDefinition,
+  tape: ReplayTapeDocument | string,
+  options: AsyncRunnerOptions & { expect?: ReplayExpectation } = {},
+): Promise<ReplayReport> {
+  // An object is verified exactly like text (w3-vbc finding 10).
+  const verified = typeof tape === "string" ? parseTape(tape) : verifyTape(tape);
+  if (verified.abi !== "1.0" && verified.abi !== "1.1") fail(`unknown abi \`${String(verified.abi)}\``);
+  checkIdentity(verified, options.expect);
+  const doc = bridged(verified) as ReplayTapeDocument;
   const invocation = { export: doc.invocation.export, input: doc.invocation.input, snapshots: doc.invocation.snapshots, deadline_unix_ms: 0 };
   const records: { outcomes: Json[]; events: Json[] }[] = [];
   const stoppedAfterLast = doc.terminal.result === undefined && ["refused", "cancelled", "sandboxFailed"].includes(doc.terminal.status);

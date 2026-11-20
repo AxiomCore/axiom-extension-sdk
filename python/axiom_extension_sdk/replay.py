@@ -43,13 +43,61 @@ def canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
-def load_tape(data: bytes | str) -> dict[str, Any]:
-    """Read and verify a tape; raises ``TapeError``."""
+MAX_TAPE_DEPTH = 128
+"""Nesting deeper than this is refused (the Rust reader's limit)."""
+
+
+def _depth(raw: bytes) -> int:
+    """Deepest object/array nesting of ``raw`` (outside strings)."""
+    depth = deepest = 0
+    in_string = escaped = False
+    for byte in raw:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif byte == 0x5C:  # backslash
+                escaped = True
+            elif byte == 0x22:  # quote
+                in_string = False
+        elif byte == 0x22:
+            in_string = True
+        elif byte in (0x7B, 0x5B):  # { [
+            depth += 1
+            deepest = max(deepest, depth)
+        elif byte in (0x7D, 0x5D):  # } ]
+            depth -= 1
+    return deepest
+
+
+def _no_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in out:
+            raise TapeError(f"AXIOM_EXTENSION_REPLAY_TAPE: malformed tape: duplicate key `{key}`")
+        out[key] = value
+    return out
+
+
+def load_tape(data: bytes | str, expect_extension: str | None = None) -> dict[str, Any]:
+    """Read and verify a tape; raises ``TapeError``.
+
+    Refused: over the size cap, not JSON, nesting deeper than
+    ``MAX_TAPE_DEPTH``, a duplicate object key (the digest covers the parsed
+    content, so bytes that could parse to two meanings are not accepted),
+    another format or version, a failed integrity digest, a redacted tape,
+    and (with ``expect_extension``) a tape of another extension.
+    """
     raw = data.encode("utf-8") if isinstance(data, str) else data
     if len(raw) > MAX_TAPE_FILE_BYTES:
         raise TapeError(f"AXIOM_EXTENSION_REPLAY_TAPE: tape is {len(raw)} bytes, over the {MAX_TAPE_FILE_BYTES}-byte limit")
+    if _depth(raw) > MAX_TAPE_DEPTH:
+        raise TapeError(f"AXIOM_EXTENSION_REPLAY_TAPE: nesting deeper than {MAX_TAPE_DEPTH}")
     try:
-        tape = json.loads(raw)
+        tape = json.loads(raw, object_pairs_hook=_no_duplicate_keys)
+    except RecursionError:
+        raise TapeError(f"AXIOM_EXTENSION_REPLAY_TAPE: nesting deeper than {MAX_TAPE_DEPTH}") from None
+    except TapeError:
+        raise
     except ValueError as error:
         raise TapeError(f"AXIOM_EXTENSION_REPLAY_TAPE: not JSON: {error}") from None
     if not isinstance(tape, dict) or tape.get("format") != FORMAT:
@@ -65,6 +113,11 @@ def load_tape(data: bytes | str) -> dict[str, Any]:
         raise TapeError("AXIOM_EXTENSION_REPLAY_TAPE: tape failed its integrity check (content changed after recording)")
     if tape.get("header", {}).get("replayable") is not True:
         raise TapeError("AXIOM_EXTENSION_REPLAY_TAPE: tape has redacted values and cannot be replayed byte-exactly")
+    recorded = tape.get("identity", {}).get("extension")
+    if expect_extension is not None and recorded != expect_extension:
+        raise TapeError(
+            f"AXIOM_EXTENSION_REPLAY_IDENTITY: the tape was recorded for extension `{recorded}`, not `{expect_extension}`"
+        )
     return tape
 
 
