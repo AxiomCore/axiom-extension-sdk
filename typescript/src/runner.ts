@@ -1,4 +1,4 @@
-import { createResumeContext, createContext, type ExtensionDefinition, type ExtensionResponse } from "./index.js";
+import { HostOperationError, createResumeContext, createContext, type ExtensionDefinition, type ExtensionResponse } from "./index.js";
 
 declare const Javy: {
   IO: {
@@ -27,13 +27,16 @@ export function runExtension(extension: ExtensionDefinition): void {
       throw new Error(`unsupported extension bridge message: ${request.kind}`);
     }
   } catch (error) {
+    // H5 (w4-h): a host operation's error keeps its code (the Rust SDK's `?`).
     response = {
       kind: "failed",
-      error: {
-        code: "Guest",
-        message: error instanceof Error ? error.message : "managed-language extension failed",
-        retryable: false,
-      },
+      error: error instanceof HostOperationError
+        ? { code: error.code, message: error.message, retryable: error.retryable }
+        : {
+          code: "Guest",
+          message: error instanceof Error ? error.message : "managed-language extension failed",
+          retryable: false,
+        },
     };
   }
   Javy.IO.writeSync(1, new TextEncoder().encode(JSON.stringify(response)));

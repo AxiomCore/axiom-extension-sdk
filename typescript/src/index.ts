@@ -3,7 +3,7 @@ export {
   EFFECT_GROUP_FORMAT, HostOperationError, MAX_GROUP_BRANCHES, asyncExport, asyncHandlerOf, extension, segmentPlan,
   type AsyncContext, type AsyncExport, type AsyncHandler,
 } from "./async.js";
-import type { AsyncExport } from "./async.js";
+import { HostOperationError as HostError, type AsyncExport } from "./async.js";
 
 export type AxiomValue =
   | "Null"
@@ -325,6 +325,14 @@ export function createResumeContext(outcomes: unknown[], events: unknown[], requ
   const read = (index: number): AxiomValue => {
     if (!Number.isSafeInteger(index) || index < 0 || index >= outcomes.length) throw new Error("host outcome is unavailable");
     const outcome = outcomes[index] as {index?: number; result?: {Ok?: AxiomValue; Err?: unknown}};
+    if (outcome && outcome.index === index && outcome.result && "Err" in outcome.result && !("Ok" in outcome.result)) {
+      // H5 (w4-h): the host's error keeps its kind (`Exhausted`, `Denied`,
+      // ...) through a 1.0 resume, as the Rust SDK's `?` and the 1.1 async
+      // runtime do; the runners report it with that code.
+      const error = outcome.result.Err as {code?: unknown; message?: unknown; retryable?: unknown} | null;
+      if (error && typeof error === "object" && typeof error.code === "string" && error.code !== "")
+        throw new HostError(error.code, `host operation denied (${error.code}): ${typeof error.message === "string" ? error.message : ""}`, error.retryable === true);
+    }
     if (!outcome || outcome.index !== index || !outcome.result || !("Ok" in outcome.result) || "Err" in outcome.result) throw new Error("host operation denied");
     return outcome.result.Ok!;
   };

@@ -1,7 +1,7 @@
 // The ABI 1.1 runner: async exports on rounds (contract x8d-managed-async.md).
 // The async build bundles this module instead of `./runner`; a sync-only
 // build keeps the ABI 1.0 runner and none of the async runtime (w2-c2 L-5).
-import { createResumeContext, createContext, type ExtensionDefinition, type ExtensionResponse } from "./index.js";
+import { HostOperationError, createResumeContext, createContext, type ExtensionDefinition, type ExtensionResponse } from "./index.js";
 import { LOWERED_ASYNC, asyncHandlerOf, installStepHook, probeAsyncBuild, startAsyncRound, type AsyncHandler, type RoundRequest, type RoundResponse } from "./async.js";
 /** The async build's realm prelude installs the plan-order hooks before it freezes the intrinsics. */
 export { installOrderingHooks } from "./async.js";
@@ -78,6 +78,8 @@ function failedWith(code: string, message: string): ExtensionResponse {
 }
 
 function failed(error: unknown): ExtensionResponse {
+  // H5 (w4-h): a host operation's error keeps its code (the Rust SDK's `?`).
+  if (error instanceof HostOperationError) return { kind: "failed", error: { code: error.code, message: error.message, retryable: error.retryable } } as ExtensionResponse;
   return failedWith("Guest", error instanceof Error ? error.message : "managed-language extension failed");
 }
 
