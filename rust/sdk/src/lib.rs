@@ -1516,6 +1516,61 @@ mod tests {
         host.assert_no_denials();
     }
 
+    /// w4-s: the test host matches a write grant segment by segment, never
+    /// as `.`-joined text: a field literally named `a.b` is not field `b`
+    /// inside `a`, in either direction.
+    #[test]
+    fn in_memory_test_host_matches_write_paths_segment_by_segment() {
+        struct Raw(Vec<&'static str>);
+        impl TypedExtension for Raw {
+            fn invoke(&mut self, _: TypedInvocation) -> Result<ExtensionResponse> {
+                Ok(ExtensionResponse::new(()).patch(abi::Patch {
+                    resource: "ui:cart".into(),
+                    expected_revision: 1,
+                    operations: vec![abi::PatchOperation::Set {
+                        path: self.0.iter().map(|s| (*s).into()).collect(),
+                        value: Value::Unsigned(1),
+                    }],
+                }))
+            }
+        }
+        let state = || {
+            Value::Record(vec![
+                abi::Field { name: "a".into(), value: Value::Record(vec![abi::Field { name: "b".into(), value: Value::Unsigned(0) }]) },
+                abi::Field { name: "a.b".into(), value: Value::Unsigned(0) },
+                abi::Field { name: "a2".into(), value: Value::Unsigned(0) },
+                abi::Field { name: "ab".into(), value: Value::Unsigned(0) },
+            ])
+        };
+        // (grant, path, granted?, malformed?)
+        let table: &[(&str, &[&'static str], bool, bool)] = &[
+            ("a.b", &["a", "b"], true, false),
+            ("a.b", &["a.b"], false, true),
+            ("a", &["a.b"], false, true),
+            ("a", &["a", "b"], false, false),
+            ("a", &["ab"], false, false),
+            ("a", &["a2"], false, false),
+            ("ab", &["a", "b"], false, false),
+            ("a", &[""], false, true),
+            ("a.b", &["a", "", "b"], false, true),
+            ("a", &["\u{ff41}"], false, false),
+        ];
+        for (grant, path, granted, malformed) in table {
+            let mut host = test::TestHost::new()
+                .ui_state("cart", 1, state())
+                .allow_ui_write("cart", grant);
+            let mut extension = boxed_extension(Raw(path.to_vec()));
+            let run = host.invoke(&mut *extension, "x", ());
+            assert_eq!(run.is_ok(), *granted, "grant {grant} path {path:?}: {run:?}");
+            if !granted {
+                assert_eq!(host.revision("ui:cart"), Some(1), "{grant} {path:?}");
+                let error = run.unwrap_err();
+                let expected = if *malformed { ErrorCode::InvalidInput } else { ErrorCode::Denied };
+                assert_eq!(error.code, expected, "grant {grant} path {path:?}: {error:?}");
+            }
+        }
+    }
+
     #[test]
     fn in_memory_test_host_rolls_back_state_and_write_audit_on_denied_patch() {
         #[derive(AxiomType)]

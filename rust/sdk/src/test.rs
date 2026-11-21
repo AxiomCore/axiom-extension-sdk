@@ -407,11 +407,29 @@ impl TestHost {
                 }
                 operation => {
                     let path = operation_path(operation)?;
-                    let joined = path.join(".");
-                    if !self
-                        .writes
-                        .contains(&(patch.resource.clone(), joined.clone()))
+                    // w4-s: a grant (dotted text of dot-free segments) matches a
+                    // patch path segment by segment, never as `.`-joined text;
+                    // an empty or dotted segment can never be granted.
+                    if path
+                        .iter()
+                        .any(|segment| segment.is_empty() || segment.contains('.'))
                     {
+                        let text = format!("{path:?}");
+                        self.record(
+                            AuditKind::Denied,
+                            Some(patch.resource.clone()),
+                            Some(text),
+                            "state/store path segment must be non-empty and must not contain `.`",
+                        );
+                        return Err(SdkError::invalid_input(
+                            "state/store path segment must be non-empty and must not contain `.`",
+                        ));
+                    }
+                    let joined = path.join(".");
+                    if !self.writes.iter().any(|(resource, granted)| {
+                        resource == &patch.resource
+                            && granted.split('.').eq(path.iter().map(String::as_str))
+                    }) {
                         return self.denied(
                             &patch.resource,
                             Some(&joined),
