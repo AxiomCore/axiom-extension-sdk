@@ -42,6 +42,9 @@ const fn op(operation: &'static str) -> Operation<Value, u64> {
 }
 
 const LOAD: Operation<Value, u64> = op("load");
+/// What the test host answers for `load` and `price` (`Host::replies`).
+const LOAD_REPLY: u64 = 10;
+const PRICE_REPLY: u64 = 20;
 const PRICE: Operation<Value, u64> = op("price");
 const RESERVE: Operation<Value, u64> = op("reserve");
 const FAIL: Operation<Value, u64> = op("fail");
@@ -302,6 +305,34 @@ impl Guest {
         let next = if cx.round() == 1 { &PRICE } else { &RESERVE };
         let a = cx.call(next.call(n(1))).await?;
         Ok(a + cx.call(LOAD.call(n(2))).await?)
+    }
+
+    /// p-round: `cx.round()` read before, between and after awaits and in
+    /// `join!` branches; a plan and the result depend on the values. Twin of
+    /// the TypeScript SDK test `roundTrace`.
+    #[export]
+    async fn round_trace(cx: &Cx, _input: Value) -> Result<Vec<u64>> {
+        let seen = std::cell::RefCell::new(vec![u64::from(cx.round())]);
+        let a = cx.call(LOAD.call(n(u64::from(cx.round())))).await?;
+        seen.borrow_mut().push(u64::from(cx.round()));
+        let first = async {
+            seen.borrow_mut().push(u64::from(cx.round()));
+            cx.call(PRICE.call(n(u64::from(cx.round())))).await
+        };
+        let second = async {
+            let v = cx.call(LOAD.call(n(7))).await;
+            seen.borrow_mut().push(u64::from(cx.round()));
+            v
+        };
+        let (b, c) = join!(first, second).await;
+        seen.borrow_mut().push(u64::from(cx.round()));
+        let at = seen.borrow().len() as u64;
+        let next = if seen.borrow()[0] >= 2 { &RESERVE } else { &PRICE };
+        let d = cx.call(next.call(n(at))).await?;
+        let mut seen = seen.into_inner();
+        seen.push(u64::from(cx.round()));
+        seen.push(a + b? + c? + d + seen[0]);
+        Ok(seen)
     }
 
     /// A registered operation dropped before the stall stays in the plan.
@@ -683,7 +714,7 @@ fn factory_abi_version_is_1_1_only_for_async_extensions() {
     }
     assert_eq!(factory_abi_version(&|| Box::new(Raw)), ABI_VERSION.packed());
     assert_eq!(<AsyncExtension as FactoryOutput>::ABI, ABI_VERSION_1_1);
-    assert_eq!(AXIOM_EXTENSION_EXPORTS.len(), 32);
+    assert_eq!(AXIOM_EXTENSION_EXPORTS.len(), 33);
     assert!(AXIOM_EXTENSION_EXPORTS.windows(2).all(|w| w[0] < w[1]));
 }
 
@@ -813,9 +844,33 @@ fn non_deterministic_guests_are_caught_on_replay() {
     assert_eq!(run.error().code, ErrorCode::Protocol);
     assert!(run.error().message.contains("non-deterministic"), "{}", run.error().message);
 
+}
+
+/// p-round: `cx.round()` is the round in which the reading code first ran, so
+/// a guest that branches on it before an await re-derives the same plan on
+/// replay (before p-round, `round_dependent` re-derived `reserve` for round
+/// 1's `price` and failed `Protocol`). Same rule as the TypeScript and Python
+/// SDKs, whose managed live path runs such code once.
+#[test]
+fn round_reads_return_the_round_the_code_first_ran_in() {
+    let mut host = guest();
     let run = host.invoke("round_dependent", Value::Null, 2);
-    assert_eq!(run.error().code, ErrorCode::Protocol);
-    assert!(run.error().message.contains("effect round 1"), "{}", run.error().message);
+    assert_eq!(run.output(), &n(LOAD_REPLY + PRICE_REPLY));
+    assert_eq!(run.plans, vec![plan_of(&[("price", 1)]), plan_of(&[("load", 2)])]);
+
+    let mut host = guest();
+    let run = host.invoke("round_trace", Value::Null, 4);
+    let total = LOAD_REPLY + PRICE_REPLY + LOAD_REPLY + PRICE_REPLY + 1;
+    assert_eq!(
+        run.output(),
+        &Value::List([1, 2, 2, 3, 3, 4, total].map(n).to_vec()),
+        "reads per position: before the first await, after load, in the first join! branch, after the second branch's load, after the join, after the last call"
+    );
+    assert_eq!(run.invokes, 4);
+    assert_eq!(
+        run.plans,
+        vec![plan_of(&[("load", 1)]), plan_of(&[("price", 2), ("load", 7)]), plan_of(&[("price", 5)])]
+    );
 }
 
 #[test]

@@ -4,7 +4,7 @@
 // which node runs only once every microtask has run).
 import assert from "node:assert/strict";
 import test from "node:test";
-import { asyncExport, defineExtension, extension, operation, HostOperationError } from "../dist/index.js";
+import { asyncExport, defineExtension, encodeValue, extension, operation, HostOperationError } from "../dist/index.js";
 import { runRound } from "../dist/runner.js";
 import { canonicalRoundPlan, LOWERED_ASYNC } from "../dist/async.js";
 import { readFileSync } from "node:fs";
@@ -49,6 +49,7 @@ async function drive(ext, name, host, options = {}) {
 const values = { load: 10, price: 20 };
 const host = (effect, index) => (effect.operation === "fail" ? err(index, "Guest", "unavailable") : ok(index, { Unsigned: values[effect.operation] ?? 0 }));
 
+let drift = 0;
 const guest = defineExtension({
   exports: {
     scenario: extension.export(async (cx) => {
@@ -67,6 +68,24 @@ const guest = defineExtension({
       return "none";
     }),
     divergent: extension.export(async (cx) => { await cx.call(load.call(cx.round())); return 0; }),
+    // Diverges on replay: a module counter (node keeps module state between
+    // the rounds of these tests; an engine would start fresh) decides the plan.
+    drifting: extension.export(async (cx) => { drift += 1; await cx.call(load.call(drift)); return 0; }),
+    // p-round: reads of cx.round() before, between and after awaits, inside
+    // Promise.all branches, and a plan and a result that depend on them.
+    roundTrace: extension.export(async (cx) => {
+      const seen = [cx.round()];
+      const a = await cx.call(load.call(cx.round()));
+      seen.push(cx.round());
+      const both = await Promise.all([
+        (async () => { seen.push(cx.round()); return cx.call(price.call(cx.round())); })(),
+        (async () => { const v = await cx.call(load.call(7)); seen.push(cx.round()); return v; })(),
+      ]);
+      seen.push(cx.round());
+      const c = await cx.call((seen[0] >= 2 ? operation("catalog", "secret") : price).call(seen.length));
+      seen.push(cx.round());
+      return cx.complete({ seen, total: a + both[0] + both[1] + c + seen[0] });
+    }),
     explicit: asyncExport((cx) => cx.call(load.call(5))),
     sync: (ctx) => ctx.complete(ctx.input),
   },
@@ -123,8 +142,10 @@ test("host errors reject with HostOperationError and keep their code when they e
 
 test("re-derived plans are reported for the kernel to hash; completing early is Protocol", async () => {
   // Round 2 re-derives load(2) for a tape recorded from load(1): the kernel
-  // compares the hashes; the runner reports what it re-derived.
-  const { response } = await round(guest, "divergent", [{ outcomes: [ok(0, { Unsigned: 1 })], events: [] }]);
+  // compares the hashes; the runner reports what it re-derived. (p-round:
+  // `divergent`, which read cx.round(), no longer diverges; `drifting` does.)
+  drift = 1;
+  const { response } = await round(guest, "drifting", [{ outcomes: [ok(0, { Unsigned: 1 })], events: [] }]);
   assert.deepEqual(response.replayed, [{ Plan: { effects: [{ namespace: "catalog", operation: "load", input: { Unsigned: 2 } }] } }]);
   const early = (await round(guest, "early", [{ outcomes: [], events: [] }])).response;
   assert.deepEqual(early.error, { code: "Protocol", message: "non-deterministic guest: the export completed after replaying 0 of 1 effect rounds", retryable: false });
@@ -291,13 +312,34 @@ test("p-live: a resume that does not continue the suspended run fails Protocol; 
   assert.equal("live" in response, false);
 });
 
-test("p-live: a guest whose plan depends on cx.round() is caught on replay but runs once live (documented difference)", async () => {
-  // Replay re-derives load(2) for round 1's load(1): the kernel's hash check
-  // refuses it (Protocol). Live, round 1's code ran once, so the plan it
-  // reports is the one it yielded and the kernel's check passes.
+test("p-round: a guest whose plan depends on cx.round() plans and answers the same live and on replay", async () => {
+  // cx.round() is the round in which the reading code first ran: replay
+  // re-derives load(1) for round 1 (before p-round it re-derived load(2),
+  // which the kernel refused), and live runs the code once in round 1.
   const replay = await driveReplay(guest, "divergent", host);
-  assert.notDeepEqual(replay.response.replayed, replay.plans);
+  assert.equal(replay.response.kind, "completedRound");
+  assert.deepEqual(replay.response.replayed, replay.plans);
   const live = await driveLive(guest, "divergent", host);
   assert.equal(live.response.kind, "completedRound");
   assert.deepEqual(live.response.replayed, live.plans);
+  const strip = (responses) => responses.map(({ live: _live, ...rest }) => rest);
+  assert.deepEqual(strip(live.responses), strip(replay.responses));
+});
+
+test("p-round: every read of cx.round() is the round its code first ran in, on both paths", async () => {
+  const replay = await driveReplay(guest, "roundTrace", host);
+  const live = await driveLive(guest, "roundTrace", host);
+  assert.equal(replay.response.kind, "completedRound");
+  // Round 1: before the first await. Round 2: after load, in the first
+  // branch (which starts at once). Round 3: the second branch after its own
+  // load and the code after the group. Round 4: after the last call.
+  assert.deepEqual(replay.response.result.output, encodeValue({ seen: [1, 2, 2, 3, 3, 4], total: 10 + 20 + 10 + 20 + 1 }));
+  assert.deepEqual(replay.plans.map((plan) => (plan.Plan ? plan.Plan.effects : plan.Group.branches.map((branch) => branch.effect)).map((effect) => [effect.operation, effect.input])), [
+    [["load", { Unsigned: 1 }]],
+    [["price", { Unsigned: 2 }], ["load", { Unsigned: 7 }]],
+    [["price", { Unsigned: 5 }]],
+  ]);
+  const strip = (responses) => responses.map(({ live: _live, ...rest }) => rest);
+  assert.deepEqual(strip(live.responses), strip(replay.responses), "live and replay answer identically round by round");
+  assert.deepEqual(live.plans, replay.plans);
 });

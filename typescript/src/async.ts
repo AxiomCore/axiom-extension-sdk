@@ -339,7 +339,14 @@ export function canonicalRoundPlan(plan: RoundPlanJson): string {
 export interface AsyncContext {
   readonly invocation: Invocation;
   readonly input: unknown;
-  /** Current invoke number (1-based). It must not influence which operations are called. */
+  /**
+   * The round in which the calling code first ran (1-based): 1 before the
+   * first await, k + 1 after the k-th effect round's results arrived. A read
+   * returns the same value on every path (live, replay, live+verify) and in
+   * every language, because code re-run on replay gets the round it ran in
+   * when it first executed, like an effect result (p-round). Reading it
+   * after the last await gives the round that completes the export.
+   */
   round(): number;
   /** The yield budget (`maxRounds`) of this invocation. */
   maxRounds(): number;
@@ -499,6 +506,14 @@ class RoundRun {
   private outsideTree = false;
   /** The round this run is in: the request's, then each live resume's. */
   private round: number;
+  /**
+   * p-round: what `cx.round()` returns: the round in which the reading code
+   * first executed. The tape position is the record: `cursor` effect rounds
+   * have been answered, so the running code first ran in round cursor + 1.
+   */
+  roundOfRead(): number {
+    return this.cursor + 1;
+  }
   /** p-live: the operations and plan of the yield this run is suspended at. */
   private held: { segment: Registered[]; plan: RoundPlanJson } | undefined;
 
@@ -512,7 +527,13 @@ class RoundRun {
     return Object.freeze({
       invocation: base.invocation,
       input: base.input,
-      round: () => run.round,
+      // p-round: the round in which this read first executed. Code that runs
+      // while `cursor` effect rounds have been answered first ran in round
+      // cursor + 1 (the replay path re-runs it while replaying the same
+      // tape position; the live path runs it once, at that position), so the
+      // value is a function of the tape position only, identical on both
+      // paths and across a live-to-replay fallback.
+      round: () => run.roundOfRead(),
       maxRounds: () => run.request.max_rounds,
       call<O>(effect: TypedEffect<O>): Promise<O> { return run.register(effect) as Promise<O>; },
       snapshot: (resource: string) => base.snapshot(resource),

@@ -119,7 +119,6 @@ pub struct Cx {
     moved_input: RefCell<Option<Value>>,
     /// The export input was moved into the export's `Value` argument.
     input_taken: Cell<bool>,
-    round: u16,
     max_rounds: u16,
     state: RefCell<RunState>,
 }
@@ -136,7 +135,6 @@ impl Cx {
             invocation,
             moved_input: RefCell::new(moved_input),
             input_taken: Cell::new(false),
-            round: request.round,
             max_rounds: request.max_rounds,
             state: RefCell::new(RunState {
                 tape: request.tape,
@@ -214,12 +212,21 @@ impl Cx {
         }
     }
 
-    /// The 1-based invoke number of this run. It changes from round to round:
-    /// never use it to decide which host operations to call (see the module
-    /// determinism rules). Reporting it in the output after the last await is
-    /// fine.
+    /// The round in which the calling code first ran (1-based): 1 before the
+    /// first await, `k + 1` after the `k`-th effect round's results arrived.
+    ///
+    /// Every round re-runs the export from the top and replays the tape, so
+    /// code before an await runs again in later rounds; a read there returns
+    /// the round it returned when that code first executed, exactly as the
+    /// replayed host operations return their recorded results (p-round). The
+    /// value is the same on every path and in every SDK language (the
+    /// managed live path runs such code once, in that round). Reading it
+    /// after the last await gives the round that completes the export.
     pub fn round(&self) -> u16 {
-        self.round
+        // The tape position is the record: code that runs while `cursor`
+        // effect rounds have been answered first ran in round `cursor + 1`.
+        let cursor = self.state.borrow().cursor;
+        u16::try_from(cursor).map_or(u16::MAX, |cursor| cursor.saturating_add(1))
     }
 
     /// The host's `maxRounds`: how many times this invocation may yield.

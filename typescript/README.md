@@ -91,11 +91,15 @@ export default defineExtension({
   re-derives a different plan than the tape fails with `Protocol`
   ("non-deterministic guest") and nothing commits.
 - **Determinism.** Do not let anything but host results decide which
-  operations you call: not `cx.round()`, not `Date.now()` (always 0) or
-  `Math.random()` (a fixed sequence). The engine has no timers, `WeakRef`,
+  operations you call: not `Date.now()` (always 0) or `Math.random()` (a
+  fixed sequence). The engine has no timers, `WeakRef`,
   `FinalizationRegistry` or `performance`; awaiting anything that never
   settles fails the invocation with `InvalidInput`. Time and randomness come
   from host operations, which are on the tape.
+- **`cx.round()`** is the round in which the reading code first ran: 1 before
+  the first await, k + 1 after the k-th round's results arrived. Code that
+  replay runs again gets the value it got the first time, like a host result,
+  so the value is the same on every host path and in every SDK language.
 - **Awkward cases.** An operation you never await is never sent (Rust's
   unpolled future); one you touched (`.then`, `.catch`, a combinator) and then
   abandoned still runs with its round and its result is discarded

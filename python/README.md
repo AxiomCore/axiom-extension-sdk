@@ -81,7 +81,9 @@ async def apply(cx: AsyncContext, input):
   export from the top in a fresh engine with earlier results from the host's
   tape; a re-derived plan that differs is `Protocol` and nothing commits.
   Module globals start fresh every round; `time` and `random` are
-  deterministic; do not let `cx.round()` decide which operations run.
+  deterministic. `cx.round()` is the round in which the reading code first
+  ran (1 before the first await); code that replay runs again reads the
+  value it read the first time, as in TypeScript and Rust.
 - **Errors.** A failed operation raises `HostOperationError` (`code`,
   `retryable`); escaping the export it fails the invocation with that code.
   Other exceptions fail it with `Guest`.
