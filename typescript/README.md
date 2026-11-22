@@ -30,6 +30,137 @@ workspace. Use the exact SDK, generated selection and managed toolchain from
 that cohort. These working candidate capabilities do not establish registry
 publication or browser/mobile qualification.
 
+## Async exports: rounds, replay, determinism
+
+ABI 1.1 (X8d) lets an export await host operations across several effect
+rounds. Write it as an `async` function; `cx.call(effect)` starts a host
+operation and returns a promise of its typed output.
+
+```ts
+import { defineExtension, extension, operation, type AsyncContext, type Selector } from "@axiomcore/extension-sdk";
+
+const loadUser = operation<{ id: number }, { id: number; tier: string }>("catalog", "user");
+const priceOf = operation<string, number>("catalog", "price");
+const stockOf = operation<number, number>("catalog", "stock");
+const TOTAL = "total" as Selector<number>;
+
+export default defineExtension({
+  exports: {
+    apply: extension.export(async (cx: AsyncContext, input: { id: number }) => {
+      const user = await cx.call(loadUser.call({ id: input.id }));             // round 1
+      const [price, stock] = await Promise.all([                                // round 2: one group
+        cx.call(priceOf.call(user.tier)),
+        cx.call(stockOf.call(user.id)),
+      ]);
+      return cx.complete({ price, stock }, { patches: [cx.patch("ui:cart").set(TOTAL, price * stock).build()] });
+    }),
+  },
+});
+```
+
+- `extension.export(fn)` makes an `async` function an async export; any other
+  function stays a 1.0 handler. `asyncExport(fn)` marks a function that returns
+  a promise without being `async`. Sync and async exports can share a module.
+- **Rounds.** An operation registers when it is first awaited (or passed to
+  a `Promise.all` that is awaited, or returned from an async function): the
+  Rust SDK's "first poll" rule, so `const p = cx.call(a); await cx.call(b);
+  await p;` takes two rounds in TypeScript, Rust and Python alike. An async
+  function's operations likewise wait until its promise is awaited. When
+  every job has run and the export is still waiting, the operations
+  registered since the last stop form one round: one operation is a plan, 2 to 32 are one `Collect`
+  group (branches `b0`, `b1`, ...; `limit` is `min(n, 8)`), more than 32 fail
+  with `Exhausted`. `Promise.all` therefore batches by itself; sequential
+  awaits take one round each. The package's `maxEffects` and the authority's
+  `maxRounds` (yields) still apply.
+- **Order inside a round.** Operations are ordered by where they were awaited
+  in the tree of async calls (depth first, in argument order), exactly as the
+  Rust SDK's `join!` orders them for the same program: `Promise.all([a(), b()])`
+  puts all of `a`'s operations before `b`'s, at any nesting depth and however
+  many awaits of helpers or resolved promises come in between. (CPython's
+  `asyncio` task order can differ for a `gather` inside a task; Axiom follows
+  Rust.)
+- **Fail-fast or wait for all.** `Promise.all` is fail-fast like Rust
+  `try_join!`: when a branch fails it rejects, and the other branches are
+  dropped (an operation they already registered still runs; they register
+  nothing more, and awaiting a dropped branch again fails with
+  `InvalidInput`). `Promise.allSettled` waits for every branch like Rust
+  `join!`. Python: `gather(...)` / `gather(..., return_exceptions=True)`.
+- **Replay.** Every round runs the export from the top in a fresh engine, with
+  the results of earlier rounds answered from the host's tape. Nothing survives
+  between rounds (module variables start fresh every round). A round that
+  re-derives a different plan than the tape fails with `Protocol`
+  ("non-deterministic guest") and nothing commits.
+- **Determinism.** Do not let anything but host results decide which
+  operations you call: not `cx.round()`, not `Date.now()` (always 0) or
+  `Math.random()` (a fixed sequence). The engine has no timers, `WeakRef`,
+  `FinalizationRegistry` or `performance`; awaiting anything that never
+  settles fails the invocation with `InvalidInput`. Time and randomness come
+  from host operations, which are on the tape.
+- **Awkward cases.** An operation you never await is never sent (Rust's
+  unpolled future); one you touched (`.then`, `.catch`, a combinator) and then
+  abandoned still runs with its round and its result is discarded
+  (registered operations are never withdrawn). Operations still pending when
+  the export returns are never sent. Awaiting one promise
+  twice gives its value twice. `Promise.race`/`Promise.any` are deterministic:
+  all operations of a round finish together and settle in plan order, so the
+  first in the plan wins, and the others still run.
+- **Errors.** A failed operation rejects with `HostOperationError` (`code`,
+  `message`, `retryable`). If it escapes the export, the invocation fails with
+  that code; any other exception fails it with `Guest`. Nothing commits.
+- **Build.** `axiom-build` decides by itself: a module that uses the async API
+  is built with the async runner (`@axiomcore/extension-sdk/runner-async`),
+  async/await lowered to generators, the Javy event loop and the ABI 1.1 step
+  export and marker (`axiom-typescript-managed-abi finish`), and is packaged as
+  `axiom-extension-abi` 1.1.0; a mistake fails the build with an
+  `AXIOM_MANAGED_ASYNC_BUILD` diagnostic. A sync-only module is built exactly
+  as before (byte-identical) and carries none of the async runtime. Under the
+  1.0 build an async export refuses to run (contract `x8d-managed-async.md`).
+- **Cost and limits.** Replay re-runs the prefix every round. The fuel budget
+  is one invocation's fuel per run (`× (maxRounds + 1)`), the deadline covers
+  all rounds together, memory does not grow per round. A small TypeScript
+  guest uses about 2.6 G managed fuel and 0.25 s for 16 yields, which fits
+  the default budgets.
+
+## Typed tickets
+
+```ts
+import { defineExtension, operation, type Effects } from "@axiomcore/extension-sdk";
+
+const name = operation<{ id: number }, string>("catalog", "name");
+const stock = operation<number, boolean>("catalog", "stock");
+// One function builds the plan, for the export and for the resume.
+const lookup = (plan: Effects, id: number) => ({
+  name: plan.push(name.call({ id })),
+  stock: plan.push(stock.call(id)),
+});
+
+export default defineExtension({
+  exports: { run: (ctx) => { const plan = ctx.plan(); lookup(plan, 7); return ctx.effects(plan); } },
+  resume: (resume) => {
+    const t = lookup(resume.plan(), 7);   // same calls, same inputs, same order
+    return resume.complete({ name: resume.get(t.name), stock: resume.get(t.stock) });
+  },
+});
+```
+
+`resume.get(t.name)` is typed `string`; a forged ticket does not type-check and
+is rejected at runtime. `resume.outcome(i)` is deprecated, and so is
+`Effects.call` (use `push`). A later yield step from a resume uses
+`yieldFor(plan)`.
+
+In TypeScript and Python every exchange runs in a fresh engine, so tickets
+do not survive from the export to the resume. The resume rebuilds the plan it
+answers with `resume.plan()`: the **same calls (namespace, operation and
+input) in the same order**, usually by calling the same function that built
+the yielded plan. The managed host echoes its record of the yielded plan with
+the resume, and `get` rejects a rebuilt plan that differs, naming the first
+differing call (for example `call 0 is catalog.stock, the yielded call 0 was
+catalog.name`). Inputs are compared exactly up to 8 KiB per call and 64 KiB
+per plan; larger inputs are compared by their canonical length. A plan of more
+than about 1,700 calls, or a host that predates the echo, gets only the
+call-count check. When a resume cannot rebuild its plan deterministically, use
+a named continuation, whose state the host carries.
+
 ## Portable schema source checks
 
 The portable validation helper has a checked source binding in

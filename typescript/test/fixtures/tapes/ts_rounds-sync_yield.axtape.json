@@ -1,0 +1,135 @@
+{
+  "format": "axiom-extension-replay-tape",
+  "version": 1,
+  "header": {
+    "notice": "Axiom extension dev replay tape. It contains the real input, the round-1 snapshots (as the guest saw them), every plan the guest yielded, the host's outcomes and events, and the final result of one invocation. Secret values are never recorded (handles and granted names only); host context, request ids, trace ids and wall-clock deadlines are not recorded. Keep it local and treat it like the data it holds. The integrity digest detects accidental change; it is not a trust anchor.",
+    "contains": [
+      "identity",
+      "input",
+      "snapshots",
+      "plans",
+      "sites",
+      "outcomes",
+      "events",
+      "hostExchanges",
+      "result",
+      "budgets",
+      "usage"
+    ],
+    "sensitive": "none-present",
+    "redactions": [],
+    "replayable": true,
+    "recorder": "axiom-extension-broker/0.1.0"
+  },
+  "identity": {
+    "application": "x8d",
+    "extension": "rounds"
+  },
+  "abi": "1.1",
+  "maxRounds": 1,
+  "hostGroups": true,
+  "budgets": {
+    "maxHostCalls": 64,
+    "maxReadBytes": 65536,
+    "maxWriteBytes": 65536,
+    "maxMutations": 16,
+    "maxEvents": 16,
+    "maxConcurrentStreams": 1
+  },
+  "invocation": {
+    "export": "sync_yield",
+    "input": "Null",
+    "snapshots": [
+      {
+        "resource": "ui:checkout",
+        "revision": 1,
+        "value": {
+          "Record": [
+            {
+              "name": "count",
+              "value": {
+                "Unsigned": 1
+              }
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "rounds": [
+    {
+      "round": 1,
+      "planHash": "d829a61d11fcb5b946a245cbde035ebe31dd381934ed9e0584d50372bcd94c83",
+      "plan": {
+        "Plan": {
+          "effects": [
+            {
+              "namespace": "catalog",
+              "operation": "load",
+              "input": {
+                "Unsigned": 7
+              }
+            }
+          ]
+        }
+      },
+      "status": "executed",
+      "outcomes": [
+        {
+          "index": 0,
+          "result": {
+            "Ok": {
+              "Unsigned": 10
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "hostExchanges": [
+    {
+      "round": 1,
+      "call": {
+        "kind": "contract",
+        "service": "catalog",
+        "method": "load",
+        "access": "query",
+        "input": {
+          "Unsigned": 7
+        }
+      },
+      "reply": {
+        "kind": "value",
+        "value": {
+          "Unsigned": 10
+        }
+      }
+    }
+  ],
+  "terminal": {
+    "status": "completed",
+    "result": {
+      "output": {
+        "Unsigned": 11
+      },
+      "patches": [],
+      "transactions": [],
+      "emitted_events": []
+    },
+    "committed": true
+  },
+  "usage": {
+    "rounds": 2,
+    "fuelPerRound": [
+      39376514,
+      45678361
+    ],
+    "hostCalls": 1,
+    "readBytes": 2,
+    "writeBytes": 2
+  },
+  "integrity": {
+    "algorithm": "sha256",
+    "digest": "0d28fa054b5a3505f52cbda877da2b03d438c1f7102db680f6e68788220b9119"
+  }
+}

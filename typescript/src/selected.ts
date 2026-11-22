@@ -1,4 +1,5 @@
-import type { AxiomValue, Completed, Effect, ExtensionContext, ExtensionDefinition, ExtensionHandler, InvocationResult, Yielded } from "./index.js";
+import type { AxiomValue, Completed, Effect, ExtensionContext, ExtensionDefinition, ExtensionHandler, InvocationResult, Operation, TypedEffect, Yielded } from "./index.js";
+import { typedEffect } from "./index.js";
 
 export type SelectedType =
   | { kind: "scalar"; value: "unit" | "boolean" | "signed64" | "unsigned64" | "unsigned32" | "unsigned16" | "string" | "bytes" }
@@ -199,6 +200,23 @@ export function selectedCall(profile: SelectedInterface, namespace: string, oper
   const selected = profile.imports.find(i => i.namespace === namespace && i.operation === operation);
   if (!selected) fail("operation is outside selected interface");
   return { namespace, operation, input: encodeSelected(profile, selected.input, input) };
+}
+/**
+ * A typed operation checked against the selected interface: `call(input)`
+ * encodes with the import's input type, and a ticket from
+ * `plan.push(op.call(input))` decodes its outcome with the import's output
+ * type (`resume.get(ticket)`). The effect bytes equal {@link selectedCall}.
+ * Named continuations already receive outcomes by branch name and need no
+ * tickets: the host answers a selected yield with one checked continuation
+ * envelope, which `defineSelectedExtension` decodes.
+ */
+export function selectedOperation<I = unknown, O = unknown>(profile: SelectedInterface, namespace: string, operation: string): Operation<I, O> {
+  const selected = profile.imports.find(i => i.namespace === namespace && i.operation === operation);
+  if (!selected || selected.mode !== "call") fail("operation is outside selected interface");
+  return Object.freeze({ namespace, operation,
+    call(input: I): TypedEffect<O> {
+      return typedEffect<O>(selectedCall(profile, namespace, operation, input), value => decodeSelected(profile, selected.output, value) as O);
+    } });
 }
 const CONTINUATION_FORMAT = "axiom-selected-continuation/v1";
 function wireRecord(value: unknown): Record<string, unknown> {

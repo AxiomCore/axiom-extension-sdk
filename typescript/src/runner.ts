@@ -1,4 +1,4 @@
-import { createResumeContext, createContext, type ExtensionDefinition, type ExtensionResponse } from "./index.js";
+import { HostOperationError, createResumeContext, createContext, type ExtensionDefinition, type ExtensionResponse } from "./index.js";
 
 declare const Javy: {
   IO: {
@@ -22,18 +22,21 @@ export function runExtension(extension: ExtensionDefinition): void {
       if (!handler) throw new Error(`unknown extension export: ${request.invocation.export}`);
       response = handler(createContext(request.invocation));
     } else if (request.kind === "resume" && extension.resume) {
-      response = extension.resume(createResumeContext(request.outcomes, request.events, request.request_id));
+      response = extension.resume(createResumeContext(request.outcomes, request.events, request.request_id, request.yielded_plan));
     } else {
       throw new Error(`unsupported extension bridge message: ${request.kind}`);
     }
   } catch (error) {
+    // H5 (w4-h): a host operation's error keeps its code (the Rust SDK's `?`).
     response = {
       kind: "failed",
-      error: {
-        code: "Guest",
-        message: error instanceof Error ? error.message : "managed-language extension failed",
-        retryable: false,
-      },
+      error: error instanceof HostOperationError
+        ? { code: error.code, message: error.message, retryable: error.retryable }
+        : {
+          code: "Guest",
+          message: error instanceof Error ? error.message : "managed-language extension failed",
+          retryable: false,
+        },
     };
   }
   Javy.IO.writeSync(1, new TextEncoder().encode(JSON.stringify(response)));
@@ -58,3 +61,8 @@ function readAll(): Uint8Array {
   }
   return result;
 }
+
+// The ABI 1.1 runner (async exports, rounds) lives in `./runner-async`; this
+// re-export keeps `runRound` importable from here without bundling the async
+// runtime into a sync-only build (`sideEffects: false`).
+export { runRound } from "./runner-async.js";

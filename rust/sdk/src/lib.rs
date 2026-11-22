@@ -4,7 +4,9 @@
 extern crate alloc;
 extern crate self as axiom_extension_sdk;
 
+pub mod async_rt;
 mod primitives;
+pub(crate) mod round_frame;
 pub mod secrets;
 #[cfg(feature = "std")]
 pub mod test;
@@ -16,23 +18,24 @@ use abi::{
 };
 use alloc::{boxed::Box, collections::BTreeMap, string::String, vec, vec::Vec};
 pub use axiom_extension_abi as abi;
+pub use async_rt::{join_all, AsyncExtension, Call, Cx, LocalBoxFuture, RoundInvocation};
 pub use axiom_extension_sdk_derive::{export, extension, AxiomType};
 pub use primitives::{Cents, DurationMs, Id, Percentage, Revision, TimestampMs};
 pub use typed::{
-    boxed_extension, AxiomDecode, AxiomEncode, AxiomType, EffectCall, Effects, ExtensionResponse,
-    Operation, RecordDecoder, Result, ResumeContext, SdkError, Store, StoreField, StoreObject,
-    StorePatch, StoreTransaction, Stream, StreamBatch, TypedExtension, TypedInvocation, UiField, UiPatch,
-    UiScope, UiState,
+    boxed_extension, AxiomDecode, AxiomEncode, AxiomType, EffectCall, EffectGroup, Effects, ExtensionResponse,
+    Operation, RecordDecoder, Result, ResumeContext, SdkError, SiteKey, SiteTable, Store, StoreField, StoreObject,
+    StorePatch, StoreTransaction, Stream, StreamBatch, Ticket, TypedExtension, TypedInvocation, UiField,
+    UiPatch, UiScope, UiState,
 };
 
 /// Ordinary extension authors should import this module. It contains the
 /// typed, deterministic SDK surface and intentionally omits transport framing.
 pub mod prelude {
     pub use crate::{
-        boxed_extension, export, extension, AxiomDecode, AxiomEncode, AxiomType, Cents, DurationMs,
-        EffectCall, Effects, ExtensionResponse, Id, Operation, Percentage, Result, ResumeContext,
+        boxed_extension, export, extension, join, join_all, AxiomDecode, AxiomEncode, AxiomType,
+        Cents, Cx, DurationMs, EffectCall, Effects, ExtensionResponse, Id, Operation, Percentage, Result, ResumeContext,
         Revision, SdkError, Store, StoreField, StoreObject, StorePatch, StoreTransaction, Stream, StreamBatch,
-        TimestampMs, TypedExtension, TypedInvocation, UiField, UiPatch, UiScope, UiState,
+        Ticket, TimestampMs, TypedExtension, TypedInvocation, UiField, UiPatch, UiScope, UiState,
     };
 }
 
@@ -49,6 +52,7 @@ pub mod raw {
 
 #[doc(hidden)]
 pub mod __private {
+    pub use crate::async_rt::{factory_abi_version, factory_extension, AsyncExports};
     pub use crate::typed::{canonical_record, RecordDecoder};
     pub use alloc::boxed::Box;
 
@@ -107,6 +111,23 @@ pub trait Extension {
         Ok(())
     }
     fn shutdown(&mut self) {}
+    /// ABI 1.1 (X8c): true when this extension answers `InvokeRound`
+    /// ([`Extension::invoke_round`]); `GuestMachine` then selects 1.1 when the
+    /// host offers it. Extensions with async exports return true.
+    fn supports_rounds(&self) -> bool {
+        false
+    }
+    /// ABI 1.1 (X8c): one round of a multi-round invocation.
+    fn invoke_round(&mut self, request: RoundInvocation) -> GuestMessage {
+        GuestMessage::Failed {
+            request_id: request.request_id,
+            error: ExtensionError {
+                code: abi::ErrorCode::Protocol,
+                message: "extension does not support ABI 1.1 rounds".into(),
+                retryable: false,
+            },
+        }
+    }
 }
 
 // Generated source wrappers construct a trait object so authored modules do
@@ -138,6 +159,14 @@ impl<T: Extension + ?Sized> Extension for Box<T> {
     fn shutdown(&mut self) {
         (**self).shutdown()
     }
+
+    fn supports_rounds(&self) -> bool {
+        (**self).supports_rounds()
+    }
+
+    fn invoke_round(&mut self, request: RoundInvocation) -> GuestMessage {
+        (**self).invoke_round(request)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -155,11 +184,21 @@ enum MachineState {
 /// Upper bound for guest error text exposed to the host.
 pub const MAX_GUEST_ERROR_BYTES: usize = 1024;
 
-pub struct GuestMachine<E> {
+///
+/// `ROUNDS` (L-5): whether this machine can negotiate ABI 1.1 rounds. The
+/// export macros set it to `false` for modules that export ABI 1.0 (every
+/// sync-only extension), which makes the 1.1 decoding, round dispatch and
+/// 1.1 framing dead code, so the linker drops them and a sync-only module is
+/// built from the same code as before async exports existed. The default
+/// `true` keeps `GuestMachine<E>` exactly as it was.
+pub struct GuestMachine<E, const ROUNDS: bool = true> {
     extension: E,
     state: MachineState,
     limits: CodecLimits,
     last_error: Option<String>,
+    /// Negotiated ABI version (1.0 until a rounds-capable extension selects
+    /// 1.1); every frame after `Negotiated` carries it.
+    abi: abi::AbiVersion,
     /// The ABI crate's protocol checker is the single source of transition
     /// rules: every host message and every guest response must also be legal
     /// there, so this harness and host-side checkers cannot drift apart.
@@ -168,11 +207,26 @@ pub struct GuestMachine<E> {
 
 impl<E: Extension> GuestMachine<E> {
     pub fn new(extension: E, limits: CodecLimits) -> Self {
+        Self::with_limits(extension, limits)
+    }
+}
+
+impl<E: Extension> GuestMachine<E, false> {
+    /// A machine that only speaks ABI 1.0 (it never selects 1.1, even for a
+    /// rounds-capable extension).
+    pub fn without_rounds(extension: E, limits: CodecLimits) -> Self {
+        Self::with_limits(extension, limits)
+    }
+}
+
+impl<E: Extension, const ROUNDS: bool> GuestMachine<E, ROUNDS> {
+    fn with_limits(extension: E, limits: CodecLimits) -> Self {
         Self {
             extension,
             state: MachineState::New,
             limits,
             last_error: None,
+            abi: abi::ABI_VERSION,
             protocol: abi::Lifecycle::default(),
         }
     }
@@ -186,11 +240,16 @@ impl<E: Extension> GuestMachine<E> {
     pub fn dispatch(&mut self, bytes: &[u8]) -> core::result::Result<Vec<u8>, abi::ProtocolError> {
         self.last_error = None;
         let checkpoint = (self.protocol.clone(), self.state);
+        // A 1.0-only machine never changes `abi`.
+        let abi = ROUNDS.then_some(self.abi);
         let result = self.dispatch_frame(bytes);
         if result.is_err() {
             // The host receives no response for a failed dispatch, so neither
             // the harness state nor the protocol checker may advance.
             (self.protocol, self.state) = checkpoint;
+            if let Some(abi) = abi {
+                self.abi = abi;
+            }
         }
         if let Err(error) = &result {
             if self.last_error.is_none() {
@@ -208,12 +267,18 @@ impl<E: Extension> GuestMachine<E> {
         bytes: &[u8],
     ) -> core::result::Result<Vec<u8>, abi::ProtocolError> {
         // Host frames are trusted; the host still canonically checks our output.
-        let frame = abi::decode_frame_trusted::<HostMessage>(bytes, self.limits)?;
+        // A 1.1 session accepts exactly 1.1 frames; 1.0 is decoded as before.
+        let reply_abi = self.abi;
+        let frame = if ROUNDS && reply_abi == abi::ABI_VERSION_1_1 {
+            abi::decode_frame_trusted_versioned::<HostMessage>(bytes, self.limits, &[reply_abi])?
+        } else {
+            abi::decode_frame_trusted::<HostMessage>(bytes, self.limits)?
+        };
         if self.state != MachineState::Stopped {
             self.protocol.host(&frame.message)?;
         }
         let response = match (self.state, frame.message) {
-            (MachineState::New, HostMessage::Negotiate { supported }) => {
+            (MachineState::New, HostMessage::Negotiate { supported }) if !ROUNDS => {
                 if !supported.contains(&abi::ABI_VERSION) {
                     return Err(abi::ProtocolError::AbiMismatch);
                 }
@@ -221,6 +286,21 @@ impl<E: Extension> GuestMachine<E> {
                 GuestMessage::Negotiated {
                     selected: abi::ABI_VERSION,
                 }
+            }
+            (MachineState::New, HostMessage::Negotiate { supported }) => {
+                let selected = if self.extension.supports_rounds()
+                    && supported.contains(&abi::ABI_VERSION_1_1)
+                {
+                    abi::ABI_VERSION_1_1
+                } else if supported.contains(&abi::ABI_VERSION) {
+                    abi::ABI_VERSION
+                } else {
+                    return Err(abi::ProtocolError::AbiMismatch);
+                };
+                self.state = MachineState::Negotiated;
+                // `Negotiated` itself goes out in a 1.0 frame (`reply_abi`).
+                self.abi = selected;
+                GuestMessage::Negotiated { selected }
             }
             (MachineState::Negotiated, HostMessage::Initialize { .. }) => {
                 if let Err(error) = self.extension.initialize() {
@@ -255,6 +335,34 @@ impl<E: Extension> GuestMachine<E> {
                 let response = self.extension.resume(request_id, outcomes, events);
                 self.accept_outcome(request_id, response)?
             }
+            (
+                MachineState::Ready | MachineState::Yielded(_),
+                HostMessage::InvokeRound {
+                    request_id,
+                    invocation,
+                    round,
+                    max_rounds,
+                    tape,
+                },
+            ) if ROUNDS
+                && (matches!(self.state, MachineState::Ready)
+                    || self.state == MachineState::Yielded(request_id)) =>
+            {
+                let request = RoundInvocation {
+                    request_id,
+                    invocation,
+                    round,
+                    max_rounds,
+                    tape,
+                };
+                // W2A-1: the frame stays readable for this round, so an async
+                // export whose `Value` input was moved can still read it.
+                let extension = &mut self.extension;
+                let response = round_frame::scoped(bytes, self.limits, reply_abi, || {
+                    extension.invoke_round(request)
+                });
+                self.accept_round(request_id, response)?
+            }
             (MachineState::Yielded(active), HostMessage::Cancel { request_id })
                 if active == request_id =>
             {
@@ -282,7 +390,41 @@ impl<E: Extension> GuestMachine<E> {
             _ => return Err(abi::ProtocolError::InvalidTransition),
         };
         self.protocol.guest(&response)?;
-        abi::encode(&Frame::new(response), self.limits)
+        if !ROUNDS || reply_abi == abi::ABI_VERSION {
+            abi::encode(&Frame::new(response), self.limits)
+        } else {
+            abi::encode(&Frame::with_abi(reply_abi, response), self.limits)
+        }
+    }
+
+    fn accept_round(
+        &mut self,
+        request_id: RequestId,
+        response: GuestMessage,
+    ) -> core::result::Result<GuestMessage, abi::ProtocolError> {
+        match &response {
+            // X9c: a sited yield (`abi::yielded_round` with known sites) is a
+            // yield like any other; the labels ride beside the plan.
+            GuestMessage::YieldedRound {
+                request_id: actual, ..
+            }
+            | GuestMessage::YieldedRoundSited {
+                request_id: actual, ..
+            } if *actual == request_id => self.state = MachineState::Yielded(request_id),
+            GuestMessage::CompletedRound {
+                request_id: actual, ..
+            }
+            | GuestMessage::Failed {
+                request_id: actual, ..
+            }
+            | GuestMessage::Cancelled { request_id: actual }
+                if *actual == request_id =>
+            {
+                self.state = MachineState::Ready
+            }
+            _ => return Err(abi::ProtocolError::InvalidTransition),
+        }
+        Ok(response)
     }
 
     fn accept_outcome(
@@ -677,8 +819,11 @@ fn record(fields: Vec<(&str, Value)>) -> Value {
 /// Safe owner for the core-WASM transport buffers used by generated exports.
 /// Pointers are opaque allocation IDs from the host's perspective; all actual
 /// ownership remains in this table until dispatch or deallocation consumes it.
-pub struct GuestExports<E> {
-    machine: GuestMachine<E>,
+///
+/// `ROUNDS`: see [`GuestMachine`]; the export macros pass `false` for
+/// modules that export ABI 1.0.
+pub struct GuestExports<E, const ROUNDS: bool = true> {
+    machine: GuestMachine<E, ROUNDS>,
     allocations: BTreeMap<u32, Box<[u8]>>,
     max_bytes: usize,
     last_error: Option<Box<[u8]>>,
@@ -686,8 +831,17 @@ pub struct GuestExports<E> {
 
 impl<E: Extension> GuestExports<E> {
     pub fn new(extension: E, limits: CodecLimits) -> Self {
+        Self::configured(extension, limits)
+    }
+}
+
+impl<E: Extension, const ROUNDS: bool> GuestExports<E, ROUNDS> {
+    /// Used by the export macros, which choose `ROUNDS` from the module's
+    /// exported ABI version.
+    #[doc(hidden)]
+    pub fn configured(extension: E, limits: CodecLimits) -> Self {
         Self {
-            machine: GuestMachine::new(extension, limits),
+            machine: GuestMachine::with_limits(extension, limits),
             allocations: BTreeMap::new(),
             max_bytes: limits.max_bytes,
             last_error: None,
@@ -782,8 +936,8 @@ macro_rules! export_extension {
     ($extension_type:ty, $constructor:expr, max_bytes = $max_bytes:expr) => {
         #[cfg(target_arch = "wasm32")]
         std::thread_local! {
-            static AXIOM_EXTENSION_EXPORTS: std::cell::RefCell<$crate::GuestExports<$extension_type>> =
-                std::cell::RefCell::new($crate::GuestExports::new(
+            static AXIOM_EXTENSION_EXPORTS: std::cell::RefCell<$crate::GuestExports<$extension_type, false>> =
+                std::cell::RefCell::new($crate::GuestExports::configured(
                     $constructor,
                     $crate::abi::CodecLimits { max_bytes: $max_bytes },
                 ));
@@ -900,11 +1054,17 @@ macro_rules! export_extension {
 #[macro_export]
 macro_rules! export_extension_factory {
     ($factory:expr, max_bytes = $max_bytes:expr) => {
+        /// ABI 1.1 rounds only for factories that export 1.1 (async
+        /// exports); a 1.0 module carries no rounds code (L-5).
+        #[cfg(target_arch = "wasm32")]
+        const AXIOM_EXTENSION_ROUNDS: bool = $crate::__private::factory_abi_version(&$factory)
+            == $crate::abi::ABI_VERSION_1_1.packed();
+
         #[cfg(target_arch = "wasm32")]
         std::thread_local! {
-            static AXIOM_EXTENSION_EXPORTS: std::cell::RefCell<$crate::GuestExports<Box<dyn $crate::Extension>>> =
-                std::cell::RefCell::new($crate::GuestExports::new(
-                    $factory(),
+            static AXIOM_EXTENSION_EXPORTS: std::cell::RefCell<$crate::GuestExports<Box<dyn $crate::Extension>, AXIOM_EXTENSION_ROUNDS>> =
+                std::cell::RefCell::new($crate::GuestExports::configured(
+                    $crate::__private::factory_extension($factory),
                     $crate::abi::CodecLimits { max_bytes: $max_bytes },
                 ));
         }
@@ -912,8 +1072,10 @@ macro_rules! export_extension_factory {
         #[cfg(target_arch = "wasm32")]
         #[unsafe(no_mangle)]
         pub extern "C" fn axiom_extension_abi_version() -> i32 {
-            (($crate::abi::ABI_VERSION.major as i32) << 16)
-                | $crate::abi::ABI_VERSION.minor as i32
+            // 1.0 for `Box<dyn Extension>` factories, 1.1 for `AsyncExtension`
+            // (async exports). A constant, so the body is `i32.const N`.
+            const AXIOM_EXTENSION_ABI: i32 = $crate::__private::factory_abi_version(&$factory);
+            AXIOM_EXTENSION_ABI
         }
 
         #[cfg(target_arch = "wasm32")]
@@ -1212,6 +1374,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // the positional `outcome(i)` path must keep working
     fn typed_effects_yield_and_resume_without_raw_guest_messages() {
         struct CallsCatalog;
         impl TypedExtension for CallsCatalog {
@@ -1351,6 +1514,61 @@ mod tests {
         assert_eq!(host.revision("ui:cart"), Some(4));
         host.assert_wrote("ui:cart", "discount_cents");
         host.assert_no_denials();
+    }
+
+    /// w4-s: the test host matches a write grant segment by segment, never
+    /// as `.`-joined text: a field literally named `a.b` is not field `b`
+    /// inside `a`, in either direction.
+    #[test]
+    fn in_memory_test_host_matches_write_paths_segment_by_segment() {
+        struct Raw(Vec<&'static str>);
+        impl TypedExtension for Raw {
+            fn invoke(&mut self, _: TypedInvocation) -> Result<ExtensionResponse> {
+                Ok(ExtensionResponse::new(()).patch(abi::Patch {
+                    resource: "ui:cart".into(),
+                    expected_revision: 1,
+                    operations: vec![abi::PatchOperation::Set {
+                        path: self.0.iter().map(|s| (*s).into()).collect(),
+                        value: Value::Unsigned(1),
+                    }],
+                }))
+            }
+        }
+        let state = || {
+            Value::Record(vec![
+                abi::Field { name: "a".into(), value: Value::Record(vec![abi::Field { name: "b".into(), value: Value::Unsigned(0) }]) },
+                abi::Field { name: "a.b".into(), value: Value::Unsigned(0) },
+                abi::Field { name: "a2".into(), value: Value::Unsigned(0) },
+                abi::Field { name: "ab".into(), value: Value::Unsigned(0) },
+            ])
+        };
+        // (grant, path, granted?, malformed?)
+        let table: &[(&str, &[&'static str], bool, bool)] = &[
+            ("a.b", &["a", "b"], true, false),
+            ("a.b", &["a.b"], false, true),
+            ("a", &["a.b"], false, true),
+            ("a", &["a", "b"], false, false),
+            ("a", &["ab"], false, false),
+            ("a", &["a2"], false, false),
+            ("ab", &["a", "b"], false, false),
+            ("a", &[""], false, true),
+            ("a.b", &["a", "", "b"], false, true),
+            ("a", &["\u{ff41}"], false, false),
+        ];
+        for (grant, path, granted, malformed) in table {
+            let mut host = test::TestHost::new()
+                .ui_state("cart", 1, state())
+                .allow_ui_write("cart", grant);
+            let mut extension = boxed_extension(Raw(path.to_vec()));
+            let run = host.invoke(&mut *extension, "x", ());
+            assert_eq!(run.is_ok(), *granted, "grant {grant} path {path:?}: {run:?}");
+            if !granted {
+                assert_eq!(host.revision("ui:cart"), Some(1), "{grant} {path:?}");
+                let error = run.unwrap_err();
+                let expected = if *malformed { ErrorCode::InvalidInput } else { ErrorCode::Denied };
+                assert_eq!(error.code, expected, "grant {grant} path {path:?}: {error:?}");
+            }
+        }
     }
 
     #[test]

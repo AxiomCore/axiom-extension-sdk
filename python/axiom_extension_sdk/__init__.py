@@ -4,10 +4,14 @@ The Axiom compiler parses authored source; it never imports this module while
 building or running an extension. The host supplies the real context.
 """
 
-from typing import Any, Callable, Generic, Protocol, TypeVar
+import asyncio
+from typing import Any, Awaitable, Callable, Generic, Mapping, Protocol, TypedDict, TypeVar, overload
+
+from .money import Cents, Percentage
 
 T = TypeVar("T", bound=Callable[..., object])
 ValueT = TypeVar("ValueT")
+O = TypeVar("O")
 
 
 class Selector(str, Generic[ValueT]):
@@ -30,11 +34,60 @@ class SecretHandle(Protocol):
     @property
     def kind(self) -> str: ...
 
+class TypedEffect(TypedDict, Generic[O]):
+    """An effect whose outcome decodes as ``O``. The wire shape is unchanged:
+    ``{"namespace": ..., "operation": ..., "input": ...}``."""
+    namespace: str
+    operation: str
+    input: Any
+
+
+def typed_effect(namespace: str, operation: str, input: Any, output: "type[O]") -> TypedEffect[O]:
+    """An effect whose outcome decodes as ``output``; ``plan.push`` of it gives
+    a ``Ticket[output]``. Returns the plain effect dict (``input`` in wire
+    form, as for a hand-written effect); ``output`` is used for typing only."""
+    del output
+    return {"namespace": namespace, "operation": operation, "input": input}
+
+
+class Ticket(Generic[O]):
+    """A typed claim on the outcome of one host call in one effect plan.
+
+    Issued only by ``Effects.push`` (the host's plan object); ``index`` is the
+    ABI outcome index. Read it with ``ResumeContext.get``. A resume rebuilds
+    the yielded plan with the same calls (namespace, operation and input) in
+    the same order; ``get`` checks that against the host's record of the
+    yielded plan. In the AOT profile these names import at runtime too (for
+    annotations only; they cannot be instantiated).
+    """
+
+    @property
+    def index(self) -> int:
+        raise NotImplementedError("tickets are issued by the host's Effects plan")
+
+
+class Effects(Protocol):
+    """An effect plan built call by call; yield it with ``ctx.effects(plan)``.
+
+    ``plan.push(effect)`` appends a host call and returns its ticket (the
+    AOT host bridge never exposes a member named ``call``).
+
+    The yielded plan is byte-identical to ``ctx.effects(*effects)``.
+    """
+    @overload
+    def push(self, effect: TypedEffect[ValueT]) -> Ticket[ValueT]: ...
+    @overload
+    def push(self, effect: Mapping[str, Any]) -> Ticket[Any]: ...
+    @property
+    def length(self) -> int: ...
+
+
 class Context(Protocol):
     input: Any
     def secret(self, alias: str) -> SecretHandle: ...
     def authenticated_request(self, namespace: str, operation: str, path: str, body: bytes | list[int], secret: SecretHandle) -> Any: ...
     def effects(self, *effects: Any) -> Any: ...
+    def plan(self) -> Effects: ...
     def snapshot(self, resource: str) -> Snapshot: ...
     def patch(self, resource: str) -> Patch: ...
     def complete(self, output: Any = ..., *, patches: list[Any] = ...,
@@ -44,8 +97,54 @@ class Context(Protocol):
 class ResumeContext(Protocol):
     outcomes: list[Any]
     events: list[Any]
-    def outcome(self, index: int) -> Any: ...
+    def get(self, ticket: Ticket[ValueT]) -> ValueT:
+        """Decode the outcome of the host call that issued ``ticket``.
+
+        A ticket from another plan or yield step raises."""
+        ...
+    def plan(self) -> Effects: ...
+    def outcome(self, index: int) -> Any:
+        """Deprecated: positional outcome access.
+
+        Use ``ctx.get(ticket)`` with a ticket from ``plan.push(effect)``. Kept
+        working. No ``DeprecationWarning`` is emitted: the context is supplied
+        by the host runtime, not by this module."""
+        ...
     def complete(self, output: Any = ...) -> Any: ...
+
+class HostOperationError(Exception):
+    """A host operation failed (async exports). ``code`` is the ABI error code
+    (``"Guest"``, ``"Denied"``, ``"Exhausted"``, ...). An export that lets it
+    escape fails the invocation with the same code."""
+
+    def __init__(self, code: str, message: str, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.code = code
+        self.retryable = retryable
+
+
+class AsyncContext(Protocol):
+    """The context of an ``async def`` export (ABI 1.1 rounds)."""
+    input: Any
+    def call(self, effect: TypedEffect[ValueT]) -> Awaitable[ValueT]:
+        """Start a host operation when awaited (or scheduled by ``gather``);
+        operations started together before the export waits form one round."""
+        ...
+    def round(self) -> int: ...
+    def max_rounds(self) -> int: ...
+    def secret(self, alias: str) -> SecretHandle: ...
+    def snapshot(self, resource: str) -> Snapshot: ...
+    def patch(self, resource: str) -> Patch: ...
+    def complete(self, output: Any = ..., *, patches: list[Any] = ...,
+                 transactions: list[Any] = ..., emitted_events: list[Any] = ...) -> Any: ...
+
+
+def gather(*awaitables: Awaitable[Any], return_exceptions: bool = False) -> Awaitable[list[Any]]:
+    """Await several operations or coroutines together (``asyncio.gather``):
+    their host operations go to the host as one round group. There is no
+    ``asyncio`` in the AOT profile; under CPython this is ``asyncio.gather``."""
+    return asyncio.gather(*awaitables, return_exceptions=return_exceptions)
+
 
 class _Extension:
     def export(self, function: T) -> T:

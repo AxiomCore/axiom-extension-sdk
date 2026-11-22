@@ -10,7 +10,11 @@ use alloc::{
     string::{String, ToString},
     vec::Vec,
 };
-use core::marker::PhantomData;
+use core::{
+    cell::Cell,
+    marker::PhantomData,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 pub type Result<T> = core::result::Result<T, SdkError>;
 
@@ -320,6 +324,9 @@ fn value_kind(value: &Value) -> &'static str {
 pub struct TypedInvocation {
     request_id: RequestId,
     invocation: Invocation,
+    /// W2A-1: the input was moved into an async export's `Value` argument;
+    /// [`TypedInvocation::input`] decodes it again from the round's frame.
+    input_moved: bool,
 }
 
 impl TypedInvocation {
@@ -327,7 +334,13 @@ impl TypedInvocation {
         Self {
             request_id,
             invocation,
+            input_moved: false,
         }
+    }
+
+    /// The input was moved out of this invocation (async executor, H-1).
+    pub(crate) fn mark_input_moved(&mut self) {
+        self.input_moved = true;
     }
 
     pub fn request_id(&self) -> RequestId {
@@ -350,6 +363,16 @@ impl TypedInvocation {
     }
 
     pub fn input<T: AxiomDecode>(&self) -> Result<T> {
+        if self.input_moved {
+            // W2A-1: the input went to the export's `Value` argument; read it
+            // again from the round's frame (only when it is asked for).
+            return match crate::round_frame::input() {
+                Some(input) => T::decode(&input),
+                None => Err(SdkError::invalid_input(
+                    "the export input was moved into the export's `Value` argument; read it from the argument",
+                )),
+            };
+        }
         T::decode(&self.invocation.input)
     }
 
@@ -377,6 +400,11 @@ pub struct ResumeContext {
     request_id: RequestId,
     outcomes: Vec<EffectOutcome>,
     events: Vec<EventBatch>,
+    /// The plan this adapter yielded for `request_id`, when it is known.
+    plan: Option<PlanRecord>,
+    /// Without a recorded plan, the first ticket read binds this resume to
+    /// its plan so tickets from two different plans cannot be mixed.
+    bound: Cell<Option<u64>>,
 }
 
 impl ResumeContext {
@@ -384,7 +412,53 @@ impl ResumeContext {
         self.request_id
     }
 
+    /// Decode the outcome of the host call that issued `ticket`, with the
+    /// output type the operation declared.
+    ///
+    /// A ticket is only valid in the resume of the plan (yield step) that
+    /// issued it. When the adapter that yielded the plan also resumes it (the
+    /// normal case for `export_extension_factory!`), a ticket from any other
+    /// plan or an earlier step fails with `InvalidInput`. When no plan was
+    /// recorded (for example an extension instance rebuilt for every message),
+    /// the first ticket binds the resume to its plan and a ticket from another
+    /// plan fails. The check is local; it costs no host round-trip.
+    pub fn get<O: AxiomDecode>(&self, ticket: Ticket<O>) -> Result<O> {
+        match self.plan {
+            Some(plan) => {
+                if ticket.plan != plan.plan {
+                    return Err(SdkError::invalid_input(
+                        "effect ticket belongs to another effect plan or yield step",
+                    ));
+                }
+                if ticket.index >= plan.len {
+                    return Err(SdkError::invalid_input(
+                        "effect ticket index is outside its effect plan",
+                    ));
+                }
+            }
+            None => match self.bound.get() {
+                Some(bound) if bound != ticket.plan => {
+                    return Err(SdkError::invalid_input(
+                        "effect tickets from different effect plans were read in one resume",
+                    ));
+                }
+                Some(_) => {}
+                None => self.bound.set(Some(ticket.plan)),
+            },
+        }
+        self.decode_outcome(ticket.index)
+    }
+
+    /// Positional outcome access.
+    #[deprecated(
+        since = "0.1.5",
+        note = "use typed tickets: `let ticket = effects.push(operation.call(input));` then `resume.get(ticket)`"
+    )]
     pub fn outcome<T: AxiomDecode>(&self, index: u32) -> Result<T> {
+        self.decode_outcome(index)
+    }
+
+    fn decode_outcome<T: AxiomDecode>(&self, index: u32) -> Result<T> {
         let outcome = self
             .outcomes
             .iter()
@@ -417,6 +491,11 @@ pub struct ExtensionResponse {
     events: Vec<Event>,
     effects: Option<abi::EffectPlan>,
     group: Option<abi::EffectGroup>,
+    plan: PlanMark,
+    /// X9c: the site label of each yielded effect or branch, from the typed
+    /// tickets ([`Effects::push`], [`EffectGroup::push`]). Sent only in an
+    /// ABI 1.1 session, beside the plan (never part of its bytes or hash).
+    sites: Vec<Option<abi::SiteId>>,
 }
 
 impl ExtensionResponse {
@@ -428,12 +507,16 @@ impl ExtensionResponse {
             events: Vec::new(),
             effects: None,
             group: None,
+            plan: PlanMark(None),
+            sites: Vec::new(),
         }
     }
 
     /// Suspend this invocation while the host executes the generated,
     /// capability-scoped effect plan. Continue in [`TypedExtension::resume`].
-    pub fn yield_for(effects: Effects) -> Self {
+    pub fn yield_for(mut effects: Effects) -> Self {
+        let plan = PlanMark(Some(effects.record()));
+        let sites = core::mem::take(&mut effects.sites);
         Self {
             output: Value::Null,
             patches: Vec::new(),
@@ -441,11 +524,34 @@ impl ExtensionResponse {
             events: Vec::new(),
             effects: Some(effects.build()),
             group: None,
+            plan,
+            sites,
+        }
+    }
+
+    /// Suspend this invocation while the host runs a group built with
+    /// [`EffectGroup::push`]; its tickets read the branches in the resume.
+    /// The yielded bytes equal [`ExtensionResponse::yield_group`] of the same
+    /// raw group.
+    pub fn yield_effect_group(mut group: EffectGroup) -> Self {
+        let plan = PlanMark(Some(group.record()));
+        let sites = core::mem::take(&mut group.sites);
+        Self {
+            output: Value::Null,
+            patches: Vec::new(),
+            transactions: Vec::new(),
+            events: Vec::new(),
+            effects: None,
+            group: Some(group.build()),
+            plan,
+            sites,
         }
     }
 
     /// A finite host-owned group. Hosts without the explicit capability reject.
     /// Branch names/indexes retain declaration order; this adds no grants.
+    /// Outcomes of a raw group can only be read positionally; prefer
+    /// [`ExtensionResponse::yield_effect_group`], which issues typed tickets.
     pub fn yield_group(group: abi::EffectGroup) -> Self {
         Self {
             output: Value::Null,
@@ -454,6 +560,8 @@ impl ExtensionResponse {
             events: Vec::new(),
             effects: None,
             group: Some(group),
+            plan: PlanMark(None),
+            sites: Vec::new(),
         }
     }
     pub fn patch(mut self, patch: impl Into<Patch>) -> Self {
@@ -513,26 +621,72 @@ pub trait TypedExtension {
     fn shutdown(&mut self) {}
 }
 
-pub struct TypedAdapter<T>(T);
+pub struct TypedAdapter<T> {
+    extension: T,
+    /// The plan of the request that is currently yielded, if any. Guest-local
+    /// bookkeeping only; nothing here reaches the wire.
+    yielded: Option<(RequestId, PlanRecord)>,
+    /// X9c: the site labels of the plan just yielded, kept only when at least
+    /// one is known, for an ABI 1.1 session to send beside the plan
+    /// ([`TypedAdapter::take_yield_sites`]). The ABI 1.0 messages never
+    /// carry them.
+    yielded_sites: Option<(RequestId, Vec<Option<abi::SiteId>>)>,
+}
+
+impl<T> TypedAdapter<T> {
+    pub(crate) fn new(extension: T) -> Self {
+        Self {
+            extension,
+            yielded: None,
+            yielded_sites: None,
+        }
+    }
+
+    fn respond(&mut self, request_id: RequestId, result: Result<ExtensionResponse>) -> GuestMessage {
+        self.yielded = None;
+        self.yielded_sites = None;
+        match result {
+            Ok(mut response) => {
+                if let PlanMark(Some(plan)) = response.plan {
+                    self.yielded = Some((request_id, plan));
+                }
+                if response.sites.iter().any(Option::is_some) {
+                    self.yielded_sites = Some((request_id, core::mem::take(&mut response.sites)));
+                }
+                response.into_message(request_id)
+            }
+            Err(error) => failed(request_id, error),
+        }
+    }
+
+    /// X9c, ABI 1.1: the site labels of the plan `request_id` just yielded,
+    /// in plan or branch order; empty when none is known (the round is then
+    /// sent as a plain `YieldedRound`, byte for byte as before X9c).
+    pub(crate) fn take_yield_sites(&mut self, request_id: RequestId) -> Vec<Option<abi::SiteId>> {
+        match self.yielded_sites.take() {
+            Some((id, sites)) if id == request_id => sites,
+            _ => Vec::new(),
+        }
+    }
+}
 
 /// Erase a typed implementation behind the ABI-compatible extension trait
 /// object expected by the generated source wrapper.
 pub fn boxed_extension<T: TypedExtension + 'static>(
     extension: T,
 ) -> alloc::boxed::Box<dyn Extension> {
-    alloc::boxed::Box::new(TypedAdapter(extension))
+    alloc::boxed::Box::new(TypedAdapter::new(extension))
 }
 
 impl<T: TypedExtension> Extension for TypedAdapter<T> {
     fn initialize(&mut self) -> core::result::Result<(), ExtensionError> {
-        TypedExtension::initialize(&mut self.0).map_err(Into::into)
+        TypedExtension::initialize(&mut self.extension).map_err(Into::into)
     }
 
     fn invoke(&mut self, request_id: RequestId, invocation: Invocation) -> GuestMessage {
-        match TypedExtension::invoke(&mut self.0, TypedInvocation::new(request_id, invocation)) {
-            Ok(response) => response.into_message(request_id),
-            Err(error) => failed(request_id, error),
-        }
+        let result =
+            TypedExtension::invoke(&mut self.extension, TypedInvocation::new(request_id, invocation));
+        self.respond(request_id, result)
     }
 
     fn resume(
@@ -541,25 +695,33 @@ impl<T: TypedExtension> Extension for TypedAdapter<T> {
         outcomes: Vec<EffectOutcome>,
         events: Vec<EventBatch>,
     ) -> GuestMessage {
-        match TypedExtension::resume(
-            &mut self.0,
+        let plan = match self.yielded.take() {
+            Some((yielded, plan)) if yielded == request_id => Some(plan),
+            _ => None,
+        };
+        let result = TypedExtension::resume(
+            &mut self.extension,
             ResumeContext {
                 request_id,
                 outcomes,
                 events,
+                plan,
+                bound: Cell::new(None),
             },
-        ) {
-            Ok(response) => response.into_message(request_id),
-            Err(error) => failed(request_id, error),
-        }
+        );
+        self.respond(request_id, result)
     }
 
     fn cancel(&mut self, request_id: RequestId) -> core::result::Result<(), ExtensionError> {
-        TypedExtension::cancel(&mut self.0, request_id).map_err(Into::into)
+        self.yielded = None;
+        self.yielded_sites = None;
+        TypedExtension::cancel(&mut self.extension, request_id).map_err(Into::into)
     }
 
     fn shutdown(&mut self) {
-        TypedExtension::shutdown(&mut self.0)
+        self.yielded = None;
+        self.yielded_sites = None;
+        TypedExtension::shutdown(&mut self.extension)
     }
 }
 
@@ -830,8 +992,102 @@ impl<S: StoreObject> From<StoreTransaction<S>> for TransactionProposal {
     }
 }
 
+/// One entry of the X9a site table (`axiom-extension-effect-summary/v1`
+/// `sites[]`): the binding token a guest source uses, as the static analyser
+/// records it. `file` is relative to the extension source root with `/`
+/// separators; `line` and `column` are 1-based, the column counted in
+/// Unicode scalar values; `binding` is the qualified generated item (for
+/// example `operations::catalog_name` or `ui::Cart::subscribe_total`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SiteKey {
+    pub file: &'static str,
+    pub line: u32,
+    pub column: u32,
+    pub binding: &'static str,
+}
+
+/// The interned X9a site table embedded in the generated bindings by the
+/// build (X9c). The id of a site is its index; the table is sorted by
+/// (`file`, `line`, `column`, `binding`), exactly as X9a interns it, so the
+/// ids the guest emits at run time are the ids of the package's static
+/// summary. `root` is the prefix the compiler puts in front of the source
+/// root in [`core::panic::Location::file`] (for the Axiom source build,
+/// `members/<alias>/src/sources/`); it is stripped before matching, so no
+/// path of the build machine is compared or emitted.
+///
+/// The table is data for labels only. A site id never changes what an
+/// effect does, and the host treats it as untrusted.
+#[derive(Clone, Copy, Debug)]
+pub struct SiteTable {
+    pub root: &'static str,
+    pub sites: &'static [SiteKey],
+}
+
+impl SiteTable {
+    /// No table: every generated binding call carries no site, and a 1.1
+    /// guest yields plain `YieldedRound` frames, byte for byte as before X9c.
+    pub const EMPTY: SiteTable = SiteTable {
+        root: "",
+        sites: &[],
+    };
+
+    /// The X9c interning rule (contract `x9c-sites-and-spans.md` §3.2): a
+    /// call whose caller location is (`file`, `line`, `column`) and that goes
+    /// through the generated item `binding` has the site id of the table entry
+    /// with exactly that file (after stripping `root`), line, column and
+    /// binding. Anything else has no site (`None`): never a guess from a
+    /// nearby column, another line or another file.
+    ///
+    /// The table is normalised at build time to the positions rustc's
+    /// `#[track_caller]` reports: the method-name token for a method call
+    /// (`cart.subscribe_total()`), the first token of the path for a path call
+    /// (`operations::catalog_name(..)`, also with a turbofish or split over
+    /// lines), and the first token of the outermost macro invocation for a
+    /// call inside a `macro_rules!` body. An exact match cannot pick another
+    /// call's entry: two different calls never start at the same column of
+    /// the same line, so a location that is not itself a binding call (for
+    /// example a user helper marked `#[track_caller]`) has no site.
+    pub fn locate(&self, file: &str, line: u32, column: u32, binding: &str) -> Option<abi::SiteId> {
+        if self.sites.is_empty() || self.sites.len() > abi::MAX_SITE_TABLE_LEN as usize {
+            return None;
+        }
+        let normalised;
+        let file = if file.contains('\\') {
+            normalised = file.replace('\\', "/");
+            normalised.as_str()
+        } else {
+            file
+        };
+        let relative = file.strip_prefix(self.root)?;
+        let start = self
+            .sites
+            .partition_point(|site| (site.file, site.line, site.column) < (relative, line, column));
+        for (offset, site) in self.sites[start..].iter().enumerate() {
+            if site.file != relative || site.line != line || site.column != column {
+                break;
+            }
+            if site.binding == binding {
+                return abi::SiteId::try_from(start + offset).ok();
+            }
+        }
+        None
+    }
+
+    /// [`Self::locate`] at the caller's location. Generated binding items are
+    /// `#[track_caller]`, so this is the guest's call of the binding.
+    #[track_caller]
+    pub fn here(&self, binding: &str) -> Option<abi::SiteId> {
+        if self.sites.is_empty() {
+            return None;
+        }
+        let location = core::panic::Location::caller();
+        self.locate(location.file(), location.line(), location.column(), binding)
+    }
+}
+
 pub struct Operation<I, O> {
     binding: Binding,
+    site: Option<abi::SiteId>,
     marker: PhantomData<fn(I) -> O>,
 }
 
@@ -840,8 +1096,29 @@ impl<I, O> Operation<I, O> {
     pub const fn generated(binding: Binding) -> Self {
         Self {
             binding,
+            site: None,
             marker: PhantomData,
         }
+    }
+
+    /// Generated binding items (X9c) call this from a `#[track_caller]`
+    /// function, so the site is the guest's call of the generated item,
+    /// interned through the embedded X9a table. With [`SiteTable::EMPTY`]
+    /// this is [`Self::generated`].
+    #[doc(hidden)]
+    #[track_caller]
+    pub fn generated_sited(binding: Binding, table: &SiteTable, name: &str) -> Self {
+        Self {
+            binding,
+            site: table.here(name),
+            marker: PhantomData,
+        }
+    }
+
+    /// The interned X9a site of the binding call that produced this
+    /// operation, if the build embedded a site table and the call is in it.
+    pub fn site(&self) -> Option<abi::SiteId> {
+        self.site
     }
 }
 
@@ -849,6 +1126,7 @@ impl<I: AxiomEncode, O> Operation<I, O> {
     pub fn call(&self, input: I) -> EffectCall<O> {
         EffectCall {
             effect: self.binding.effect(input.encode()),
+            site: self.site,
             marker: PhantomData,
         }
     }
@@ -856,6 +1134,7 @@ impl<I: AxiomEncode, O> Operation<I, O> {
 
 pub struct EffectCall<O> {
     effect: Effect,
+    site: Option<abi::SiteId>,
     marker: PhantomData<fn() -> O>,
 }
 
@@ -863,26 +1142,267 @@ impl<O> EffectCall<O> {
     pub fn into_effect(self) -> Effect {
         self.effect
     }
+
+    /// The X9c site label carried with this call (never part of the effect
+    /// bytes or the plan hash).
+    pub fn site(&self) -> Option<abi::SiteId> {
+        self.site
+    }
+
+    /// The effect and its site label.
+    pub fn into_parts(self) -> (Effect, Option<abi::SiteId>) {
+        (self.effect, self.site)
+    }
 }
 
-#[derive(Default)]
+/// Guest-local plan identities. A plain counter: plans are only compared for
+/// equality inside one extension instance, and nothing is sent to the host.
+static NEXT_PLAN: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PlanRecord {
+    plan: u64,
+    len: u32,
+}
+
+/// Guest-local plan identity carried beside a response. It never affects
+/// equality or the encoded message: two responses with the same plan bytes
+/// compare equal.
+#[derive(Clone, Copy, Debug)]
+struct PlanMark(Option<PlanRecord>);
+
+impl PartialEq for PlanMark {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+/// A typed claim on the outcome of one host call in one effect plan.
+///
+/// Returned by [`Effects::push`]; read it in [`TypedExtension::resume`] with
+/// [`ResumeContext::get`], which decodes the outcome as `O`. A ticket is
+/// `Copy` so it can be kept in the extension between invoke and resume. It
+/// cannot be built from a raw index:
+///
+/// ```compile_fail,E0451
+/// let forged: axiom_extension_sdk::Ticket<u64> = axiom_extension_sdk::Ticket {
+///     plan: 1,
+///     index: 0,
+///     marker: core::marker::PhantomData,
+/// };
+/// ```
+///
+/// and the decoded type is the one the operation declared:
+///
+/// ```compile_fail,E0308
+/// use axiom_extension_sdk::{Binding, Effects, Operation, ResumeContext};
+/// fn read(resume: &ResumeContext) {
+///     let mut effects = Effects::new();
+///     let ticket = effects.push(
+///         Operation::<u64, u64>::generated(Binding {
+///             namespace: "n", operation: "o", input: "Unsigned", output: "Unsigned",
+///         })
+///         .call(1),
+///     );
+///     let wrong: String = resume.get(ticket).unwrap();
+/// }
+/// ```
+pub struct Ticket<O> {
+    plan: u64,
+    index: u32,
+    marker: PhantomData<fn() -> O>,
+}
+
+impl<O> Ticket<O> {
+    /// The ABI outcome index (declaration order in the plan).
+    pub fn index(&self) -> u32 {
+        self.index
+    }
+}
+
+impl<O> Clone for Ticket<O> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<O> Copy for Ticket<O> {}
+
+impl<O> PartialEq for Ticket<O> {
+    fn eq(&self, other: &Self) -> bool {
+        self.plan == other.plan && self.index == other.index
+    }
+}
+
+impl<O> Eq for Ticket<O> {}
+
+impl<O> core::fmt::Debug for Ticket<O> {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("Ticket")
+            .field("plan", &self.plan)
+            .field("index", &self.index)
+            .finish()
+    }
+}
+
 pub struct Effects {
     effects: Vec<Effect>,
+    sites: Vec<Option<abi::SiteId>>,
+    plan: u64,
+}
+
+impl Default for Effects {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Effects {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            effects: Vec::new(),
+            sites: Vec::new(),
+            plan: NEXT_PLAN.fetch_add(1, Ordering::Relaxed),
+        }
     }
 
+    /// Append a call, chaining by value. The outcome can only be read
+    /// positionally; prefer [`Effects::push`], which returns a typed ticket.
     pub fn call<O>(mut self, call: EffectCall<O>) -> Self {
-        self.effects.push(call.into_effect());
+        let (effect, site) = call.into_parts();
+        self.effects.push(effect);
+        self.sites.push(site);
         self
+    }
+
+    /// Append a call and return the typed ticket for its outcome. The plan
+    /// bytes are identical to the ones [`Effects::call`] produces.
+    pub fn push<O>(&mut self, call: EffectCall<O>) -> Ticket<O> {
+        let index = u32::try_from(self.effects.len()).unwrap_or(u32::MAX);
+        let (effect, site) = call.into_parts();
+        self.effects.push(effect);
+        self.sites.push(site);
+        Ticket {
+            plan: self.plan,
+            index,
+            marker: PhantomData,
+        }
+    }
+
+    /// Number of host calls in the plan.
+    pub fn len(&self) -> usize {
+        self.effects.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.effects.is_empty()
+    }
+
+    /// X9c: the site label of each call, in plan order (`None` when unknown).
+    pub fn sites(&self) -> &[Option<abi::SiteId>] {
+        &self.sites
+    }
+
+    /// X9c, ABI 1.1: the round plan and its site labels, for
+    /// [`abi::yielded_round`], which sends the plain `YieldedRound` when no
+    /// label is known.
+    pub fn into_round_plan(self) -> (abi::RoundPlan, Vec<Option<abi::SiteId>>) {
+        let sites = self.sites.clone();
+        (abi::RoundPlan::Plan(self.build()), sites)
+    }
+
+    fn record(&self) -> PlanRecord {
+        PlanRecord {
+            plan: self.plan,
+            len: u32::try_from(self.effects.len()).unwrap_or(u32::MAX),
+        }
     }
 
     fn build(self) -> abi::EffectPlan {
         abi::EffectPlan {
             effects: self.effects,
+        }
+    }
+}
+
+/// A finite host-owned effect group built branch by branch, with a typed
+/// ticket per branch (X7a tickets for groups). Yield it with
+/// [`ExtensionResponse::yield_effect_group`]; read each branch in the resume
+/// with [`ResumeContext::get`]. Outcome indexes are declaration order, so a
+/// ticket reads its branch even when branches finish out of order. The group
+/// bytes are identical to the raw `abi::EffectGroup` passed to
+/// [`ExtensionResponse::yield_group`]; hosts without the group capability
+/// reject it, and building one adds no grants.
+pub struct EffectGroup {
+    mode: abi::EffectGroupMode,
+    limit: u16,
+    branches: Vec<abi::NamedEffect>,
+    sites: Vec<Option<abi::SiteId>>,
+    plan: u64,
+}
+
+impl EffectGroup {
+    /// An empty group running at most `limit` branches at once.
+    pub fn new(mode: abi::EffectGroupMode, limit: u16) -> Self {
+        Self {
+            mode,
+            limit,
+            branches: Vec::new(),
+            sites: Vec::new(),
+            plan: NEXT_PLAN.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+
+    /// Append a named branch and return the typed ticket for its outcome.
+    pub fn push<O>(&mut self, name: impl Into<String>, call: EffectCall<O>) -> Ticket<O> {
+        let index = u32::try_from(self.branches.len()).unwrap_or(u32::MAX);
+        let (effect, site) = call.into_parts();
+        self.branches.push(abi::NamedEffect {
+            name: name.into(),
+            effect,
+        });
+        self.sites.push(site);
+        Ticket {
+            plan: self.plan,
+            index,
+            marker: PhantomData,
+        }
+    }
+
+    /// Number of branches in the group.
+    pub fn len(&self) -> usize {
+        self.branches.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.branches.is_empty()
+    }
+
+    /// X9c: the site label of each branch, in branch order.
+    pub fn sites(&self) -> &[Option<abi::SiteId>] {
+        &self.sites
+    }
+
+    /// X9c, ABI 1.1: the round plan (a group) and its site labels.
+    pub fn into_round_plan(self) -> (abi::RoundPlan, Vec<Option<abi::SiteId>>) {
+        let sites = self.sites.clone();
+        (abi::RoundPlan::Group(self.build()), sites)
+    }
+
+    fn record(&self) -> PlanRecord {
+        PlanRecord {
+            plan: self.plan,
+            len: u32::try_from(self.branches.len()).unwrap_or(u32::MAX),
+        }
+    }
+
+    fn build(self) -> abi::EffectGroup {
+        abi::EffectGroup {
+            format: abi::EFFECT_GROUP_FORMAT.into(),
+            limit: self.limit,
+            mode: self.mode,
+            branches: self.branches,
         }
     }
 }
@@ -1056,4 +1576,562 @@ fn value_at_path<'a>(value: &'a Value, path: &str) -> Result<&'a Value> {
 
 fn split_path(path: &str) -> Vec<String> {
     path.split('.').map(ToString::to_string).collect()
+}
+
+#[cfg(test)]
+mod ticket_tests {
+    use super::*;
+    use alloc::{boxed::Box, vec};
+    use abi::{CodecLimits, Frame};
+
+    const LOOKUP: Binding = Binding {
+        namespace: "contract:catalog",
+        operation: "query_product",
+        input: "Unsigned",
+        output: "String",
+    };
+    const STOCK: Binding = Binding {
+        namespace: "contract:catalog",
+        operation: "in_stock",
+        input: "Unsigned",
+        output: "Boolean",
+    };
+
+    fn lookup() -> Operation<u64, String> {
+        Operation::generated(LOOKUP)
+    }
+    fn stock() -> Operation<u64, bool> {
+        Operation::generated(STOCK)
+    }
+    fn id(value: u64) -> RequestId {
+        RequestId::new(value).unwrap()
+    }
+    fn invocation(export: &str) -> Invocation {
+        Invocation {
+            export: export.into(),
+            input: Value::Null,
+            snapshots: vec![],
+            deadline_unix_ms: 1,
+        }
+    }
+    fn ok(index: u32, value: Value) -> EffectOutcome {
+        EffectOutcome {
+            index,
+            result: Ok(value),
+        }
+    }
+    fn output(message: GuestMessage) -> Value {
+        match message {
+            GuestMessage::Completed { result, .. } => result.output,
+            other => panic!("expected completion, got {other:?}"),
+        }
+    }
+    fn failure(message: GuestMessage) -> ExtensionError {
+        match message {
+            GuestMessage::Failed { error, .. } => error,
+            other => panic!("expected failure, got {other:?}"),
+        }
+    }
+
+    /// Yields two differently typed calls and reads both by ticket.
+    #[derive(Default)]
+    struct TwoCalls {
+        tickets: Option<(Ticket<String>, Ticket<bool>)>,
+    }
+    impl TypedExtension for TwoCalls {
+        fn invoke(&mut self, _: TypedInvocation) -> Result<ExtensionResponse> {
+            let mut effects = Effects::new();
+            let name = effects.push(lookup().call(7));
+            let available = effects.push(stock().call(7));
+            self.tickets = Some((name, available));
+            Ok(ExtensionResponse::yield_for(effects))
+        }
+        fn resume(&mut self, resume: ResumeContext) -> Result<ExtensionResponse> {
+            let (name, available) = self.tickets.take().unwrap();
+            let name: String = resume.get(name)?;
+            let available: bool = resume.get(available)?;
+            Ok(ExtensionResponse::new(format!("{name}:{available}")))
+        }
+    }
+
+    #[test]
+    fn tickets_round_trip_typed_outcomes() {
+        let mut extension = boxed_extension(TwoCalls::default());
+        let GuestMessage::Yielded { plan, .. } = extension.invoke(id(1), invocation("load"))
+        else {
+            panic!("expected a yield");
+        };
+        assert_eq!(plan.effects.len(), 2);
+        let resumed = extension.resume(
+            id(1),
+            vec![ok(0, Value::String("Linen".into())), ok(1, Value::Bool(true))],
+            vec![],
+        );
+        assert_eq!(output(resumed), Value::String("Linen:true".into()));
+    }
+
+    #[test]
+    fn ticket_reports_type_mismatch_and_host_errors() {
+        let mut extension = boxed_extension(TwoCalls::default());
+        extension.invoke(id(1), invocation("load"));
+        // The host returns the right index with the wrong type: decoding fails
+        // instead of silently reading another outcome.
+        let error = failure(extension.resume(
+            id(1),
+            vec![ok(0, Value::Bool(true)), ok(1, Value::Bool(true))],
+            vec![],
+        ));
+        assert_eq!(error.code, ErrorCode::InvalidInput);
+        assert!(error.message.contains("expected string"), "{}", error.message);
+
+        extension.invoke(id(2), invocation("load"));
+        let error = failure(extension.resume(
+            id(2),
+            vec![
+                EffectOutcome {
+                    index: 0,
+                    result: Err(ExtensionError {
+                        code: ErrorCode::Denied,
+                        message: "denied by host".into(),
+                        retryable: false,
+                    }),
+                },
+                ok(1, Value::Bool(true)),
+            ],
+            vec![],
+        ));
+        assert_eq!(error.code, ErrorCode::Denied);
+    }
+
+    /// Keeps the ticket of the first invocation and reads it in a later one.
+    #[derive(Default)]
+    struct StaleTicket {
+        first: Option<Ticket<String>>,
+        unyielded: Option<Ticket<String>>,
+        current: Option<Ticket<String>>,
+    }
+    impl TypedExtension for StaleTicket {
+        fn invoke(&mut self, invocation: TypedInvocation) -> Result<ExtensionResponse> {
+            let mut effects = Effects::new();
+            let ticket = effects.push(lookup().call(1));
+            if self.first.is_none() {
+                self.first = Some(ticket);
+            }
+            self.current = Some(ticket);
+            if invocation.export() == "unyielded" {
+                // A plan that is built but never yielded issues tickets that
+                // are valid for no resume.
+                let mut other = Effects::new();
+                self.unyielded = Some(other.push(lookup().call(2)));
+            }
+            Ok(ExtensionResponse::yield_for(effects))
+        }
+        fn resume(&mut self, resume: ResumeContext) -> Result<ExtensionResponse> {
+            let ticket = match self.unyielded.take() {
+                Some(ticket) => ticket,
+                None => self.first.unwrap(),
+            };
+            Ok(ExtensionResponse::new(resume.get(ticket)?))
+        }
+    }
+
+    #[test]
+    fn ticket_from_another_plan_is_rejected() {
+        let mut extension = boxed_extension(StaleTicket::default());
+        extension.invoke(id(1), invocation("load"));
+        assert_eq!(
+            output(extension.resume(id(1), vec![ok(0, Value::String("a".into()))], vec![])),
+            Value::String("a".into())
+        );
+        // Second request: same shape, same index, different plan.
+        extension.invoke(id(2), invocation("load"));
+        let error = failure(extension.resume(id(2), vec![ok(0, Value::String("b".into()))], vec![]));
+        assert_eq!(error.code, ErrorCode::InvalidInput);
+        assert!(error.message.contains("another effect plan"), "{}", error.message);
+
+        // A ticket from a plan that was never yielded.
+        let mut extension = boxed_extension(StaleTicket::default());
+        extension.invoke(id(3), invocation("unyielded"));
+        let error = failure(extension.resume(id(3), vec![ok(0, Value::String("c".into()))], vec![]));
+        assert!(error.message.contains("another effect plan"), "{}", error.message);
+    }
+
+    /// Yields twice in one request and reads the first step's ticket at the
+    /// second resume.
+    #[derive(Default)]
+    struct TwoSteps {
+        step_one: Option<Ticket<String>>,
+        step_two: Option<Ticket<String>>,
+        stale: bool,
+    }
+    impl TypedExtension for TwoSteps {
+        fn invoke(&mut self, invocation: TypedInvocation) -> Result<ExtensionResponse> {
+            self.stale = invocation.export() == "stale";
+            let mut effects = Effects::new();
+            self.step_one = Some(effects.push(lookup().call(1)));
+            Ok(ExtensionResponse::yield_for(effects))
+        }
+        fn resume(&mut self, resume: ResumeContext) -> Result<ExtensionResponse> {
+            match self.step_two {
+                None => {
+                    let first: String = resume.get(self.step_one.unwrap())?;
+                    let mut effects = Effects::new();
+                    self.step_two = Some(effects.push(lookup().call(first.len() as u64)));
+                    Ok(ExtensionResponse::yield_for(effects))
+                }
+                Some(second) => {
+                    let ticket = if self.stale { self.step_one.unwrap() } else { second };
+                    Ok(ExtensionResponse::new(resume.get(ticket)?))
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ticket_from_an_earlier_yield_step_is_rejected() {
+        for (export, expect_ok) in [("fresh", true), ("stale", false)] {
+            let mut extension = boxed_extension(TwoSteps::default());
+            extension.invoke(id(1), invocation(export));
+            let step = extension.resume(id(1), vec![ok(0, Value::String("abc".into()))], vec![]);
+            assert!(matches!(step, GuestMessage::Yielded { .. }), "{step:?}");
+            let last = extension.resume(id(1), vec![ok(0, Value::String("second".into()))], vec![]);
+            if expect_ok {
+                assert_eq!(output(last), Value::String("second".into()));
+            } else {
+                assert!(failure(last).message.contains("another effect plan"));
+            }
+        }
+    }
+
+    #[test]
+    fn cancel_and_failures_clear_the_recorded_plan() {
+        let mut extension = boxed_extension(TwoCalls::default());
+        extension.invoke(id(1), invocation("load"));
+        extension.cancel(id(1)).unwrap();
+        // After a cancel the adapter keeps no plan record (the host never
+        // resumes a cancelled request; this checks the SDK does not reuse a
+        // stale record). Both tickets come from one plan, so the unrecorded
+        // binding mode accepts them.
+        let adapter_resume = extension.resume(
+            id(1),
+            vec![ok(0, Value::String("x".into())), ok(1, Value::Bool(false))],
+            vec![],
+        );
+        assert_eq!(output(adapter_resume), Value::String("x:false".into()));
+    }
+
+    fn unrecorded(outcomes: Vec<EffectOutcome>) -> ResumeContext {
+        ResumeContext {
+            request_id: id(5),
+            outcomes,
+            events: vec![],
+            plan: None,
+            bound: Cell::new(None),
+        }
+    }
+
+    #[test]
+    fn without_a_recorded_plan_tickets_from_two_plans_cannot_be_mixed() {
+        let mut first = Effects::new();
+        let a = first.push(lookup().call(1));
+        let mut second = Effects::new();
+        let _ = second.push(lookup().call(1));
+        let b = second.push(stock().call(1));
+        let resume = unrecorded(vec![ok(0, Value::String("a".into())), ok(1, Value::Bool(true))]);
+        assert_eq!(resume.get(a).unwrap(), "a");
+        let error = resume.get(b).unwrap_err();
+        assert!(error.message.contains("different effect plans"), "{}", error.message);
+        // Re-reading a ticket of the bound plan stays valid.
+        assert_eq!(resume.get(a).unwrap(), "a");
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn deprecated_positional_outcome_still_works() {
+        let resume = unrecorded(vec![ok(0, Value::String("a".into())), ok(1, Value::Bool(true))]);
+        assert_eq!(resume.outcome::<String>(0).unwrap(), "a");
+        assert!(resume.outcome::<bool>(1).unwrap());
+        assert!(resume.outcome::<bool>(2).is_err());
+        // Positional reads do not bind the resume to a plan.
+        let mut effects = Effects::new();
+        let ticket = effects.push(lookup().call(1));
+        assert_eq!(resume.get(ticket).unwrap(), "a");
+    }
+
+    #[test]
+    fn tickets_are_copy_and_carry_declaration_order() {
+        let mut effects = Effects::new();
+        assert!(effects.is_empty());
+        let a = effects.push(lookup().call(1));
+        let b = effects.push(stock().call(2));
+        let copy = a;
+        assert_eq!(copy, a);
+        assert_eq!((a.index(), b.index()), (0, 1));
+        assert_eq!(effects.len(), 2);
+        let mut other = Effects::new();
+        assert_ne!(other.push(lookup().call(1)), a);
+    }
+
+    #[test]
+    fn group_tickets_read_branches_in_declaration_order_with_raw_group_bytes() {
+        let limits = CodecLimits { max_bytes: 65_536 };
+        #[derive(Default)]
+        struct Grouped {
+            pending: Option<(Ticket<String>, Ticket<String>)>,
+            last: Option<Ticket<String>>,
+            stale: Option<Ticket<String>>,
+        }
+        impl TypedExtension for Grouped {
+            fn invoke(&mut self, invocation: TypedInvocation) -> Result<ExtensionResponse> {
+                let mut group = EffectGroup::new(abi::EffectGroupMode::FailFast, 2);
+                assert!(group.is_empty());
+                let a = group.push("a", lookup().call(1));
+                let b = group.push("b", lookup().call(2));
+                assert_eq!((a.index(), b.index(), group.len()), (0, 1, 2));
+                if invocation.export() == "stale" {
+                    self.stale = self.last;
+                }
+                self.last = Some(a);
+                self.pending = Some((a, b));
+                Ok(ExtensionResponse::yield_effect_group(group))
+            }
+            fn resume(&mut self, resume: ResumeContext) -> Result<ExtensionResponse> {
+                if let Some(stale) = self.stale.take() {
+                    return resume.get(stale).map(ExtensionResponse::new);
+                }
+                let (a, b) = self.pending.take().unwrap();
+                Ok(ExtensionResponse::new(alloc::format!("{}/{}", resume.get(a)?, resume.get(b)?)))
+            }
+        }
+        // Same bytes as the raw group the m2 fixture used to build by hand.
+        let raw = ExtensionResponse::yield_group(abi::EffectGroup {
+            format: abi::EFFECT_GROUP_FORMAT.into(),
+            limit: 2,
+            mode: abi::EffectGroupMode::FailFast,
+            branches: ["a", "b"]
+                .into_iter()
+                .zip([1u64, 2])
+                .map(|(name, input)| abi::NamedEffect { name: name.into(), effect: lookup().call(input).into_effect() })
+                .collect(),
+        });
+        let mut extension = boxed_extension(Grouped::default());
+        let yielded = extension.invoke(id(1), invocation("load"));
+        assert_eq!(
+            abi::encode(&Frame::new(yielded), limits).unwrap(),
+            abi::encode(&Frame::new(raw.into_message(id(1))), limits).unwrap()
+        );
+        // Outcomes arrive out of order; tickets still read their own branch.
+        let outcomes = alloc::vec![
+            EffectOutcome { index: 1, result: Ok(Value::String("B".into())) },
+            EffectOutcome { index: 0, result: Ok(Value::String("A".into())) },
+        ];
+        match extension.resume(id(1), outcomes.clone(), Vec::new()) {
+            GuestMessage::Completed { result, .. } => assert_eq!(result.output, Value::String("A/B".into())),
+            other => panic!("expected completion, got {other:?}"),
+        }
+        // A ticket from the previous group (an earlier yield step) is rejected.
+        extension.invoke(id(2), invocation("load"));
+        extension.resume(id(2), outcomes.clone(), Vec::new());
+        extension.invoke(id(3), invocation("stale"));
+        match extension.resume(id(3), outcomes, Vec::new()) {
+            GuestMessage::Failed { error, .. } => assert!(error.message.contains("another effect plan"), "{}", error.message),
+            other => panic!("expected the stale ticket to fail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_bytes_are_identical_with_and_without_tickets() {
+        let limits = CodecLimits { max_bytes: 65_536 };
+        let request_id = id(3);
+        let chained = ExtensionResponse::yield_for(
+            Effects::new().call(lookup().call(7)).call(stock().call(9)),
+        );
+        let mut effects = Effects::new();
+        let _name = effects.push(lookup().call(7));
+        let _stock = effects.push(stock().call(9));
+        let ticketed = ExtensionResponse::yield_for(effects);
+        assert_eq!(chained, ticketed);
+        let chained = abi::encode(&Frame::new(chained.into_message(request_id)), limits).unwrap();
+        let ticketed = abi::encode(&Frame::new(ticketed.into_message(request_id)), limits).unwrap();
+        assert!(!chained.is_empty());
+        assert_eq!(chained, ticketed);
+
+        // The same holds for the full adapter output on the wire.
+        struct Chained;
+        impl TypedExtension for Chained {
+            fn invoke(&mut self, _: TypedInvocation) -> Result<ExtensionResponse> {
+                Ok(ExtensionResponse::yield_for(
+                    Effects::new().call(lookup().call(7)).call(stock().call(7)),
+                ))
+            }
+        }
+        let via_adapter = |mut extension: Box<dyn Extension>| {
+            abi::encode(&Frame::new(extension.invoke(request_id, invocation("load"))), limits)
+                .unwrap()
+        };
+        assert_eq!(
+            via_adapter(boxed_extension(Chained)),
+            via_adapter(boxed_extension(TwoCalls::default()))
+        );
+    }
+}
+
+#[cfg(test)]
+mod site_tests {
+    use super::*;
+    use alloc::vec;
+
+    const BINDING: Binding = Binding {
+        namespace: "contract:catalog",
+        operation: "query_product",
+        input: "Unsigned",
+        output: "String",
+    };
+
+    // Sorted by (file, line, column, binding), id = index, as X9a interns;
+    // columns are the normalised `#[track_caller]` positions (path start).
+    static SITES: [SiteKey; 6] = [
+        SiteKey { file: "src/a.rs", line: 3, column: 9, binding: "operations::catalog" },
+        SiteKey { file: "src/a.rs", line: 3, column: 40, binding: "operations::catalog" },
+        SiteKey { file: "src/a.rs", line: 7, column: 5, binding: "operations::catalog" },
+        SiteKey { file: "src/a.rs", line: 7, column: 5, binding: "ui::Cart::subscribe_total" },
+        SiteKey { file: "src/b.rs", line: 1, column: 1, binding: "operations::catalog" },
+        SiteKey { file: "src/b.rs", line: 2, column: 30, binding: "operations::stock" },
+    ];
+    const TABLE: SiteTable = SiteTable { root: "members/x/src/sources/", sites: &SITES };
+
+    fn at(file: &str, line: u32, column: u32, binding: &str) -> Option<u32> {
+        TABLE.locate(file, line, column, binding)
+    }
+
+    #[test]
+    fn only_an_exact_location_and_binding_has_a_site() {
+        let f = "members/x/src/sources/src/a.rs";
+        // Exact (file, line, column, binding).
+        assert_eq!(at(f, 7, 5, "ui::Cart::subscribe_total"), Some(3));
+        assert_eq!(at(f, 3, 9, "operations::catalog"), Some(0));
+        assert_eq!(at(f, 3, 40, "operations::catalog"), Some(1));
+        // Same position, different binding (X9a over-approximation entries).
+        assert_eq!(at(f, 7, 5, "operations::catalog"), Some(2));
+        // W2B-1: a nearby column is never matched, before or after an entry
+        // (a user `#[track_caller]` helper reports its caller's column).
+        for column in [1, 8, 10, 39, 41, u32::MAX] {
+            assert_eq!(at(f, 3, column, "operations::catalog"), None, "column {column}");
+        }
+        assert_eq!(at(f, 7, 1, "operations::catalog"), None);
+        assert_eq!(at(f, 7, 6, "ui::Cart::subscribe_total"), None);
+        // Never another binding, line or file.
+        assert_eq!(at(f, 3, 9, "operations::stock"), None);
+        assert_eq!(at(f, 4, 9, "operations::catalog"), None);
+        assert_eq!(at("members/x/src/sources/src/b.rs", 2, 30, "operations::stock"), Some(5));
+        assert_eq!(at("members/x/src/sources/src/b.rs", 2, 1, "operations::stock"), None);
+        assert_eq!(at("members/x/src/sources/src/b.rs", 2, 30, "operations::catalog"), None);
+    }
+
+    #[test]
+    fn root_is_required_and_paths_are_normalised() {
+        // A file outside the root (another crate, the SDK itself) has no site.
+        assert_eq!(at("src/a.rs", 3, 9, "operations::catalog"), None);
+        assert_eq!(at("/abs/members/x/src/sources/src/a.rs", 3, 9, "operations::catalog"), None);
+        // Windows separators from the compiler are normalised.
+        assert_eq!(at("members\\x\\src\\sources\\src\\a.rs", 3, 9, "operations::catalog"), Some(0));
+        // The empty table never matches.
+        assert_eq!(SiteTable::EMPTY.locate("src/a.rs", 3, 9, "operations::catalog"), None);
+    }
+
+    #[test]
+    fn an_unsorted_or_hostile_table_never_panics() {
+        static BAD: [SiteKey; 3] = [
+            SiteKey { file: "z", line: 9, column: 9, binding: "b" },
+            SiteKey { file: "a", line: 0, column: 0, binding: "" },
+            SiteKey { file: "", line: u32::MAX, column: u32::MAX, binding: "b" },
+        ];
+        let table = SiteTable { root: "", sites: &BAD };
+        for (file, line, column) in [("z", 9, 9), ("a", 0, 0), ("", u32::MAX, u32::MAX), ("q", 1, 1)] {
+            let _ = table.locate(file, line, column, "b");
+        }
+    }
+
+    #[track_caller]
+    fn generated_item() -> Operation<u64, String> {
+        Operation::generated_sited(BINDING, &TRACKED, "operations::catalog")
+    }
+
+    // The table for this very file, built from the caller locations below.
+    static TRACKED_SITES: [SiteKey; 0] = [];
+    static TRACKED: SiteTable = SiteTable { root: "", sites: &TRACKED_SITES };
+
+    #[test]
+    fn sites_ride_with_calls_and_never_change_effect_bytes() {
+        let plain = Operation::<u64, String>::generated(BINDING);
+        assert_eq!(plain.site(), None);
+        // Unknown location (empty table): no site.
+        assert_eq!(generated_item().site(), None);
+        let sited = Operation::<u64, String> { binding: BINDING, site: Some(4), marker: PhantomData };
+        let mut effects = Effects::new();
+        let _ = effects.push(plain.call(1));
+        let _ = effects.push(sited.call(1));
+        assert_eq!(effects.sites(), &[None, Some(4)]);
+        let (plan, sites) = effects.into_round_plan();
+        assert_eq!(sites, vec![None, Some(4)]);
+        // Both effects encode identically: the site is not in the effect.
+        let abi::RoundPlan::Plan(plan) = plan else { panic!("plan") };
+        assert_eq!(plan.effects[0], plan.effects[1]);
+        let mut group = EffectGroup::new(abi::EffectGroupMode::Collect, 2);
+        let _ = group.push("a", sited.call(2));
+        let _ = group.push("b", Operation::<u64, String>::generated(BINDING).call(2));
+        assert_eq!(group.sites(), &[Some(4), None]);
+        let (group_plan, group_sites) = group.into_round_plan();
+        assert_eq!(group_sites, vec![Some(4), None]);
+        assert_eq!(group_plan.len(), 2);
+    }
+
+    /// W2B-1 regression: a user helper marked `#[track_caller]` reports its
+    /// caller's location. With a table entry for a direct call of the same
+    /// binding later on that line, the old "smallest column at or after" rule
+    /// gave the helper's effect the direct call's site. The exact rule gives
+    /// it no site, and the direct call keeps its own.
+    #[test]
+    fn a_track_caller_user_helper_never_takes_another_calls_site() {
+        #[track_caller]
+        fn item(table: &'static SiteTable) -> (Operation<u64, String>, &'static core::panic::Location<'static>) {
+            (Operation::generated_sited(BINDING, table, "operations::catalog"), core::panic::Location::caller())
+        }
+        #[track_caller]
+        fn tracked_helper(table: &'static SiteTable) -> (Operation<u64, String>, &'static core::panic::Location<'static>) {
+            item(table)
+        }
+        fn line(table: &'static SiteTable) -> [(Operation<u64, String>, &'static core::panic::Location<'static>); 2] {
+            [tracked_helper(table), item(table)]
+        }
+        // Pass 1 learns where rustc puts both calls (as the build would).
+        let [(_, helper_at), (_, direct_at)] = line(&SiteTable::EMPTY);
+        assert_eq!(helper_at.line(), direct_at.line());
+        assert!(helper_at.column() < direct_at.column());
+        let sites: &'static [SiteKey] = alloc::boxed::Box::leak(alloc::boxed::Box::new([SiteKey {
+            file: direct_at.file(),
+            line: direct_at.line(),
+            column: direct_at.column(),
+            binding: "operations::catalog",
+        }]));
+        let table: &'static SiteTable = alloc::boxed::Box::leak(alloc::boxed::Box::new(SiteTable { root: "", sites }));
+        // Pass 2 with the table: the direct call has its site, the helper none.
+        let [(helper, _), (direct, _)] = line(table);
+        assert_eq!(direct.site(), Some(0));
+        assert_eq!(helper.site(), None);
+    }
+
+    #[test]
+    fn track_caller_reports_the_guest_call_through_generated_items() {
+        // Two calls on one line get their own columns; the location is the
+        // call of the generated item, not a line inside the SDK.
+        #[track_caller]
+        fn whereami() -> &'static core::panic::Location<'static> {
+            core::panic::Location::caller()
+        }
+        let (a, b) = (whereami(), whereami());
+        assert_eq!(a.line(), b.line());
+        assert!(a.column() < b.column());
+        assert!(a.file().ends_with("typed.rs"));
+    }
 }
