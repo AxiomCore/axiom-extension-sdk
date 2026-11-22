@@ -68,6 +68,10 @@ The check is deliberately narrow. It does not warn when:
 - other statements stand between the two awaits;
 - the second effect's arguments use a name the first statement assigned, or
   contain an `await`, a function literal or a `yield`;
+- the second effect's arguments call a function (it could read what the first
+  statement stored), other than the conversions `Number`, `String`, `Boolean`,
+  `BigInt` (TypeScript) or `int`, `str`, `len` and similar builtins (Python);
+- a parameter or local shadows the effect helper or the SDK constructor;
 - the awaits go through different context objects.
 
 The check works on syntax, so it can miss independent awaits, for example
