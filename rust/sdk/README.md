@@ -202,8 +202,10 @@ impl Checkout {
   plans differently on replay fails with `Protocol` ("non-deterministic
   guest") and nothing commits.
 - **Determinism rules.** Time, randomness and state come only from host
-  operations (they are on the tape). Do not branch on `static`/global state
-  or on `cx.round()` before an await. `join!` polls in argument order. There
+  operations (they are on the tape). Do not branch on `static`/global state.
+  `cx.round()` is the round in which the reading code first ran (1 before the
+  first await), so code that replay runs again reads the value it read the
+  first time, as in TypeScript and Python. `join!` polls in argument order. There
   is no `select!`: if a hand-written combinator drops an operation after it
   was polled, it still runs in its round and its result is discarded;
   operations still pending when the export returns are never sent. Awaiting a
