@@ -32,6 +32,8 @@
 // pure helpers, resolved promises) in between.
 import type { AxiomValue, Completed, Effect, ExtensionHandler, Invocation, InvocationResult, SecretHandle, TypedEffect } from "./index.js";
 import { PatchBuilder, StateSnapshot, canonicalValue, createContext, decodeValue, effectDecoder, encodeValue } from "./index.js";
+import { HostOperationError } from "./errors.js";
+export { HostOperationError } from "./errors.js";
 
 /** Group format of an ABI 1.1 `Collect` round group (`abi::EFFECT_GROUP_FORMAT`). */
 export const EFFECT_GROUP_FORMAT = "axiom-extension-effect-group/v1";
@@ -320,26 +322,6 @@ export function canonicalRoundPlan(plan: RoundPlanJson): string {
   if ("Plan" in plan) return `{"Plan":[${plan.Plan.effects.map((effect) => call(effect)).join(",")}]}`;
   const group = plan.Group;
   return `{"Group":{"format":${JSON.stringify(group.format)},"limit":${group.limit},"mode":${JSON.stringify(group.mode)},"branches":[${group.branches.map((branch) => call(branch.effect, branch.name)).join(",")}]}}`;
-}
-
-/**
- * A failed host operation. Awaiting `cx.call(...)` rejects with this error
- * when the host answered the operation with an error; an export that lets it
- * escape fails the invocation with the same `code` (the Rust SDK's `?`).
- */
-export class HostOperationError extends Error {
-  // A class field *defines* the own property: an assignment (`this.name = …`)
-  // throws in strict code once `Error.prototype.name` is frozen (the override
-  // mistake). The realm freeze leaves Error prototypes writable, so this is
-  // defence in depth for guests that freeze them.
-  override readonly name = "HostOperationError";
-  readonly code: string;
-  readonly retryable: boolean;
-  constructor(code: string, message: string, retryable = false) {
-    super(message);
-    this.code = code;
-    this.retryable = retryable;
-  }
 }
 
 /** The context of one async export run. */
