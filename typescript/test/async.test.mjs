@@ -214,3 +214,90 @@ test("the 1.0 runner carries no async runtime; the async runner does", () => {
   // Node runs the SDK unlowered (native async functions).
   assert.equal(LOWERED_ASYNC, false);
 });
+
+// ---- p-live: live rounds (the host keeps the engine and resumes the run) ----
+
+/** Runs to completion on the live path: one start, then one resume per yield, all in this realm. */
+async function driveLive(ext, name, hostFn, { input = "Null", maxRounds = 16 } = {}) {
+  const written = [];
+  const plans = [];
+  const responses = [];
+  delete globalThis.__axiom_managed_step__;
+  runRound(ext, { kind: "invokeRound", request_id: 1, invocation: invocation(name, input), round: 1, max_rounds: maxRounds, abi: "1.1", tape: [], live: true }, (response) => written.push(response));
+  let round = 1;
+  let resume;
+  for (;;) {
+    let steps = 0;
+    while (written.length === 0) {
+      await drained();
+      assert.ok(steps < 2 || (round === 1 && steps < 3), "a live round answers within two engine steps");
+      globalThis.__axiom_managed_step__(resume);
+      resume = undefined;
+      steps += 1;
+    }
+    assert.equal(written.length, 1);
+    const response = written.pop();
+    responses.push(response);
+    if (response.kind !== "yieldedRound") return { response, plans, responses };
+    assert.equal(response.live, true, "a runner offered a live continuation keeps the run");
+    assert.deepEqual(response.replayed, plans, "a live run reports the plans it holds");
+    plans.push(response.plan);
+    const effects = response.plan.Plan ? response.plan.Plan.effects : response.plan.Group.branches.map((branch) => branch.effect);
+    round += 1;
+    resume = { kind: "resumeRound", request_id: 1, round, record: { outcomes: effects.map((effect, index) => hostFn(effect, index)), events: [] } };
+  }
+}
+
+/** The replay path's responses round by round (as `drive`, keeping each response). */
+async function driveReplay(ext, name, hostFn, options = {}) {
+  const tape = [];
+  const plans = [];
+  const responses = [];
+  for (;;) {
+    const { response } = await round(ext, name, tape, options);
+    responses.push(response);
+    if (response.kind !== "yieldedRound") return { response, plans, responses };
+    plans.push(response.plan);
+    const effects = response.plan.Plan ? response.plan.Plan.effects : response.plan.Group.branches.map((branch) => branch.effect);
+    tape.push({ outcomes: effects.map((effect, index) => hostFn(effect, index)), events: [] });
+  }
+}
+
+test("p-live: every deterministic export answers identically live and on replay, round by round", async () => {
+  const cases = [["scenario"], ["all", { Unsigned: 3 }], ["all", { Unsigned: 40 }], ["plain"], ["early"], ["forever"], ["failing"], ["throwing"], ["caught"], ["explicit"]];
+  for (const [name, input] of cases) {
+    const options = input === undefined ? {} : { input };
+    const replay = await driveReplay(guest, name, host, options);
+    const live = await driveLive(guest, name, host, options);
+    // The only difference on the wire is the `live` flag of each yield.
+    const strip = (responses) => responses.map(({ live: _live, ...rest }) => rest);
+    assert.deepEqual(strip(live.responses), strip(replay.responses), `${name}: live and replay answers differ`);
+    assert.deepEqual(live.plans, replay.plans, `${name}: plans differ`);
+  }
+});
+
+test("p-live: a resume that does not continue the suspended run fails Protocol; without `live` nothing is kept", async () => {
+  // Wrong round.
+  const written = [];
+  delete globalThis.__axiom_managed_step__;
+  runRound(guest, { kind: "invokeRound", request_id: 1, invocation: invocation("scenario"), round: 1, max_rounds: 4, abi: "1.1", tape: [], live: true }, (r) => written.push(r));
+  while (written.length === 0) { await drained(); globalThis.__axiom_managed_step__(); }
+  assert.equal(written.pop().live, true);
+  globalThis.__axiom_managed_step__({ kind: "resumeRound", request_id: 1, round: 3, record: { outcomes: [ok(0, { Unsigned: 10 })], events: [] } });
+  assert.equal(written.pop().error.code, "Protocol");
+  // Without `live` in the request the yield carries no `live` flag (the replay host's bytes).
+  const { response } = await round(guest, "scenario");
+  assert.equal(response.kind, "yieldedRound");
+  assert.equal("live" in response, false);
+});
+
+test("p-live: a guest whose plan depends on cx.round() is caught on replay but runs once live (documented difference)", async () => {
+  // Replay re-derives load(2) for round 1's load(1): the kernel's hash check
+  // refuses it (Protocol). Live, round 1's code ran once, so the plan it
+  // reports is the one it yielded and the kernel's check passes.
+  const replay = await driveReplay(guest, "divergent", host);
+  assert.notDeepEqual(replay.response.replayed, replay.plans);
+  const live = await driveLive(guest, "divergent", host);
+  assert.equal(live.response.kind, "completedRound");
+  assert.deepEqual(live.response.replayed, live.plans);
+});

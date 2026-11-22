@@ -2,7 +2,7 @@
 // The async build bundles this module instead of `./runner`; a sync-only
 // build keeps the ABI 1.0 runner and none of the async runtime (w2-c2 L-5).
 import { HostOperationError, createResumeContext, createContext, type ExtensionDefinition, type ExtensionResponse } from "./index.js";
-import { LOWERED_ASYNC, asyncHandlerOf, installStepHook, probeAsyncBuild, startAsyncRound, type AsyncHandler, type RoundRequest, type RoundResponse } from "./async.js";
+import { LOWERED_ASYNC, asyncHandlerOf, installStepHook, parseResumeRequest, probeAsyncBuild, startAsyncRound, type AsyncHandler, type ResumeRequest, type RoundRequest, type RoundResponse } from "./async.js";
 /** The async build's realm prelude installs the plan-order hooks before it freezes the intrinsics. */
 export { installOrderingHooks } from "./async.js";
 
@@ -99,14 +99,19 @@ export function runRound(extension: ExtensionDefinition, request: RoundRequest, 
   const handler = extension.exports[request.invocation.export];
   const asyncHandler = asyncHandlerFor(extension, request.invocation.export, options);
   if (asyncHandler) {
-    let step: () => void;
+    let step: (resume?: ResumeRequest) => void;
     try {
       step = startAsyncRound(asyncHandler, request, write);
     } catch (error) {
       write(failed(error) as RoundResponse);
       return;
     }
-    installStepHook(step);
+    // p-live: on a host that keeps the engine (`request.live`), a step whose
+    // stdin carries a `resumeRound` continues the suspended run; every other
+    // step reads nothing (the replay path never gives a step input).
+    // (A caller that is not the step export, such as the SDK's tests, may
+    // pass the message directly.)
+    installStepHook(request.live === true ? (resume?: ResumeRequest) => step(resume ?? readResume()) : step);
     return;
   }
   let response: ExtensionResponse;
@@ -133,6 +138,14 @@ export function runRound(extension: ExtensionDefinition, request: RoundRequest, 
     default:
       write(response);
   }
+}
+
+/** p-live: the `resumeRound` on this step's stdin, if the host sent one. */
+function readResume(): ResumeRequest | undefined {
+  if (typeof Javy === "undefined") return undefined;
+  const bytes = readAll();
+  if (bytes.length === 0) return undefined;
+  return parseResumeRequest(new TextDecoder().decode(bytes));
 }
 
 function readAll(): Uint8Array {
