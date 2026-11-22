@@ -471,16 +471,16 @@ export function encodeValue(value: unknown): AxiomValue {
   // `typeof` once, most frequent first (the primitive cases are disjoint).
   const type = typeof value;
   if (type === "string") return { String: value as string };
-  if (typeof value === "number") {
+  if (type === "number") {
     if (!Number.isSafeInteger(value)) throw new Error("Axiom numbers must be safe integers");
-    return value >= 0 ? { Unsigned: value } : { Signed: value };
+    return (value as number) >= 0 ? { Unsigned: value as number } : { Signed: value as number };
   }
   if (type === "boolean") return { Bool: value as boolean };
-  if (typeof value === "bigint") {
-    if (value < -(2n ** 63n) || value > 2n ** 64n - 1n) throw new Error("Axiom integers must fit in 64 bits");
-    const safe = value >= BigInt(Number.MIN_SAFE_INTEGER) && value <= BigInt(Number.MAX_SAFE_INTEGER);
-    const exact = safe ? Number(value) : value.toString();
-    return value >= 0n ? { Unsigned: exact } : { Signed: exact };
+  if (type === "bigint") {
+    if ((value as bigint) < -(2n ** 63n) || (value as bigint) > 2n ** 64n - 1n) throw new Error("Axiom integers must fit in 64 bits");
+    const safe = (value as bigint) >= BigInt(Number.MIN_SAFE_INTEGER) && (value as bigint) <= BigInt(Number.MAX_SAFE_INTEGER);
+    const exact = safe ? Number(value) : (value as bigint).toString();
+    return (value as bigint) >= 0n ? { Unsigned: exact } : { Signed: exact };
   }
   if (value instanceof Uint8Array) return { Bytes: Array.from(value) };
   if (Array.isArray(value)) return { List: value.map(encodeValue) };
