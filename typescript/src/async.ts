@@ -32,6 +32,8 @@
 // pure helpers, resolved promises) in between.
 import type { AxiomValue, Completed, Effect, ExtensionHandler, Invocation, InvocationResult, SecretHandle, TypedEffect } from "./index.js";
 import { PatchBuilder, StateSnapshot, canonicalValue, createContext, decodeValue, effectDecoder, encodeValue } from "./index.js";
+import { HostOperationError } from "./errors.js";
+export { HostOperationError } from "./errors.js";
 
 /** Group format of an ABI 1.1 `Collect` round group (`abi::EFFECT_GROUP_FORMAT`). */
 export const EFFECT_GROUP_FORMAT = "axiom-extension-effect-group/v1";
@@ -41,6 +43,17 @@ export const MAX_GROUP_BRANCHES = 32;
 export const MAX_GROUP_LIMIT = 8;
 /** Name of the step hook the async build's step export calls. */
 export const STEP_HOOK = "__axiom_managed_step__";
+/**
+ * p-live: `JSON.parse` as it was when the SDK loaded, before any guest module
+ * body ran, so a guest that patches `JSON.parse` never sees (or alters) the
+ * host's `resumeRound` messages.
+ */
+const nativeJsonParse: (text: string) => unknown = JSON.parse;
+
+/** p-live: decode the `resumeRound` bridge message of a live step. */
+export function parseResumeRequest(text: string): ResumeRequest {
+  return nativeJsonParse(text) as ResumeRequest;
+}
 
 /**
  * True when this bundle was built with `async`/`await` lowered to generators
@@ -322,31 +335,18 @@ export function canonicalRoundPlan(plan: RoundPlanJson): string {
   return `{"Group":{"format":${JSON.stringify(group.format)},"limit":${group.limit},"mode":${JSON.stringify(group.mode)},"branches":[${group.branches.map((branch) => call(branch.effect, branch.name)).join(",")}]}}`;
 }
 
-/**
- * A failed host operation. Awaiting `cx.call(...)` rejects with this error
- * when the host answered the operation with an error; an export that lets it
- * escape fails the invocation with the same `code` (the Rust SDK's `?`).
- */
-export class HostOperationError extends Error {
-  // A class field *defines* the own property: an assignment (`this.name = …`)
-  // throws in strict code once `Error.prototype.name` is frozen (the override
-  // mistake). The realm freeze leaves Error prototypes writable, so this is
-  // defence in depth for guests that freeze them.
-  override readonly name = "HostOperationError";
-  readonly code: string;
-  readonly retryable: boolean;
-  constructor(code: string, message: string, retryable = false) {
-    super(message);
-    this.code = code;
-    this.retryable = retryable;
-  }
-}
-
 /** The context of one async export run. */
 export interface AsyncContext {
   readonly invocation: Invocation;
   readonly input: unknown;
-  /** Current invoke number (1-based). It must not influence which operations are called. */
+  /**
+   * The round in which the calling code first ran (1-based): 1 before the
+   * first await, k + 1 after the k-th effect round's results arrived. A read
+   * returns the same value on every path (live, replay, live+verify) and in
+   * every language, because code re-run on replay gets the round it ran in
+   * when it first executed, like an effect result (p-round). Reading it
+   * after the last await gives the round that completes the export.
+   */
   round(): number;
   /** The yield budget (`maxRounds`) of this invocation. */
   maxRounds(): number;
@@ -422,6 +422,20 @@ export interface RoundRequest {
   yielded_plan?: unknown;
   /** The canonical text of each tape round's plan, or null above the kernel's bound. */
   tape_plans?: Array<string | null>;
+  /**
+   * p-live: the host keeps this engine after a yield, so the run may stay
+   * suspended in it and be resumed by a {@link ResumeRequest} on the step
+   * hook instead of a fresh engine replaying the tape.
+   */
+  live?: boolean;
+}
+
+/** p-live: the newest tape record for the run suspended at its last yield. */
+export interface ResumeRequest {
+  kind: "resumeRound";
+  request_id: number;
+  round: number;
+  record: TapeRecord;
 }
 
 type RoundPlanJson =
@@ -430,7 +444,7 @@ type RoundPlanJson =
 
 export type RoundResponse =
   | { kind: "completedRound"; result: InvocationResult; replayed?: RoundPlanJson[] }
-  | { kind: "yieldedRound"; plan: RoundPlanJson; replayed?: RoundPlanJson[] }
+  | { kind: "yieldedRound"; plan: RoundPlanJson; replayed?: RoundPlanJson[]; live?: true }
   | { kind: "failed"; error: { code: string; message: string; retryable: boolean }; replayed?: RoundPlanJson[] }
   | { kind: "cancelled" };
 
@@ -490,8 +504,22 @@ class RoundRun {
   private readonly root: OrderNode = newNode(true);
   /** Set when an operation started outside the async call tree (see `register`). */
   private outsideTree = false;
+  /** The round this run is in: the request's, then each live resume's. */
+  private round: number;
+  /**
+   * p-round: what `cx.round()` returns: the round in which the reading code
+   * first executed. The tape position is the record: `cursor` effect rounds
+   * have been answered, so the running code first ran in round cursor + 1.
+   */
+  roundOfRead(): number {
+    return this.cursor + 1;
+  }
+  /** p-live: the operations and plan of the yield this run is suspended at. */
+  private held: { segment: Registered[]; plan: RoundPlanJson } | undefined;
 
-  constructor(private readonly request: RoundRequest, private readonly write: (response: RoundResponse) => void) {}
+  constructor(private readonly request: RoundRequest, private readonly write: (response: RoundResponse) => void) {
+    this.round = request.round;
+  }
 
   context(): AsyncContext {
     const base = createContext(this.request.invocation);
@@ -499,7 +527,13 @@ class RoundRun {
     return Object.freeze({
       invocation: base.invocation,
       input: base.input,
-      round: () => run.request.round,
+      // p-round: the round in which this read first executed. Code that runs
+      // while `cursor` effect rounds have been answered first ran in round
+      // cursor + 1 (the replay path re-runs it while replaying the same
+      // tape position; the live path runs it once, at that position), so the
+      // value is a function of the tape position only, identical on both
+      // paths and across a live-to-replay fallback.
+      round: () => run.roundOfRead(),
       maxRounds: () => run.request.max_rounds,
       call<O>(effect: TypedEffect<O>): Promise<O> { return run.register(effect) as Promise<O>; },
       snapshot: (resource: string) => base.snapshot(resource),
@@ -577,6 +611,29 @@ class RoundRun {
     this.write(response);
   }
 
+  /**
+   * p-live: continue the run suspended at its last yield with the newest
+   * tape record (the host kept this engine). The record answers the held
+   * operations exactly as replay answers a tape round; the job queue drains
+   * when the step export returns, and the next step answers. From here on
+   * the run is in the same state a replay of the tape would reach.
+   */
+  resume(request: ResumeRequest): void {
+    const held = this.held;
+    this.held = undefined;
+    if (!held || request.kind !== "resumeRound" || request.request_id !== this.request.request_id || request.round !== this.round + 1 || !request.record) {
+      this.answered = false;
+      this.answer({ kind: "failed", error: failure("Protocol", "live round: the resume does not continue the run suspended in this engine"), replayed: this.replayed });
+      return;
+    }
+    this.round = request.round;
+    this.request.tape.push(request.record);
+    this.replayed.push(held.plan);
+    this.answered = false;
+    this.cursor += 1;
+    this.deliver(held.segment, request.record.outcomes ?? []);
+  }
+
   /** Called when the job queue has drained. */
   step(): void {
     if (this.answered) return;
@@ -651,6 +708,12 @@ class RoundRun {
         this.answer({ kind: "failed", error: failure("Exhausted", "async export needs more than one effect round, but the host negotiated ABI 1.0, which allows one"), replayed });
         return;
       }
+      if (this.request.live === true && this.request.abi === "1.1") {
+        // p-live: stay suspended here; the host resumes this engine.
+        this.held = { segment, plan };
+        this.answer({ kind: "yieldedRound", plan, replayed: [...replayed], live: true });
+        return;
+      }
       this.answer({ kind: "yieldedRound", plan, replayed });
       return;
     }
@@ -666,6 +729,11 @@ class RoundRun {
     }
     const outcomes = tape[this.cursor].outcomes ?? [];
     this.cursor += 1;
+    this.deliver(segment, outcomes);
+  }
+
+  /** Answer a round's operations from its tape record (outcome index = position in the plan). */
+  private deliver(segment: Registered[], outcomes: TapeRecord["outcomes"]): void {
     segment.forEach((registered, index) => {
       const outcome = outcomes.find((candidate) => candidate && candidate.index === index);
       const result = outcome?.result;
@@ -695,15 +763,16 @@ class RoundRun {
  * now; the response is written by a later step (the kernel re-enters the
  * engine after each drain of the job queue).
  */
-export function startAsyncRound(handler: AsyncHandler, request: RoundRequest, write: (response: RoundResponse) => void): () => void {
+export function startAsyncRound(handler: AsyncHandler, request: RoundRequest, write: (response: RoundResponse) => void): (resume?: ResumeRequest) => void {
   const run = new RoundRun(request, write);
-  const step = () => run.step();
+  // p-live: a step that carries a `resumeRound` continues the suspended run.
+  const step = (resume?: ResumeRequest) => (resume === undefined ? run.step() : run.resume(resume));
   run.start(handler, run.context());
   return step;
 }
 
 /** Install the step hook the async build's step export calls on re-entry. */
-export function installStepHook(step: () => void): void {
+export function installStepHook(step: (resume?: ResumeRequest) => void): void {
   Object.defineProperty(globalThis, STEP_HOOK, { value: step, writable: false, enumerable: false, configurable: true });
 }
 

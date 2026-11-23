@@ -43,14 +43,24 @@ export function runExtension(extension: ExtensionDefinition): void {
 }
 
 function readAll(): Uint8Array {
-  const chunks: Uint8Array[] = [];
-  let length = 0;
+  // A request that fits one chunk (EOF on the second read) needs no list.
+  const first = new Uint8Array(4096);
+  const read = Javy.IO.readSync(0, first);
+  if (read === 0) return first.subarray(0, 0);
+  const next = new Uint8Array(4096);
+  const more = Javy.IO.readSync(0, next);
+  if (more === 0) return first.subarray(0, read);
+  return readRest([first.subarray(0, read), next.subarray(0, more)], read + more);
+}
+
+/** The general read loop, continued after the chunks already read. */
+function readRest(chunks: Uint8Array[], length: number): Uint8Array {
   while (true) {
     const chunk = new Uint8Array(4096);
     const read = Javy.IO.readSync(0, chunk);
     if (read === 0) break;
-    const used = chunk.slice(0, read);
-    chunks.push(used);
+    // The chunk is not reused: a view of its first `read` bytes is a copy's equal.
+    chunks.push(chunk.subarray(0, read));
     length += read;
   }
   const result = new Uint8Array(length);

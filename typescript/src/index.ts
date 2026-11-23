@@ -1,9 +1,11 @@
 export { Cents, Percentage } from "./money.js";
+export { HostOperationError } from "./errors.js";
 export {
-  EFFECT_GROUP_FORMAT, HostOperationError, MAX_GROUP_BRANCHES, asyncExport, asyncHandlerOf, extension, segmentPlan,
+  EFFECT_GROUP_FORMAT, MAX_GROUP_BRANCHES, asyncExport, asyncHandlerOf, extension, segmentPlan,
   type AsyncContext, type AsyncExport, type AsyncHandler,
 } from "./async.js";
-import { HostOperationError as HostError, type AsyncExport } from "./async.js";
+import type { AsyncExport } from "./async.js";
+import { HostOperationError as HostError } from "./errors.js";
 
 export type AxiomValue =
   | "Null"
@@ -385,12 +387,18 @@ export class StateSnapshot {
 }
 
 export class PatchBuilder {
-  private readonly operations: PatchOperation[] = [];
+  // Assigned in the constructor in the order the class fields had (resource,
+  // revision, operations): the same own properties, without first defining
+  // each one as undefined.
+  private declare readonly resource: string;
+  private declare readonly revision: number;
+  private declare readonly operations: PatchOperation[];
 
-  constructor(
-    private readonly resource: string,
-    private readonly revision: number,
-  ) {}
+  constructor(resource: string, revision: number) {
+    this.resource = resource;
+    this.revision = revision;
+    this.operations = [];
+  }
 
   set<T>(path: Selector<T>, value: T): this {
     this.operations.push({ Set: { path: splitPath(path), value: encodeValue(value) } });
@@ -411,7 +419,7 @@ export class PatchBuilder {
     return {
       resource: this.resource,
       expected_revision: this.revision,
-      operations: [...this.operations],
+      operations: this.operations.slice(),
     };
   }
 }
@@ -460,25 +468,29 @@ export function createContext(invocation: Invocation): ExtensionContext {
 
 export function encodeValue(value: unknown): AxiomValue {
   if (value === null || value === undefined) return "Null";
-  if (typeof value === "boolean") return { Bool: value };
-  if (typeof value === "number") {
+  // `typeof` once, most frequent first (the primitive cases are disjoint).
+  const type = typeof value;
+  if (type === "string") return { String: value as string };
+  if (type === "number") {
     if (!Number.isSafeInteger(value)) throw new Error("Axiom numbers must be safe integers");
-    return value >= 0 ? { Unsigned: value } : { Signed: value };
+    return (value as number) >= 0 ? { Unsigned: value as number } : { Signed: value as number };
   }
-  if (typeof value === "bigint") {
-    if (value < -(2n ** 63n) || value > 2n ** 64n - 1n) throw new Error("Axiom integers must fit in 64 bits");
-    const safe = value >= BigInt(Number.MIN_SAFE_INTEGER) && value <= BigInt(Number.MAX_SAFE_INTEGER);
-    const exact = safe ? Number(value) : value.toString();
-    return value >= 0n ? { Unsigned: exact } : { Signed: exact };
+  if (type === "boolean") return { Bool: value as boolean };
+  if (type === "bigint") {
+    if ((value as bigint) < -(2n ** 63n) || (value as bigint) > 2n ** 64n - 1n) throw new Error("Axiom integers must fit in 64 bits");
+    const safe = (value as bigint) >= BigInt(Number.MIN_SAFE_INTEGER) && (value as bigint) <= BigInt(Number.MAX_SAFE_INTEGER);
+    const exact = safe ? Number(value) : (value as bigint).toString();
+    return (value as bigint) >= 0n ? { Unsigned: exact } : { Signed: exact };
   }
-  if (typeof value === "string") return { String: value };
   if (value instanceof Uint8Array) return { Bytes: Array.from(value) };
   if (Array.isArray(value)) return { List: value.map(encodeValue) };
   if (typeof value === "object") {
     return {
+      // Entries are [key, value] arrays: indexing them is their destructuring
+      // without the iterator protocol (cheaper in QuickJS).
       Record: Object.entries(value as Record<string, unknown>)
-        .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
-        .map(([name, item]) => ({ name, value: encodeValue(item) })),
+        .sort((left, right) => (left[0] < right[0] ? -1 : left[0] > right[0] ? 1 : 0))
+        .map((entry) => ({ name: entry[0], value: encodeValue(entry[1]) })),
     };
   }
   throw new Error(`unsupported Axiom value: ${typeof value}`);
@@ -505,9 +517,14 @@ export function decodeValue(value: AxiomValue): unknown {
   return value.Handle;
 }
 
+// A whole static path: segments of [A-Za-z_][A-Za-z0-9_]* joined by ".".
+const STATIC_PATH = /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$/;
+
 function splitPath(path: string): string[] {
   const result = path.split(".");
-  if (result.some((segment) => !/^[A-Za-z_][A-Za-z0-9_]*$/.test(segment))) {
+  // One test of the whole string instead of one per segment; the same paths
+  // pass (a string path; anything else keeps the per-segment test).
+  if (typeof path === "string" ? !STATIC_PATH.test(path) : result.some((segment) => !/^[A-Za-z_][A-Za-z0-9_]*$/.test(segment))) {
     throw new Error(`invalid static Axiom path: ${path}`);
   }
   return result;
